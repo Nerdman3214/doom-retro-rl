@@ -1,0 +1,12 @@
+src/Rl/venv/
+src/Rl/build/
+src/Rl/checkpoints/
+src/Rl/clips/
+src/Rl/dataset/
+src/Rl/datasets/
+src/Rl/trajectories/
+src/Rl/*.pkl
+src/Rl/*.zip
+src/Rl/*.so
+__pycache__/
+*.pyc
