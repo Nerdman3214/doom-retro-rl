@@ -33,7 +33,7 @@ DOOM_IWAD = "/usr/share/games/doom/freedoom1.wad"
 
 class DoomEnv(gym.Env):
 
-    def __init__(self, launch_doom=False):
+    def __init__(self, launch_doom=False, record=True):
 
         super(DoomEnv, self).__init__()
 
@@ -55,15 +55,51 @@ class DoomEnv(gym.Env):
         self.observer = ObservationBuilder()
         self.reward_manager = RewardManager()
         self.actions = ActionSpace().ACTIONS
-        self.logger = BehaviorLogger()
-        self.traj_logger = TrajectoryLogger()
-        self.recorder = PlayerRecorder()
-        self.event_recorder = EventRecorder()
-        self.clipper = ClipGenerator(clip_length=90)
         self.preference_model = PreferenceModel()
-        self.smart_clipper = SmartClipGenerator()
         self.helper = HelperBot()
+        self.record = record
         self.stuck_counter = 0 
+        self.curriculum_stage = 0
+        self.curriculum_rewards = []
+        self.curriculum_thresholds = {
+            0: 5000,
+            1: 10000,
+            2: 15000,
+            3: 25000,
+            4: 35000,
+            5: 45000,
+            6: 55000,
+            7: 65000
+        }
+        self.max_stage = 7
+        self.enemy_visible_steps = 0
+        
+        # Stage-specific behavior counters
+        self.forward_movement_count = 0      # Stage 0: count forward movements
+        self.exploration_count = 0            # Stage 1: count new areas and item pickups
+        self.pickup_count = 0                 # Stage 1: count important item pickups
+        self.continuous_movement_steps = 0   # Stage 2: count non-stuck steps
+        self.door_interaction_count = 0       # Stage 3: count door interactions
+        self.key_item_count = 0               # Stage 3: count important item pickups/keys
+        self.enemy_engagement_count = 0       # Stage 4: count shots at visible enemies
+        self.valid_shot_count = 0             # Stage 5+: count accurate shots
+        self.level_completion_count = 0       # Stage 7: track level completion
+        self.visited_areas = set()            # Track unique areas for exploration
+
+        self.event_recorder = EventRecorder()
+        self.smart_clipper = SmartClipGenerator()
+
+        if self.record:
+            self.logger = BehaviorLogger()
+            self.traj_logger = TrajectoryLogger()
+            self.recorder = PlayerRecorder()
+            self.clipper = ClipGenerator(clip_length=90)
+        else:
+            self.logger = None
+            self.traj_logger = None
+            self.recorder = None
+            self.clipper = None
+
         pref_path = os.path.join(
             os.path.dirname(__file__), "..", "checkpoints", "preference_model.pt"
         )
@@ -92,17 +128,104 @@ class DoomEnv(gym.Env):
         self._max_episode_steps = 1000
         self._previous_frame = None
         self.last_shot_step = -100
+        self.enemy_visible_steps = 0
+        self.last_area_signature = None
 
-        # Start keyboard listener once here, not every step
-        self._kb_listener = keyboard.Listener(
-            on_press=self.recorder.on_press,
-            on_release=self.recorder.on_release,
-        )
-        self._kb_listener.start()
+        if self.record:
+            # Start keyboard listener once here, not every step
+            self._kb_listener = keyboard.Listener(
+                on_press=self.recorder.on_press,
+                on_release=self.recorder.on_release,
+            )
+            self._kb_listener.start()
+        else:
+            self._kb_listener = None
+        
+        # Initialize area tracking
+        self.last_area_signature = None
 
+    def get_stage_config(self):
+
+        return {
+            0: {
+                "name": "movement",
+                "allow_shoot": False,
+                "enemy_enabled": False,
+                "goal": "move"
+            },
+            1: {
+                "name": "game_basics",
+                "allow_shoot": False,
+                "enemy_enabled": False,
+                "goal": "explore_and_pick_items"
+            },
+            2: {
+                "name": "avoid_getting_stuck",
+                "allow_shoot": False,
+                "enemy_enabled": False,
+                "goal": "avoid_stuck"
+            },
+            3: {
+                "name": "key_doors",
+                "allow_shoot": False,
+                "enemy_enabled": False,
+                "goal": "open_doors"
+            },
+            4: {
+                "name": "combat_basic",
+                "visible": True,
+                "allow_shoot": True,
+                "require_enemy_visible_to_shoot": True,
+                "enemy_enabled": True,
+                "max_enemies": 1,
+                "goal": "defeat_enemies"
+            },
+            5: {
+                "name": "combat_full",
+                "allow_shoot": True,
+                "require_enemy_visible_to_shoot": True,
+                "enemy_enabled": True,
+                "max_enemies": min(10, self._step_count // 200),
+                "goal": "defeat_enemies"
+            },
+            6: {
+                "name": "full_game",
+                "allow_shoot": True,
+                "require_enemy_visible_to_shoot": True,
+                "enemy_enabled": True,
+                "max_enemies": 1000,
+                "goal": "defeat_enemies"
+            },
+            7: {
+                "name": 'complete_level',
+                "allow_shoot": True,
+                "require_enemy_visible_to_shoot": True,
+                "enemy_enabled": True,
+                "max_enemies": 5000,
+                "goal": "finish_level"
+            }
+        }[self.curriculum_stage]
 
     def reset(self, seed=None, options=None):
         self._step_count = 0
+        
+        # Reset stage-specific counters on episode reset
+        self.forward_movement_count = 0
+        self.exploration_count = 0
+        self.pickup_count = 0
+        self.continuous_movement_steps = 0
+        self.door_interaction_count = 0
+        self.key_item_count = 0
+        self.enemy_engagement_count = 0
+        self.valid_shot_count = 0
+        self.enemy_visible_steps = 0
+        self.stuck_counter = 0
+
+        self.visited_areas.clear()
+
+        config = self.get_stage_config()
+
+        print(f"[Curriculum] Stage {self.curriculum_stage}: {config['name']}")
 
         # Press Enter to dismiss any death/game-over screen and respawn
         import subprocess
@@ -115,6 +238,10 @@ class DoomEnv(gym.Env):
             time.sleep(1.5)  # wait for respawn animation
 
         frame_cache.invalidate()
+
+        self.previous_health = None
+        self._previous_frame = None
+
         observation = self.observer.build()
         return observation, {}
 
@@ -123,15 +250,40 @@ class DoomEnv(gym.Env):
         # Invalidate the shared frame cache so all detectors share one fresh capture
         frame_cache.invalidate()
 
-        action = self.actions[action_index]
+        self.update_curriculum()
 
-        self.perform_action(action)
+        action = self.actions[action_index]
 
         frame = self.observer.get_frame()
         enemy_visible = self.reward_manager.enemy_detector.detect_enemy_presence(frame)
+        self.enemy_visible_steps += 1 if enemy_visible else 0
+
+        config = self.get_stage_config()
 
         if enemy_visible and not self.reward_manager.enemy_in_crosshair(frame):
             self.reward_manager.add("aiming", +0.05)
+
+        if action == "shoot" and config.get("require_enemy_visible_to_shoot", False) and not enemy_visible:
+            self.reward_manager.add("shoot_without_visible_enemy", -1.0)
+        else:
+            self.perform_action(action)
+
+        # Track stage-specific behavior
+        if self.curriculum_stage == 0 and action == "move_forward":
+            self.forward_movement_count += 1
+        
+        if self.curriculum_stage == 1:
+            area_sig = self._get_area_signature()
+            if area_sig != self.last_area_signature:
+                self.exploration_count += 1
+                self.visited_areas.add(area_sig)
+                self.last_area_signature = area_sig
+
+        if self.curriculum_stage >= 4 and action == "shoot":
+            if enemy_visible:
+                self.enemy_engagement_count += 1
+            if self.reward_manager.enemy_in_crosshair(frame):
+                self.valid_shot_count += 1
 
         if action == "shoot":
             if self._step_count - self.last_shot_step < 5:
@@ -161,6 +313,81 @@ class DoomEnv(gym.Env):
 
         reward = self.reward_manager.calculate_reward(action, game_state)
 
+        # Update progression counters based on recently detected game events
+        if self.curriculum_stage == 1:
+            if self.reward_manager.breakdown.get("health_pickup", 0) > 0 or \
+               self.reward_manager.breakdown.get("ammo_pickup", 0) > 0 or \
+               self.reward_manager.breakdown.get("pickup_flash", 0) > 0:
+                self.pickup_count += 1
+
+        if self.curriculum_stage == 2 and action in ["move_forward", "move_backward", "turn_left", "turn_right"] and pixel_diff > 2:
+            self.continuous_movement_steps += 1
+
+        if self.curriculum_stage == 3:
+            if self.reward_manager.breakdown.get("door_opened", 0) > 0:
+                self.door_interaction_count += 1
+            if self.reward_manager.breakdown.get("health_pickup", 0) > 0 or \
+               self.reward_manager.breakdown.get("ammo_pickup", 0) > 0 or \
+               self.reward_manager.breakdown.get("pickup_flash", 0) > 0:
+                self.key_item_count += 1
+
+        config = self.get_stage_config()
+
+        # Stage-specific reward shaping
+        if self.curriculum_stage == 0:
+            # Stage 0: Focus on forward movement
+            if action == "move_forward":
+                reward += 0.05
+            else:
+                reward -= 0.01
+
+        elif self.curriculum_stage == 1:
+            # Stage 1: Reward any movement, exploration, and item pickups
+            reward += 0.02
+            if action == "move_forward":
+                reward += 0.03
+            if action in ["turn_left", "turn_right"]:
+                reward += 0.01
+            if self.reward_manager.breakdown.get("health_pickup", 0) > 0 or \
+               self.reward_manager.breakdown.get("ammo_pickup", 0) > 0 or \
+               self.reward_manager.breakdown.get("pickup_flash", 0) > 0:
+                reward += 0.5
+
+        elif self.curriculum_stage == 2:
+            # Stage 2: Reward all movement, penalize staying still
+            if action in ["move_forward", "move_backward", "turn_left", "turn_right"]:
+                reward += 0.05
+            elif action == "use":
+                reward += 0.04
+            else:
+                reward -= 0.02
+            
+            if pixel_diff < 2:
+                reward -= 0.01
+
+        elif self.curriculum_stage == 3:
+            # Stage 3: Reward door interaction and item/key awareness
+            if action == "use":
+                reward += 0.15
+            if self.reward_manager.breakdown.get("door_opened", 0) > 0:
+                reward += 2.0
+            if self.reward_manager.breakdown.get("health_pickup", 0) > 0 or \
+               self.reward_manager.breakdown.get("ammo_pickup", 0) > 0 or \
+               self.reward_manager.breakdown.get("pickup_flash", 0) > 0:
+                reward += 0.3
+            reward += 0.01
+
+        elif self.curriculum_stage == 4:
+            # Stage 4: Reward shooting visible enemies
+            if action == "shoot" and enemy_visible:
+                reward += 0.10
+            if self.reward_manager.enemy_in_crosshair(frame) and action == "shoot":
+                reward += 0.20
+
+        elif self.curriculum_stage >= 5:
+            # Stage 5+: Combat mastery - rewards handled by reward_manager
+            pass
+
         helper_action = self.helper.get_action(game_state)
         if action == helper_action:
             reward += 0.2
@@ -172,12 +399,14 @@ class DoomEnv(gym.Env):
         else:
             self.stuck_counter = 0
 
-
         if self.stuck_counter >= 10:  # If stuck for 10 consecutive steps
+            self.reward_manager.add("prolonged_stuck_penalty", -5.0)
             self.stuck_counter = 0
+            done = True
+        else:
+            done = False
 
         self._step_count += 1
-        done = False
         truncated = self._step_count >= self._max_episode_steps
 
         frame = self.observer.get_frame()
@@ -186,30 +415,31 @@ class DoomEnv(gym.Env):
 
         if self.previous_health is not None:
             if player_health < self.previous_health:
-                self.smart_clipper.trigger_event()
-                self.event_recorder.set_event("took_damage")
+                if self.record:
+                    self.smart_clipper.trigger_event()
+                    self.event_recorder.set_event("took_damage")
 
         self.previous_health = player_health
 
         # Enemy detection event trigger
         enemy_detected = enemy_visible
-        if enemy_detected:
+        if enemy_detected and self.record:
             self.smart_clipper.trigger_event()
             self.event_recorder.set_event("enemy_seen")
 
         # Resource pickup trigger
         if (self.reward_manager.breakdown.get("health_pickup", 0) > 0 or
-                self.reward_manager.breakdown.get("ammo_pickup", 0) > 0):
+                self.reward_manager.breakdown.get("ammo_pickup", 0) > 0) and self.record:
             self.smart_clipper.trigger_event()
             self.event_recorder.set_event("pickup_collected")
 
         # Low-health survival trigger
-        if player_health < 25:
+        if player_health < 25 and self.record:
             self.smart_clipper.trigger_event()
             self.event_recorder.set_event("low_health_escape")
 
         # Door interaction trigger
-        if self.reward_manager.breakdown.get("door_event", 0) > 0:
+        if self.reward_manager.breakdown.get("door_event", 0) > 0 and self.record:
             self.smart_clipper.trigger_event()
             self.event_recorder.set_event("door_open")
 
@@ -218,19 +448,106 @@ class DoomEnv(gym.Env):
             pref_reward = max(min(pref_reward, 3), -3)
             reward += 0.1 * pref_reward
 
-        self.logger.log(frame, action, game_state["health"],
-                        game_state["ammo"])
+        if self.record:
+            self.logger.log(frame, action, game_state["health"],
+                            game_state["ammo"])
 
-        self.traj_logger.record(frame, action, reward)
+            self.traj_logger.record(frame, action, reward)
 
-        self.recorder.record_frame(frame)
-        self.event_recorder.record_frame(frame)
+            self.recorder.record_frame(frame)
+            self.event_recorder.record_frame(frame)
 
-        self.clipper.record(frame, action)
+            self.clipper.record(frame, action)
 
-        self.smart_clipper.observe(frame, action)
+            self.smart_clipper.observe(frame, action)
+
+        self.curriculum_rewards.append(reward)
+
+        if len(self.curriculum_rewards) > 100:
+            self.curriculum_rewards.pop(0)
+
+        self.update_curriculum()
 
         return observation, reward, done, truncated, {}
+    
+    def update_curriculum(self):
+
+        if len(self.curriculum_rewards) < 50:
+            return
+
+        avg_reward = sum(self.curriculum_rewards) / len(self.curriculum_rewards)
+        threshold = self.curriculum_thresholds.get(self.curriculum_stage, 1e9)
+        reward_ready = avg_reward > threshold
+        behavior_ready = False
+
+        if self.curriculum_stage == 0:
+            # Stage 0: Require 100+ forward movements
+            behavior_ready = self.forward_movement_count >= 100
+            print(f"  [Stage 0] Forward moves: {self.forward_movement_count}/100 | Reward: {avg_reward:.1f}/{threshold}")
+        
+        elif self.curriculum_stage == 1:
+            # Stage 1: Require exploration and basic resource pickup
+            behavior_ready = len(self.visited_areas) >= 12 and self.pickup_count >= 3
+            print(f"  [Stage 1] Areas explored: {len(self.visited_areas)}/12 | Pickups: {self.pickup_count}/3 | Reward: {avg_reward:.1f}/{threshold}")
+        
+        elif self.curriculum_stage == 2:
+            # Stage 2: Require 80+ continuous movement steps (not stuck)
+            behavior_ready = self.continuous_movement_steps >= 80 and self.stuck_counter == 0
+            print(f"  [Stage 2] Movement steps: {self.continuous_movement_steps}/80 | Stuck counter: {self.stuck_counter}")
+        
+        elif self.curriculum_stage == 3:
+            # Stage 3: Require door usage plus item/key awareness
+            behavior_ready = self.door_interaction_count >= 3 and self.key_item_count >= 2
+            print(f"  [Stage 3] Doors opened: {self.door_interaction_count}/3 | Items collected: {self.key_item_count}/2 | Reward: {avg_reward:.1f}/{threshold}")
+        
+        elif self.curriculum_stage == 4:
+            # Stage 4: Require 20+ shots at visible enemies + 10+ steps seeing enemies
+            behavior_ready = self.enemy_engagement_count >= 20 and self.enemy_visible_steps >= 10
+            print(f"  [Stage 4] Enemy shots: {self.enemy_engagement_count}/20 | Visible: {self.enemy_visible_steps}/10")
+        
+        elif self.curriculum_stage == 5:
+            # Stage 5: Require 40+ accurate shots
+            behavior_ready = self.valid_shot_count >= 40
+            print(f"  [Stage 5] Accurate shots: {self.valid_shot_count}/40 | Reward: {avg_reward:.1f}/{threshold}")
+        
+        elif self.curriculum_stage == 6:
+            # Stage 6: Require 60+ accurate shots (sustained combat)
+            behavior_ready = self.valid_shot_count >= 60
+            print(f"  [Stage 6] Accurate shots: {self.valid_shot_count}/60 | Reward: {avg_reward:.1f}/{threshold}")
+        
+        elif self.curriculum_stage == 7:
+            # Stage 7: Just maintain good reward
+            behavior_ready = True
+            print(f"  [Stage 7] Final stage - Reward: {avg_reward:.1f}/{threshold}")
+
+        stage_ready = reward_ready and behavior_ready
+
+        if stage_ready:
+            if self.curriculum_stage < self.max_stage:
+                old_stage = self.curriculum_stage
+                self.curriculum_stage += 1
+                self.curriculum_rewards.clear()
+                
+                # Reset all counters for next stage
+                self.forward_movement_count = 0
+                self.exploration_count = 0
+                self.pickup_count = 0
+                self.continuous_movement_steps = 0
+                self.door_interaction_count = 0
+                self.key_item_count = 0
+                self.enemy_engagement_count = 0
+                self.valid_shot_count = 0
+                self.enemy_visible_steps = 0
+                self.stuck_counter = 0
+                self.visited_areas.clear()
+
+                print(f"[Curriculum] ADVANCING FROM STAGE {old_stage} → {self.curriculum_stage}")
+
+    def _get_area_signature(self):
+        """Get a simple signature of current screen state for exploration tracking."""
+        frame = self.observer.get_frame()
+        small_frame = frame[::20, ::20]
+        return int(small_frame.mean())
 
     def preference_reward(self, frame):
 
@@ -246,6 +563,13 @@ class DoomEnv(gym.Env):
 
     def perform_action(self, action):
 
+        config = self.get_stage_config()
+
+        # Disable shooting in early stages
+        if not config["allow_shoot"] and "shoot" in action:
+            return
+
+        # Normal execution
         if action == "move_forward":
             self.controller.move_forward()
 
@@ -279,8 +603,13 @@ class DoomEnv(gym.Env):
         elif action == "swap_weapon":
             self.controller.swap_weapon()
 
+        return
+
     def close(self):
-        self.recorder.save()
-        self.event_recorder.save()
+        if self.record:
+            if self.recorder:
+                self.recorder.save()
+            if self.event_recorder:
+                self.event_recorder.save()
         if self.game_process:
             self.game_process.terminate()
