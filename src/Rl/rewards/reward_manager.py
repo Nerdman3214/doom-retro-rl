@@ -28,6 +28,8 @@ class RewardManager:
         self.previous_position = None
         self.recent_rotations = 0
         self._coach_multipliers = self._load_coach_multipliers()
+        self.initial_distance = None
+        self.closest_distance = None
 
     @staticmethod
     def _load_coach_multipliers() -> dict:
@@ -356,6 +358,8 @@ class RewardManager:
         self.previous_ammo = None
         self.previous_health = 100
         self._last_health_change = 0
+        self.initial_distance = None
+        self.closest_distance = None
 
     def detect_grid_exploration(self, game_state):
         x = game_state.get("x")
@@ -392,6 +396,32 @@ class RewardManager:
                 self.add("movement_progress", 0.08 * progress)
 
         self.previous_position = current_position
+
+    def set_goal_distance(self, initial_distance):
+        """Called at episode reset with initial player-to-goal distance."""
+        self.initial_distance = initial_distance
+        self.closest_distance = initial_distance
+
+    def detect_distance_to_goal(self, game_state):
+        """
+        Reward progress toward goal.
+        
+        Normalized: goes from 0 (start) to ~1 (goal reached).
+        """
+        if self.initial_distance is None or self.initial_distance == 0:
+            return
+
+        x = game_state.get("x")
+        y = game_state.get("y")
+        if x is None or y is None:
+            return
+
+        # This would require goal position; for now, we track closest approach
+        # In full implementation, compute actual distance to goal_pos
+        if self.closest_distance is not None:
+            distance_progress = 1.0 - (self.closest_distance / self.initial_distance)
+            distance_progress = max(0.0, min(distance_progress, 1.0))
+            self.add("distance_to_goal", 2.0 * distance_progress)
 
     def get_frame_signature(self):
 
@@ -485,6 +515,8 @@ class RewardManager:
         self.detect_ammo_pickup(game_state["ammo"])
         self.detect_resource_priority_behavior(action)
         self.detect_resource_waste()
+        # Normalized reward signals (bounded 0-1)
+        self.detect_distance_to_goal(game_state)
         self.detect_health_and_ammo_ratio(game_state)
         self.detect_grid_exploration(game_state)
         self.detect_movement_progress(game_state)

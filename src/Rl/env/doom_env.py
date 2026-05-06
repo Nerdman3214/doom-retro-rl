@@ -236,6 +236,7 @@ class DoomEnv(gym.Env):
         
         # Reset reward manager state for new episode
         self.reward_manager.reset()
+        self.reward_manager.set_goal_distance(dist)
 
         config = self.get_stage_config()
 
@@ -268,14 +269,15 @@ class DoomEnv(gym.Env):
 
         action = self.actions[action_index]
 
-        current_dist = np.linalg.norm(
-            np.array(player_pos) - np.array(goal_pos)
-        )
+        # Update closest distance to goal for normalized reward
+        goal_pos = self.observer.get_goal_position()
+        player_pos = self.observer.get_player_position()
 
-        if current_dist < self.closest_distance:
-            self.closest_distance = current_dist
-
-        distance_progress = 1 - (self.closest_distance / self.initial_distance)
+        if goal_pos and player_pos:
+            current_dist = np.linalg.norm(np.array(player_pos) - np.array(goal_pos))
+            if self.closest_distance is not None and current_dist < self.closest_distance:
+                self.closest_distance = current_dist
+                self.reward_manager.closest_distance = self.closest_distance
 
         frame = self.observer.get_frame()
         enemy_visible = self.reward_manager.enemy_detector.detect_enemy_presence(frame)
