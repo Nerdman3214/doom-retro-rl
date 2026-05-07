@@ -51,6 +51,8 @@ CodeAnalysisResultManifest.txt
 
 # RL specific
 src/Rl/venv/
+src/Rl/dataset/
+src/Rl/datasets/
 build/
 *.so
 *.pkl
