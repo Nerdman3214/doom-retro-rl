@@ -57,18 +57,16 @@ class RewardManager:
             reward_delta * REWARD_WEIGHTS["distance_progress"],
         )
 
-    def update_exploration_reward(self, player_pos, max_tiles=500):
+    def update_exploration_reward(self, player_pos):
         if player_pos is None:
             return
 
-        tile = tuple(int(round(coord)) for coord in player_pos)
+        tile = (int(player_pos[0] / 64), int(player_pos[1] / 64))
         if tile not in self.visited_tiles:
             self.visited_tiles.add(tile)
-            exploration_ratio = len(self.visited_tiles) / max_tiles
-            exploration_ratio = max(0.0, min(exploration_ratio, 1.0))
             self.add(
                 "exploration",
-                exploration_ratio * REWARD_WEIGHTS["exploration"],
+                0.2 * REWARD_WEIGHTS["exploration"],
             )
 
     def update_resource_reward(self, health, ammo):
@@ -102,7 +100,7 @@ class RewardManager:
         if len(self.pixel_diff_history) > 5:
             self.pixel_diff_history.pop(0)
         
-        if pixel_diff < 0.5:
+        if pixel_diff < 2.0:
             self.add("stuck_penalty", -1.0)
     
     def get_stuck_severity(self) -> float:

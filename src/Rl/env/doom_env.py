@@ -35,7 +35,7 @@ from recording.event_recorder import EventRecorder
 
 
 DOOM_BINARY = "/home/steven/Downloads/doomretro-master/build/doomretro"
-DOOM_IWAD = "/usr/share/games/doom/freedoom1.wad"
+DOOM_IWAD = "/usr/share/games/doom/freedoom2.wad"
 
 
 class DoomEnv(gym.Env):
@@ -68,32 +68,37 @@ class DoomEnv(gym.Env):
         self.helper = HelperBot()
         self.record = record
         self.reward_overlay = RewardDebugOverlay() if RewardDebugOverlay is not None else None
-        self.stuck_counter = 0 
+        self.stuck_counter = 0
         self.curriculum_stage = 0
         self.curriculum_rewards = []
         self.curriculum_thresholds = {
-            0: 5000,
-            1: 10000,
-            2: 15000,
-            3: 25000,
-            4: 35000,
-            5: 45000,
-            6: 55000,
-            7: 65000
+            0: 0.0,
+            1: 0.0,
+            2: 0.0,
+            3: 0.1,
+            4: 0.2,
+            5: 0.0,
+            6: 0.2,
+            7: 0.3,
         }
         self.max_stage = 7
+        self.last_player_position = None
+        self.distance_traveled = 0.0
+        self.visited_tiles = set()
         self.enemy_visible_steps = 0
         self.initial_distance = None
         self.closest_distance = None
         
         # Stage-specific behavior counters
-        self.movement_count = 0      # Stage 0: count movements
-        self.exploration_count = 0            # Stage 1: count new areas and item pickups
+        self.movement_count = 0      # Stage 0: count meaningful moves
+        self.exploration_count = 0            # Stage 1: count new tiles explored
         self.pickup_count = 0                 # Stage 1: count important item pickups
         self.continuous_movement_steps = 0   # Stage 2: count non-stuck steps
         self.door_interaction_count = 0       # Stage 3: count door interactions
         self.key_item_count = 0               # Stage 3: count important item pickups/keys
         self.enemy_engagement_count = 0       # Stage 4: count shots at visible enemies
+        self.track_enemy_count = 0             # Stage 4: count visible enemies
+        self.dodge_enemies_count = 0          # Stage 4: count times player dodged enemies
         self.valid_shot_count = 0             # Stage 5+: count accurate shots
         self.level_completion_count = 0       # Stage 7: track level completion
         self.visited_areas = set()            # Track unique areas for exploration
@@ -182,6 +187,8 @@ class DoomEnv(gym.Env):
                 "visible": True,
                 "allow_shoot": True,
                 "require_enemy_visible_to_shoot": True,
+                "dodge_enemies": True,
+                "track_enemy": True,
                 "enemy_enabled": True,
                 "max_enemies": 1,
                 "goal": "defeat_enemies"
@@ -189,6 +196,8 @@ class DoomEnv(gym.Env):
             4: {
                 "name": "combat_full",
                 "allow_shoot": True,
+                "track_enemy": True,
+                "dodge_enemies": True,
                 "require_enemy_visible_to_shoot": True,
                 "enemy_enabled": True,
                 "max_enemies": min(10, self._step_count // 200),
@@ -197,6 +206,9 @@ class DoomEnv(gym.Env):
             5: {
                 "name": "key_doors",
                 "allow_shoot": False,
+                "require_enemy_visible_to_shoot": True,
+                "track_enemy": True,
+                "dodge_enemies": True,
                 "enemy_enabled": False,
                 "goal": "open_doors"
             },
@@ -205,6 +217,8 @@ class DoomEnv(gym.Env):
                 "allow_shoot": True,
                 "require_enemy_visible_to_shoot": True,
                 "enemy_enabled": True,
+                "dodge_enemies": True,
+                "track_enemy": True,
                 "max_enemies": 1000,
                 "goal": "defeat_enemies"
             },
@@ -212,6 +226,8 @@ class DoomEnv(gym.Env):
                 "name": 'complete_level',
                 "allow_shoot": True,
                 "require_enemy_visible_to_shoot": True,
+                "track_enemy": True,
+                "dodge_enemies": True,
                 "enemy_enabled": True,
                 "max_enemies": 5000,
                 "goal": "finish_level"
@@ -227,11 +243,16 @@ class DoomEnv(gym.Env):
         self.pickup_count = 0
         self.continuous_movement_steps = 0
         self.door_interaction_count = 0
+        self.track_enemy_count = 0
+        self.dodge_enemies_count = 0
         self.key_item_count = 0
         self.enemy_engagement_count = 0
         self.valid_shot_count = 0
         self.enemy_visible_steps = 0
         self.stuck_counter = 0
+        self.distance_traveled = 0.0
+        self.visited_tiles.clear()
+        self.last_player_position = self.observer.get_player_position()
 
         goal_pos = self.observer.get_goal_position()
         player_pos = self.observer.get_player_position()
@@ -281,6 +302,8 @@ class DoomEnv(gym.Env):
 
         action = self.actions[action_index]
 
+        reward = 0.0  # Initialize reward accumulator
+
         # Update closest distance to goal for normalized reward
         goal_pos = self.observer.get_goal_position()
         player_pos = self.observer.get_player_position()
@@ -301,18 +324,16 @@ class DoomEnv(gym.Env):
         config = self.get_stage_config()
 
         if enemy_visible and not self.reward_manager.enemy_in_crosshair(frame):
-            self.reward_manager.add("aiming", +0.05)
+            self.reward_manager.add("aiming", +10)
+
 
         if action == "shoot" and config.get("require_enemy_visible_to_shoot", False) and not enemy_visible:
-            self.reward_manager.add("shoot_without_visible_enemy", -1.0)
+            self.reward_manager.add("shoot_without_visible_enemy", -15.0)
         else:
             self.perform_action(action)
 
         # Track stage-specific behavior
         movement_actions = ["move_forward", "move_backward", "turn_left", "turn_right"]
-        if self.curriculum_stage == 0 and action in movement_actions:
-            self.movement_count += 1
-        
         if self.curriculum_stage == 1:
             area_sig = self._get_area_signature()
             if area_sig != self.last_area_signature:
@@ -328,14 +349,14 @@ class DoomEnv(gym.Env):
 
         if action == "shoot":
             if self._step_count - self.last_shot_step < 5:
-                self.reward_manager.add("spam_penalty", -0.3)
+                self.reward_manager.add("spam_penalty", -15)
             else:
                 self.last_shot_step = self._step_count
 
             if not self.reward_manager.enemy_in_crosshair(frame):
-                self.reward_manager.add("wasted_shot", -0.2)
+                self.reward_manager.add("wasted_shot", -15)
             else:
-                self.reward_manager.add("good_shot", +0.3)
+                self.reward_manager.add("good_shot", +10)
 
         frame = self.observer.build()
         observation = self.frame_stack.add_frame(frame)
@@ -347,13 +368,38 @@ class DoomEnv(gym.Env):
             game_state["ammo"],
         )
 
+        distance_moved = 0.0
         if game_state["shared_state_available"]:
             player_x, player_y = game_state["x"], game_state["y"]
+            current_player_pos = (player_x, player_y)
+
+            if self.last_player_position is not None:
+                distance_moved = float(
+                    np.linalg.norm(
+                        np.array(current_player_pos) - np.array(self.last_player_position)
+                    )
+                )
+            else:
+                distance_moved = 0.0
+
+            self.last_player_position = current_player_pos
+            self.distance_traveled += distance_moved
+
+            if distance_moved > 5.0:
+                self.movement_count += 1
+                reward += 0.05
+            elif action in movement_actions:
+                reward -= 0.005
+
+            tile = (int(player_x // 64), int(player_y // 64))
+            if tile not in self.visited_tiles:
+                self.visited_tiles.add(tile)
+                reward += 0.2
+                self.exploration_count += 1
+
             self.exploration_memory.visit(player_x, player_y)
             novelty_reward = self.exploration_memory.get_novelty(player_x, player_y) * 0.3
             self.reward_manager.add("exploration_novelty", novelty_reward)
-            if novelty_reward > 0.2:
-                self.exploration_count += 1
 
         # Stuck detection: compare current frame to previous
         current_frame = self.observer.get_frame()
@@ -365,7 +411,7 @@ class DoomEnv(gym.Env):
             self.reward_manager.penalize_stuck(pixel_diff)
         self._previous_frame = current_frame
 
-        reward = self.reward_manager.get_reward()
+        reward += self.reward_manager.get_reward()
 
         # Update progression counters based on recently detected game events
         if self.curriculum_stage == 1:
@@ -385,34 +431,29 @@ class DoomEnv(gym.Env):
 
         # Stage-specific reward shaping
         if self.curriculum_stage == 0:
-            # Stage 0: Focus on any movement and exploration
-            if action in movement_actions:
+            # Stage 0: Focus on real locomotion/travel, not just action presses
+            if distance_moved > 5.0:
                 reward += 0.05
-            else:
-                reward -= 0.01
+            elif action in movement_actions:
+                reward -= 0.005
 
         elif self.curriculum_stage == 1:
-            # Stage 1: Reward any movement, exploration, and item pickups
-            reward += 0.02
-            if action in ["move_forward", "move_backward"]:
+            # Stage 1: Reward exploration, item pickups, and safe movement
+            if distance_moved > 5.0:
                 reward += 0.03
-            if action in ["turn_left", "turn_right"]:
+            if len(self.visited_tiles) > 0 and action in movement_actions:
                 reward += 0.01
             if game_state["health_delta"] > 0 or game_state["ammo_delta"] > 0:
                 reward += 0.5
 
         elif self.curriculum_stage == 2:
-            # Stage 2: Reward all movement, penalize staying still
-            if action in ["move_forward", "move_backward", "turn_left", "turn_right"]:
-                reward += 0.05
-            elif action == "use":
-                reward += 0.04
-            else:
-                reward -= 0.02
-            
-            if pixel_diff < 1.5:
-                reward -= 0.02
-
+            # Stage 2: Avoid stagnation and keep moving through rooms
+            if distance_moved > 5.0:
+                reward += 0.03
+            if pixel_diff < 2.0:
+                reward -= 0.05
+            if self.stuck_counter > 20:
+                reward -= 0.75
 
         elif self.curriculum_stage == 3:
             # Stage 4: Reward shooting visible enemies
@@ -441,7 +482,7 @@ class DoomEnv(gym.Env):
         else:
             reward -= 0.05
 
-        if pixel_diff < 1.5:  # Threshold for being "stuck" (more sensitive)
+        if pixel_diff < 2.0:  # Threshold for being "stuck" (more sensitive)
             self.stuck_counter += 1
         else:
             self.stuck_counter = 0
@@ -456,6 +497,9 @@ class DoomEnv(gym.Env):
             done = True
         else:
             done = False
+
+        if self.stuck_counter > 40:
+            self.reward_manager.add("long_stuck_penalty", -1.0)
 
         self.reward_manager.update_stagnation_penalty(self.stuck_counter)
         self._step_count += 1
@@ -530,50 +574,49 @@ class DoomEnv(gym.Env):
             return
 
         avg_reward = sum(self.curriculum_rewards) / len(self.curriculum_rewards)
-        threshold = self.curriculum_thresholds.get(self.curriculum_stage, 1e9)
-        reward_ready = avg_reward > threshold
+        threshold = self.curriculum_thresholds.get(self.curriculum_stage, 0.0)
+        reward_ready = True if threshold <= 0.0 else avg_reward > threshold
         behavior_ready = False
 
         if self.curriculum_stage == 0:
-            # Stage 0: Require 100+ forward movements
-            behavior_ready = self.movement_count >= 50
-            print(f"  [Stage 0] moves: {self.movement_count}/50 | Reward: {avg_reward:.1f}/{threshold}")
+            # Stage 0: Require meaningful distance traveled, not just button presses
+            behavior_ready = self.movement_count >= 20 and self.distance_traveled >= 150.0
+            print(f"  [Stage 0] real moves: {self.movement_count}/20 | distance: {self.distance_traveled:.1f}/150 | Reward: {avg_reward:.2f}/{threshold}")
         
         elif self.curriculum_stage == 1:
-            # Stage 1: Require exploration and basic resource pickup
-            behavior_ready = len(self.visited_areas) >= 1 and self.pickup_count >= 3
-            print(f"  [Stage 1] Areas explored: {len(self.visited_areas)}/1 | Pickups: {self.pickup_count}/3 | Reward: {avg_reward:.1f}/{threshold}")
+            # Stage 1: Require exploration into new sectors and at least one pickup
+            behavior_ready = len(self.visited_tiles) >= 5 and self.pickup_count >= 1
+            print(f"  [Stage 1] tiles: {len(self.visited_tiles)}/5 | pickups: {self.pickup_count}/1 | Reward: {avg_reward:.2f}/{threshold}")
         
         elif self.curriculum_stage == 2:
-            # Stage 2: Require 80+ continuous movement steps (not stuck)
-            behavior_ready = self.continuous_movement_steps >= 20 and self.stuck_counter == 0
-            print(f"  [Stage 2] Movement steps: {self.continuous_movement_steps}/20 | Stuck counter: {self.stuck_counter}")
-        
+            # Stage 2: Require sustained movement without stagnation
+            behavior_ready = self.continuous_movement_steps >= 30 and self.stuck_counter == 0
+            print(f"  [Stage 2] movement steps: {self.continuous_movement_steps}/30 | stuck: {self.stuck_counter}")
+
         elif self.curriculum_stage == 3:
-            # Stage 4: Require 20+ shots at visible enemies + 10+ steps seeing enemies
-            behavior_ready = self.enemy_engagement_count >= 20 and self.enemy_visible_steps >= 10
-            print(f"  [Stage 4] Enemy shots: {self.enemy_engagement_count}/20 | Visible: {self.enemy_visible_steps}/10")
+            # Stage 3: Require shots at visible enemies and awareness of them
+            behavior_ready = self.enemy_engagement_count >= 10 and self.enemy_visible_steps >= 10
+            print(f"  [Stage 3] visible shots: {self.enemy_engagement_count}/10 | visible steps: {self.enemy_visible_steps}/10 | Reward: {avg_reward:.2f}/{threshold}")
         
         elif self.curriculum_stage == 4:
-            # Stage 5: Require 40+ accurate shots
-            behavior_ready = self.valid_shot_count >= 40
-            print(f"  [Stage 5] Accurate shots: {self.valid_shot_count}/40 | Reward: {avg_reward:.1f}/{threshold}")
+            # Stage 4: Require accurate shooting
+            behavior_ready = self.valid_shot_count >= 15
+            print(f"  [Stage 4] accurate shots: {self.valid_shot_count}/15 | Reward: {avg_reward:.2f}/{threshold}")
 
         elif self.curriculum_stage == 5:
-            # Stage 3: Require door usage plus item/key awareness
+            # Stage 5: Require door interaction and important pickups
             behavior_ready = self.door_interaction_count >= 1 and self.key_item_count >= 1
-            print(f"  [Stage 3] Doors opened: {self.door_interaction_count}/1 | Items collected: {self.key_item_count}/1 | Reward: {avg_reward:.1f}/{threshold}")
+            print(f"  [Stage 5] doors: {self.door_interaction_count}/1 | keys/items: {self.key_item_count}/1 | Reward: {avg_reward:.2f}/{threshold}")
         
         elif self.curriculum_stage == 6:
-            # Stage 6: Require 60+ accurate shots (sustained combat)
-            behavior_ready = self.valid_shot_count >= 60
-            print(f"  [Stage 6] Accurate shots: {self.valid_shot_count}/60 | Reward: {avg_reward:.1f}/{threshold}")
+            # Stage 6: Require sustained accurate shooting
+            behavior_ready = self.valid_shot_count >= 30
+            print(f"  [Stage 6] accurate shots: {self.valid_shot_count}/30 | Reward: {avg_reward:.2f}/{threshold}")
         
         elif self.curriculum_stage == 7:
-            # Stage 7: Just maintain good reward
+            # Stage 7: Final level progress stage
             behavior_ready = True
-            print(f"  [Stage 7] Final stage - Reward: {avg_reward:.1f}/{threshold}")
-
+            print(f"  [Stage 7] final stage - Reward: {avg_reward:.2f}/{threshold}")
         stage_ready = reward_ready and behavior_ready
 
         if stage_ready:
