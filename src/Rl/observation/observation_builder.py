@@ -3,7 +3,6 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
-from collections import deque
 from utils.shm_reader import read_player_state
 import frame_cache
 import frame_processor
@@ -14,8 +13,6 @@ OUT_W, OUT_H = 84, 84
 class ObservationBuilder:
 
     def __init__(self):
-
-        self.frames = deque(maxlen=4)
 
         # Game state tracking from shared memory if DOOM Retro is running with the RL hook.
         self.health = 100
@@ -100,15 +97,4 @@ class ObservationBuilder:
 
 
     def build(self):
-
-        frame = self.get_frame()
-
-        self.frames.append(frame)
-
-        while len(self.frames) < 4:
-
-            self.frames.append(frame)
-
-        stacked = np.concatenate(list(self.frames), axis=2)
-
-        return stacked
+        return self.get_frame()

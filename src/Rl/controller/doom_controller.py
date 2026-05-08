@@ -72,6 +72,8 @@ class DoomController:
     # --- Movement (held so the character actually moves a visible distance) ---
     def move_forward(self):   self._xkey_held("up",    0.06)
     def move_backward(self):  self._xkey_held("down",  0.06)
+    def move_left(self):      self._xkey_held("left",  0.06)
+    def move_right(self):     self._xkey_held("right", 0.06)
     def turn_left(self):      self._xkey_held("left",  0.06)
     def turn_right(self):     self._xkey_held("right", 0.06)
 

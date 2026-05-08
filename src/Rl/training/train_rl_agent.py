@@ -6,13 +6,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback
 from env.doom_env import DoomEnv
+from wrappers.normalize_wrapper import NormalizeObservationWrapper
 import time
 
 env = DoomEnv(launch_doom=True)
-
-# Focus DOOM window once before training
+# Focus DOOM window once before wrapping, since the wrapper does not expose controller helpers.
 env.controller.focus_game()
 time.sleep(2)
+env = NormalizeObservationWrapper(env)
 
 ppo_kwargs = dict(
     verbose=1,
@@ -22,6 +23,7 @@ ppo_kwargs = dict(
     n_epochs=4,
     ent_coef=0.01,
     clip_range=0.2,
+    policy_kwargs=dict(normalize_images=False),
 )
 
 CHECKPOINT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "checkpoints", "doom_rl_agent")
