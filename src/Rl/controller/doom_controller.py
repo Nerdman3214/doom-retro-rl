@@ -44,7 +44,6 @@ class DoomController:
         if not self.window_id:
             return
         xkeys = [_XDOTOOL_KEYS.get(k, k) for k in keys]
-        # windowfocus + key in one process = no focus race condition
         subprocess.call(
             ["xdotool", "windowfocus", "--sync", self.window_id, "key"] + xkeys,
             stderr=subprocess.DEVNULL
@@ -69,7 +68,7 @@ class DoomController:
     def tap(self, key, duration=0.05):
         self._xkey_held(key, duration)
 
-    # --- Movement (held so the character actually moves a visible distance) ---
+    # --- Movement ---
     def move_forward(self):   self._xkey_held("up",    0.06)
     def move_backward(self):  self._xkey_held("down",  0.06)
     def move_left(self):      self._xkey_held("left",  0.06)
@@ -77,7 +76,7 @@ class DoomController:
     def turn_left(self):      self._xkey_held("left",  0.06)
     def turn_right(self):     self._xkey_held("right", 0.06)
 
-    # --- Combat (instant press is fine) ---
+    # --- Combat ---
     def shoot(self):          self._xkey("ctrl")
 
     def use(self):
@@ -129,7 +128,7 @@ class DoomController:
         for k in ["2", "3", "4", "5", "6", "7"]:
             self._xkey(k)
 
-    # --- Camera (alias for turn) ---
+    # --- Camera ---
     def move_camera(self, direction, duration=0.1):
         key_map = {"left": "left", "right": "right",
                    "forward": "up", "backward": "down"}

@@ -30,6 +30,32 @@ class RewardManager:
             self.breakdown[name] = 0.0
         self.breakdown[name] += value
 
+    # ------------------------------------------------------------------
+    # FIX #8: Added movement_reward() — was called in doom_env but missing
+    # ------------------------------------------------------------------
+    def movement_reward(self, game_state: dict) -> float:
+        """
+        Reward real locomotion during the movement stage.
+        Returns a float that doom_env adds directly to its reward accumulator.
+        All stage-0 movement reward lives here to avoid double-counting.
+        """
+        reward = 0.0
+        distance_moved = game_state.get("distance_moved", 0.0)
+        action = game_state.get("action", "")
+
+        movement_actions = [
+            "move_forward", "move_backward",
+            "turn_left", "turn_right",
+            "strafe_left", "strafe_right",
+        ]
+
+        if distance_moved > 5.0:
+            reward += 0.1   # meaningful physical movement
+        elif action in movement_actions:
+            reward -= 0.005  # tiny penalty for pressing move but not moving
+
+        return reward
+
     def update_distance_reward(self, player_pos, goal_pos):
         if player_pos is None or goal_pos is None:
             return
@@ -99,10 +125,12 @@ class RewardManager:
         self.pixel_diff_history.append(pixel_diff)
         if len(self.pixel_diff_history) > 5:
             self.pixel_diff_history.pop(0)
-        
+
+        # FIX: reduced from -1.0 to -0.2 so it doesn't overwhelm other signals.
+        # Termination in doom_env already handles hard stuck cases.
         if pixel_diff < 2.0:
-            self.add("stuck_penalty", -1.0)
-    
+            self.add("stuck_penalty", -0.2)
+
     def get_stuck_severity(self) -> float:
         """Return stuck severity (0=moving freely, 1.0=completely stuck)."""
         if not self.pixel_diff_history:
@@ -110,15 +138,19 @@ class RewardManager:
         avg_diff = np.mean(self.pixel_diff_history)
         severity = max(0.0, 1.0 - (avg_diff / 2.0))
         return min(severity, 1.0)
-    
+
     def reward_escape_behavior(self, action: str, pixel_diff: float):
         """Reward actions that increase pixel_diff when stuck."""
         if len(self.pixel_diff_history) < 2:
             return
-        
-        prev_avg = np.mean(self.pixel_diff_history[:-1]) if len(self.pixel_diff_history) > 1 else 0.0
-        
-        if pixel_diff > prev_avg + 0.01:  # Progress made
+
+        prev_avg = (
+            np.mean(self.pixel_diff_history[:-1])
+            if len(self.pixel_diff_history) > 1
+            else 0.0
+        )
+
+        if pixel_diff > prev_avg + 0.01:
             if action in ["move_backward", "turn_left", "turn_right"]:
                 self.add("escape_action", +0.03)
 
