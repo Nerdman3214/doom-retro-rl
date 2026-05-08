@@ -32,6 +32,8 @@ from recording.clip_generator import ClipGenerator
 from recording.smart_clip_generator import SmartClipGenerator
 from recording.record_player_session import PlayerRecorder
 from recording.event_recorder import EventRecorder
+from curriculum.curriculum_manager import CurriculumManager
+
 
 
 DOOM_BINARY = "/home/steven/Downloads/doomretro-master/build/doomretro"
@@ -102,6 +104,7 @@ class DoomEnv(gym.Env):
         self.valid_shot_count = 0             # Stage 5+: count accurate shots
         self.level_completion_count = 0       # Stage 7: track level completion
         self.visited_areas = set()            # Track unique areas for exploration
+        self.curriculum = CurriculumManager()
 
         self.event_recorder = EventRecorder()
         self.smart_clipper = SmartClipGenerator()
@@ -362,6 +365,7 @@ class DoomEnv(gym.Env):
         observation = self.frame_stack.add_frame(frame)
 
         game_state = self.observer.get_game_state()
+        stage = self.curriculum.get_stage_name()
         game_state["enemy_visible"] = enemy_visible
         self.reward_manager.update_resource_reward(
             game_state["health"],
@@ -400,6 +404,48 @@ class DoomEnv(gym.Env):
             self.exploration_memory.visit(player_x, player_y)
             novelty_reward = self.exploration_memory.get_novelty(player_x, player_y) * 0.3
             self.reward_manager.add("exploration_novelty", novelty_reward)
+
+        if stage == "movement":
+            reward += self.reward_manager.movement_reward(
+            game_state
+        )
+            
+        elif stage == "track_enemy":
+
+            if game_state["enemy_visible"]:
+
+                reward += 0.5
+
+                enemy_x = game_state["enemy_x"]
+
+                center_distance = abs(enemy_x - 42)
+
+                tracking_reward = max(
+                    0,
+                    1 - (center_distance / 42)
+                )
+
+                reward += tracking_reward
+
+        elif stage == "dodge_enemies":
+
+            if game_state["enemy_visible"]:
+
+                reward += 0.2
+
+            if game_state["damage_taken"]:
+
+                reward -= 1
+
+            if action in [
+
+                "turn_left",
+                "turn_right",
+
+            ]:
+
+                reward += 0.05
+
 
         # Stuck detection: compare current frame to previous
         current_frame = self.observer.get_frame()
