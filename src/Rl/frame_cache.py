@@ -64,16 +64,25 @@ def _get_monitor(force_refresh: bool = False):
     if rect:
         left, top, width, height = rect
 
-        # Sanity-check: mss will crash with XGetImage() if width/height are 0
+        # Clamp to screen bounds — mss crashes with XGetImage() if the capture
+        # region extends even 1 pixel beyond the screen edge.
+        # Root cause: window at x=1271 width=1299 on a 2560px screen puts the
+        # right edge at 2570, which is 10px off-screen → XGetImage fails.
+        _ensure_sct()
+        screen = _sct.monitors[1]
+        if left + width > screen["width"]:
+            width = screen["width"] - left
+        if top + height > screen["height"]:
+            height = screen["height"] - top
+
         if width <= 0 or height <= 0:
-            print(f"[frame_cache] Window rect invalid ({width}x{height}) — "
+            print(f"[frame_cache] Window rect invalid after clamping ({width}x{height}) — "
                   "falling back to full monitor.")
-            _ensure_sct()
-            _monitor = _sct.monitors[1]
+            _monitor = screen
         else:
             _monitor = {"left": left, "top": top, "width": width, "height": height}
             print(f"[frame_cache] Capturing DOOM window at "
-                  f"{left},{top} {width}×{height}")
+                  f"{left},{top} {width}×{height} (clamped to screen bounds)")
     else:
         _ensure_sct()
         _monitor = _sct.monitors[1]
