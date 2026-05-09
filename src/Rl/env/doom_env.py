@@ -170,18 +170,24 @@ class DoomEnv(gym.Env):
                 "name": "movement",
                 "allow_shoot": False,
                 "enemy_enabled": False,
+                "strafe_left": True,
+                "strafe_right": True,
                 "goal": "move"
             },
             1: {
                 "name": "game_basics",
                 "allow_shoot": False,
                 "enemy_enabled": False,
+                "strafe_left": True,
+                "strafe_right": True,
                 "goal": "explore_and_pick_items"
             },
             2: {
                 "name": "avoid_getting_stuck",
                 "allow_shoot": False,
                 "enemy_enabled": False,
+                "strafe_left": True,
+                "strafe_right": True,
                 "goal": "avoid_stuck"
             },
             3: {
@@ -192,6 +198,9 @@ class DoomEnv(gym.Env):
                 "dodge_enemies": True,
                 "track_enemy": True,
                 "enemy_enabled": True,
+                "strafe_left": True,
+                "strafe_right": True,
+                "Swap_Weapon": True,
                 "max_enemies": 1,
                 "goal": "defeat_enemies"
             },
@@ -202,6 +211,9 @@ class DoomEnv(gym.Env):
                 "dodge_enemies": True,
                 "require_enemy_visible_to_shoot": True,
                 "enemy_enabled": True,
+                "strafe_left": True,
+                "strafe_right": True,
+                "Swap_Weapon": True,
                 "max_enemies": min(10, self._step_count // 200),
                 "goal": "defeat_enemies"
             },
@@ -209,6 +221,9 @@ class DoomEnv(gym.Env):
                 "name": "key_doors",
                 "allow_shoot": False,
                 "require_enemy_visible_to_shoot": True,
+                "strafe_left": True,
+                "strafe_right": True,
+                "Swap_Weapon": True,
                 "track_enemy": True,
                 "dodge_enemies": True,
                 "enemy_enabled": False,
@@ -221,6 +236,9 @@ class DoomEnv(gym.Env):
                 "enemy_enabled": True,
                 "dodge_enemies": True,
                 "track_enemy": True,
+                "strafe_left": True,
+                "strafe_right": True,
+                "Swap_Weapon": True,
                 "max_enemies": 1000,
                 "goal": "defeat_enemies"
             },
@@ -231,6 +249,9 @@ class DoomEnv(gym.Env):
                 "track_enemy": True,
                 "dodge_enemies": True,
                 "enemy_enabled": True,
+                "strafe_left": True,
+                "strafe_right": True,
+                "Swap_Weapon": True,
                 "max_enemies": 5000,
                 "goal": "finish_level"
             }

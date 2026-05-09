@@ -8,6 +8,8 @@ class ActionSpace:
         "turn_right_shoot",
         "move_forward_shoot",
         "shoot",
+        "Strafe_Left",
+        "Strafe_Right",
         "move_backward",
         "move_backward_shoot",
         "swap_weapon",

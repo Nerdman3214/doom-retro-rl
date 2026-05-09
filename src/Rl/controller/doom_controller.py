@@ -24,7 +24,7 @@ class DoomController:
             return result.decode().splitlines()[0]
 
         except Exception:
-
+            
             return None
 
     def _xkey(self, *keys):
