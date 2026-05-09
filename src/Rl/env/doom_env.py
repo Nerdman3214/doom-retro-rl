@@ -41,7 +41,7 @@ DOOM_IWAD = "/usr/share/games/doom/freedoom2.wad"
 
 class DoomEnv(gym.Env):
 
-    def __init__(self, launch_doom=False, record=True):
+    def __init__(self, launch_doom=True, record=True):
 
         super(DoomEnv, self).__init__()
 

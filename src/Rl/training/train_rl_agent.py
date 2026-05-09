@@ -10,7 +10,6 @@ from wrappers.normalize_wrapper import NormalizeObservationWrapper
 import time
 
 env = DoomEnv(launch_doom=True)
-env.controller.focus_game()
 time.sleep(2)
 env = NormalizeObservationWrapper(env)
 
