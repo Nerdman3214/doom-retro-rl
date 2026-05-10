@@ -108,6 +108,7 @@ class DoomEnv(gym.Env):
         self.valid_shot_count = 0
         self.level_completion_count = 0
         self.visited_areas = set()
+        self.swap_weapon_count = 0
 
         self.event_recorder = EventRecorder()
         self.smart_clipper = SmartClipGenerator()
@@ -415,6 +416,8 @@ class DoomEnv(gym.Env):
         action = self.actions[action_index]
         reward = 0.0
         self.apply_movement(action)
+        if action == "swap_weapon":
+            self.swap_weapon_count += 1
 
         turn_signal = 0.0
 
@@ -494,6 +497,7 @@ class DoomEnv(gym.Env):
             else:
                 self.reward_manager.add("wasted_shot", -5.0)
 
+
         frame = self.observer.build()
         observation = self.frame_stack.add_frame(frame)
 
@@ -529,7 +533,7 @@ class DoomEnv(gym.Env):
             tile = (int(player_x // 64), int(player_y // 64))
             if tile not in self.visited_tiles:
                 self.visited_tiles.add(tile)
-                reward += 0.2
+                reward += 0.03
                 self.exploration_count += 1
 
             self.exploration_memory.visit(player_x, player_y)
@@ -574,9 +578,11 @@ class DoomEnv(gym.Env):
         elif self.curriculum_stage == 3:
             # Stage 3: Basic combat — reward shooting visible enemies
             if action == "shoot" and enemy_visible:
-                reward += 0.10
+                reward += 1.0
             if self.reward_manager.enemy_in_crosshair(frame) and action == "shoot":
-                reward += 0.20
+                reward += 2.0
+            if action == "shoot" and not enemy_visible:
+                reward -= 1.5
             if action == "use":
                 self.door_interaction_count += 1
             if game_state["health_delta"] > 0 or game_state["ammo_delta"] > 0:
@@ -619,6 +625,14 @@ class DoomEnv(gym.Env):
                           "strafe_left", "strafe_right"]:
                 self.reward_manager.add("dodge_movement", 0.05)
                 self.dodge_enemies_count += 1
+
+
+        if action == "shoot":
+            if game_state.get("ammo") == 10:
+                self.reward_manager.add("low_ammo", -1.0)
+                if action == "swap_weapon":
+                    self.reward_manager.add("weapon_swapped", +1.0)
+                    self.swap_weapon_count += 1
 
         # ----------------------------------------------------------------
         # Stuck detection

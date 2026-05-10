@@ -12,6 +12,7 @@ class EnemyDetector:
         self.previous_enemy_pixels = None
         self.momentum = 0
         self.previous_enemy_center = None
+        self.confidence = 0
 
     def capture(self):
         return frame_cache.get_bgr()
@@ -19,6 +20,7 @@ class EnemyDetector:
     def detect_enemy_presence(self, frame):
         # BGR: ch2=R, ch1=G → mean(R - G) > 15
         dom = frame_processor.channel_diff_mean(frame, 3, 2, 1)
+        self.confidence += 1
         return dom > 15
 
     def detect_enemy_centered(self, frame):
@@ -30,11 +32,13 @@ class EnemyDetector:
         cy2 = int(h * 0.6)
 
         center = frame[cy1:cy2, cx1:cx2]
+        self.confidence += 1
         dom = frame_processor.centre_channel_diff_mean(frame, w, h, 3, 40, 2, 1)
         return dom > 20
 
     def detect_enemy_size_growth(self):
         frame = self.capture()
+        self.confidence += 1
         h, w, _ = frame.shape
         enemy_pixels = frame_processor.centre_channel_count(frame, w, h, 3, 40, 2, 1, 20)
 
@@ -51,6 +55,7 @@ class EnemyDetector:
     def detect_enemy_motion_direction(self):
         frame = self.capture()
         h, w, _ = frame.shape
+        self.confidence += 1
         current_center = frame_processor.centre_channel_x_mean(
             frame, w, h, 3, 40, 2, 1, 20
         )
@@ -64,21 +69,5 @@ class EnemyDetector:
 
         movement = current_center - self.previous_enemy_center
         self.previous_enemy_center = current_center
-        return movement
+        return movement, self.confidence >= 3
     
-    def confidence(self):
-        confidence = 0
-
-    if red_detected:
-        confidence += 1
-
-    if moving:
-        confidence += 1
-
-    if centered:
-        confidence += 1
-
-    if growing:
-        confidence += 1
-
-    return confidence >= 3

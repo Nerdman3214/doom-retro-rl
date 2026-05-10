@@ -9,6 +9,8 @@ class RewardManager:
     def __init__(self):
         self.enemy_detector = EnemyDetector()
         self.reset_episode()
+        self.last_tile_reward_count = 0
+        self.visited_tiles = set()
 
     def reset_episode(self):
         self.total_reward = 0.0
@@ -24,6 +26,7 @@ class RewardManager:
     def reset(self):
         self.reset_episode()
         self.last_tile_reward_count = 0
+        self.visited_tiles.clear()
 
     def add(self, name, value):
         self.total_reward += value
@@ -85,15 +88,23 @@ class RewardManager:
         )
 
     def update_exploration_reward(self, player_pos):
+
         if player_pos is None:
             return
 
-        tile = (int(player_pos[0] / 64), int(player_pos[1] / 64))
+        tile = (
+            int(player_pos[0] / 64),
+            int(player_pos[1] / 64)
+        )
+
         if tile not in self.visited_tiles:
+
             self.visited_tiles.add(tile)
 
             if len(self.visited_tiles) > self.last_tile_reward_count:
-                reward += 0.05
+
+                self.add("exploration_tile", 0.05)
+
                 self.last_tile_reward_count = len(self.visited_tiles)
 
     def update_resource_reward(self, health, ammo):
