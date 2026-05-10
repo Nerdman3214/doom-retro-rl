@@ -23,6 +23,7 @@ class RewardManager:
 
     def reset(self):
         self.reset_episode()
+        self.last_tile_reward_count = 0
 
     def add(self, name, value):
         self.total_reward += value
@@ -90,10 +91,10 @@ class RewardManager:
         tile = (int(player_pos[0] / 64), int(player_pos[1] / 64))
         if tile not in self.visited_tiles:
             self.visited_tiles.add(tile)
-            self.add(
-                "exploration",
-                0.2 * REWARD_WEIGHTS["exploration"],
-            )
+
+            if len(self.visited_tiles) > self.last_tile_reward_count:
+                reward += 0.05
+                self.last_tile_reward_count = len(self.visited_tiles)
 
     def update_resource_reward(self, health, ammo):
         if health is None or ammo is None:
@@ -153,6 +154,24 @@ class RewardManager:
         if pixel_diff > prev_avg + 0.01:
             if action in ["move_backward", "turn_left", "turn_right"]:
                 self.add("escape_action", +0.03)
+
+    def excessive_turn(self):
+        self.add("turn_penalty", -0.02)
+
+    def moved_forward(self):
+        self.add("forward_bonus", +0.05)
+
+    def enemy_visible(self):
+        self.add("enemy_visible", +0.02)
+
+    def enemy_centered(self):
+        self.add("enemy_centered", +0.05)
+
+    def smart_shot(self):
+        self.add("smart_shot", +0.08)
+
+    def wasted_shot(self):
+        self.add("wasted_shot", -0.05)
 
     def get_reward(self):
         r = self.total_reward

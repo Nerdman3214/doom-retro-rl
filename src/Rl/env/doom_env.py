@@ -38,7 +38,6 @@ from curriculum.curriculum_manager import CurriculumManager
 DOOM_BINARY = "/home/steven/Downloads/doomretro-master/build/doomretro"
 DOOM_IWAD = "/usr/share/games/doom/freedoom2.wad"
 
-
 class DoomEnv(gym.Env):
 
     def __init__(self, launch_doom=True, record=True):
@@ -69,6 +68,8 @@ class DoomEnv(gym.Env):
         self.reward_overlay = RewardDebugOverlay() if RewardDebugOverlay is not None else None
         self.stuck_counter = 0
         self.curriculum_stage = 0
+        self.stage = 0
+        self.rotation_state = DoomController.RotationState()
 
         # FIX #4: CurriculumManager is now synced to self.curriculum_stage.
         # get_stage_name() takes curriculum_stage as an argument instead of
@@ -256,7 +257,7 @@ class DoomEnv(gym.Env):
                 "goal": "finish_level"
             }
         }[self.curriculum_stage]
-
+    
     def reset(self, seed=None, options=None):
         self._step_count = 0
 
@@ -313,12 +314,118 @@ class DoomEnv(gym.Env):
         frame = self.observer.build()
         observation = self.frame_stack.reset(frame)
         return observation, {}
+    
+    def get_allowed_actions(self):
+
+        stage = self.curriculum_stage
+
+        if stage == 0:
+            return [
+                "move_forward",
+                "turn_left",
+                "turn_right",
+            ]
+
+        elif stage == 1:
+            return [
+                "move_forward",
+                "move_backward",
+                "turn_left",
+                "turn_right",
+                "use",
+            ]
+
+        elif stage == 2:
+            return [
+                "move_forward",
+                "move_backward",
+                "turn_left",
+                "turn_right",
+                "strafe_left",
+                "strafe_right",
+            ]
+
+        elif stage >= 3:
+            return [
+                "move_forward",
+                "move_backward",
+                "turn_left",
+                "turn_right",
+                "strafe_left",
+                "strafe_right",
+                "shoot",
+                "use",
+                "swap_weapon",
+            ]
+        elif stage == 4:
+            return [
+                "move_forward",
+                "move_backward",
+                "turn_left",
+                "turn_right",
+                "strafe_left",
+                "strafe_right",
+                "shoot",
+                "use",
+                "swap_weapon",
+            ]
+        elif stage == 5:
+            return [
+                "move_forward",
+                "move_backward",
+                "turn_left",
+                "turn_right",
+                "strafe_left",
+                "strafe_right",
+                "shoot",
+                "use",
+                "swap_weapon",
+            ]
+        elif stage == 6:
+            return [
+                "move_forward",
+                "move_backward",
+                "turn_left",
+                "turn_right",
+                "strafe_left",
+                "strafe_right",
+                "shoot",
+                "use",
+                "swap_weapon",
+            ]
+        elif stage == 7:
+            return [
+                "move_forward",
+                "move_backward",
+                "turn_left",
+                "turn_right",
+                "strafe_left",
+                "strafe_right",
+                "shoot",
+                "use",
+                "swap_weapon",
+            ]
 
     def step(self, action_index):
+
+        pixel_diff = 999.0
+
         frame_cache.invalidate()
 
         action = self.actions[action_index]
         reward = 0.0
+        self.apply_movement(action)
+
+        turn_signal = 0.0
+
+        if action == "turn_left":
+            turn_signal = -1.0
+        elif action == "turn_right":
+            turn_signal = 1.0
+
+        turn = self.rotation_state.update(turn_signal)
+
+        self.apply_rotation(turn)
 
         # FIX #4: Pass self.curriculum_stage so CurriculumManager stays synced.
         stage = self.curriculum.get_stage_name(self.curriculum_stage)
@@ -342,10 +449,17 @@ class DoomEnv(gym.Env):
         enemy_visible = self.reward_manager.enemy_detector.detect_enemy_presence(frame)
         self.enemy_visible_steps += 1 if enemy_visible else 0
 
+        if enemy_visible:
+            self.reward_manager.enemy_visible()
+
+        if action in ["turn_left", "turn_right"]:
+            self.reward_manager.excessive_turn()
+
         # FIX #5: Aiming reward was inverted — now correctly fires when enemy IS
         # in crosshair (not when it isn't).
         if enemy_visible and self.reward_manager.enemy_in_crosshair(frame):
             self.reward_manager.add("aiming", +10)
+            self.reward_manager.enemy_centered()
 
         # Enforce shoot restriction for stages that require enemy visibility
         if action == "shoot" and config.get("require_enemy_visible_to_shoot", False) and not enemy_visible:
@@ -510,12 +624,18 @@ class DoomEnv(gym.Env):
         # Stuck detection
         # ----------------------------------------------------------------
         current_frame = self.observer.get_frame()
-        pixel_diff = 0.0
+
         if self._previous_frame is not None:
+
             pixel_diff = float(
-                np.abs(current_frame.astype(int) - self._previous_frame.astype(int)).mean()
+                np.abs(
+                    current_frame.astype(int)
+                    - self._previous_frame.astype(int)
+                ).mean()
             )
+
             self.reward_manager.penalize_stuck(pixel_diff)
+
         self._previous_frame = current_frame
 
         if pixel_diff < 2.0:
@@ -687,37 +807,52 @@ class DoomEnv(gym.Env):
         return score.item()
 
     def perform_action(self, action):
+        allowed = self.get_allowed_actions()
         config = self.get_stage_config()
 
         if not config["allow_shoot"] and "shoot" in action:
             return
+        
+        if action not in allowed:
+            return  # ignore invalid action OR penalize
 
-        if action == "move_forward":
-            self.controller.move_forward()
-        elif action == "move_backward":
-            self.controller.move_backward()
-        elif action == "move_left":
-            self.controller.move_left()
-        elif action == "move_right":
-            self.controller.move_right()
-        elif action == "turn_left":
-            self.controller.turn_left()
-        elif action == "turn_right":
-            self.controller.turn_right()
         elif action == "shoot":
             self.controller.shoot()
+
         elif action == "use":
             self.controller.use()
-        elif action == "turn_left_shoot":
-            self.controller.turn_left_shoot()
-        elif action == "turn_right_shoot":
-            self.controller.turn_right_shoot()
-        elif action == "move_forward_shoot":
-            self.controller.move_forward_shoot()
-        elif action == "move_backward_shoot":
-            self.controller.move_backward_shoot()
+
         elif action == "swap_weapon":
             self.controller.swap_weapon()
+
+        elif action == "strafe_left":
+            self.controller.strafe_left()
+
+        elif action == "strafe_right":
+            self.controller.strafe_right()
+
+    def apply_rotation(self, turn_value):
+        if turn_value < -0.2:
+            self.controller.start_turn_left()
+            self.controller.key_up("Right")
+
+        elif turn_value > 0.2:
+            self.controller.start_turn_right()
+            self.controller.key_up("Left")
+
+        else:
+            self.controller.stop_turn()
+
+    def apply_movement(self, action):
+
+        # stop old movement first
+        self.controller.stop_forward_backward()
+
+        if action == "move_forward":
+            self.controller.start_move_forward()
+
+        elif action == "move_backward":
+            self.controller.start_move_backward()
 
     def close(self):
         if self.record:

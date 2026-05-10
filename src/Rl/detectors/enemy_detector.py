@@ -23,6 +23,13 @@ class EnemyDetector:
 
     def detect_enemy_centered(self, frame):
         h, w = frame.shape[:2]
+        cx1 = int(w * 0.4)
+        cx2 = int(w * 0.6)
+
+        cy1 = int(h * 0.4)
+        cy2 = int(h * 0.6)
+
+        center = frame[cy1:cy2, cx1:cx2]
         dom = frame_processor.centre_channel_diff_mean(frame, w, h, 3, 40, 2, 1)
         return dom > 20
 
@@ -58,3 +65,20 @@ class EnemyDetector:
         movement = current_center - self.previous_enemy_center
         self.previous_enemy_center = current_center
         return movement
+    
+    def confidence(self):
+        confidence = 0
+
+    if red_detected:
+        confidence += 1
+
+    if moving:
+        confidence += 1
+
+    if centered:
+        confidence += 1
+
+    if growing:
+        confidence += 1
+
+    return confidence >= 3
