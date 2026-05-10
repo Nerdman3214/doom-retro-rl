@@ -22,6 +22,15 @@ class EnemyDetector:
         dom = frame_processor.channel_diff_mean(frame, 3, 2, 1)
         self.confidence += 1
         return dom > 15
+    
+
+    def red_dominance(self):
+        self.confidence += 1
+    
+
+    def humanoid_ratio(self):
+        self.confidence += 1
+        
 
     def detect_enemy_centered(self, frame):
         h, w = frame.shape[:2]

@@ -36,7 +36,7 @@ from curriculum.curriculum_manager import CurriculumManager
 
 
 DOOM_BINARY = "/home/steven/Downloads/doomretro-master/build/doomretro"
-DOOM_IWAD = "/usr/share/games/doom/freedoom2.wad"
+DOOM_IWAD = "/usr/share/games/doom/freedoom1.wad"
 
 class DoomEnv(gym.Env):
 
@@ -94,6 +94,7 @@ class DoomEnv(gym.Env):
         self.enemy_visible_steps = 0
         self.initial_distance = None
         self.closest_distance = None
+        self.last_damage_source = None
 
         # Stage-specific behavior counters
         self.movement_count = 0
@@ -426,7 +427,7 @@ class DoomEnv(gym.Env):
         elif action == "turn_right":
             turn_signal = 1.0
 
-        turn = self.rotation_state.update(turn_signal)
+        turn = turn_signal
 
         self.apply_rotation(turn)
 
@@ -627,12 +628,14 @@ class DoomEnv(gym.Env):
                 self.dodge_enemies_count += 1
 
 
-        if action == "shoot":
-            if game_state.get("ammo") == 10:
-                self.reward_manager.add("low_ammo", -1.0)
-                if action == "swap_weapon":
-                    self.reward_manager.add("weapon_swapped", +1.0)
-                    self.swap_weapon_count += 1
+        if action == "swap_weapon":
+
+            if game_state["ammo"] <= 2:
+                self.controller.swap_weapon()
+                reward += 0.2
+
+            else:
+                reward -= 0.5
 
         # ----------------------------------------------------------------
         # Stuck detection

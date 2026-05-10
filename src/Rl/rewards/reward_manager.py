@@ -107,6 +107,22 @@ class RewardManager:
 
                 self.last_tile_reward_count = len(self.visited_tiles)
 
+    def detect_acid_damage(
+        self,
+        health_delta,
+        distance_moved,
+        floor_green_ratio
+    ):
+
+        if (
+            health_delta < 0
+            and distance_moved < 3
+            and floor_green_ratio > 0.25
+        ):
+            return True
+
+        return False
+
     def update_resource_reward(self, health, ammo):
         if health is None or ammo is None:
             return
