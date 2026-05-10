@@ -94,7 +94,7 @@ class ObservationBuilder:
         raw, w, h = frame_cache.get_raw()
         resized = frame_processor.resize_bgra_to_bgr(raw, w, h, OUT_W, OUT_H)
         return np.frombuffer(resized, dtype=np.uint8).reshape(OUT_H, OUT_W, 3).copy()
-
+    
 
     def build(self):
         return self.get_frame()

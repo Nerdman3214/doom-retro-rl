@@ -33,6 +33,7 @@ from recording.smart_clip_generator import SmartClipGenerator
 from recording.record_player_session import PlayerRecorder
 from recording.event_recorder import EventRecorder
 from curriculum.curriculum_manager import CurriculumManager
+from observation.frame_processor import 
 
 
 DOOM_BINARY = "/home/steven/Downloads/doomretro-master/build/doomretro"
@@ -453,6 +454,21 @@ class DoomEnv(gym.Env):
         enemy_visible = self.reward_manager.enemy_detector.detect_enemy_presence(frame)
         self.enemy_visible_steps += 1 if enemy_visible else 0
 
+        floor_green_ratio = frame_processor.floor_green_ratio(frame)
+
+        self.reward_manager.detect_acid_damage(
+            game_state["health_delta"],
+            distance_moved,
+            floor_green_ratio
+        )
+
+        red_ratio = frame_processor.red_flash_ratio(frame)
+
+        self.reward_manager.detect_barrel_damage(
+            game_state["health_delta"],
+            red_ratio
+        )
+
         if enemy_visible:
             self.reward_manager.enemy_visible()
 
@@ -679,6 +695,14 @@ class DoomEnv(gym.Env):
         else:
             done = False
 
+        if game_state.get("level_complete", False):
+
+            reward += 100.0
+
+            self.level_completion_count += 1
+
+            done = True
+
         self.reward_manager.update_stagnation_penalty(self.stuck_counter)
 
         reward += self.reward_manager.get_reward()
@@ -706,6 +730,7 @@ class DoomEnv(gym.Env):
                 self.event_recorder.set_event("took_damage")
 
         self.previous_health = player_health
+
 
         if enemy_visible and self.record:
             self.smart_clipper.trigger_event()

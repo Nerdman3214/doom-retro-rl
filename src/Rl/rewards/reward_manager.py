@@ -114,14 +114,26 @@ class RewardManager:
         floor_green_ratio
     ):
 
-        if (
+        acid_detected = (
             health_delta < 0
             and distance_moved < 3
             and floor_green_ratio > 0.25
-        ):
-            return True
+        )
 
-        return False
+        if acid_detected:
+
+            self.acid_damage_frames += 1
+
+            self.add(
+                "acid_damage",
+                -2.0
+            )
+
+        else:
+
+            self.acid_damage_frames = 0
+
+        return acid_detected
 
     def update_resource_reward(self, health, ammo):
         if health is None or ammo is None:
@@ -204,6 +216,27 @@ class RewardManager:
         r = self.total_reward
         self.total_reward = 0.0
         return r
+    
+
+    def detect_barrel_damage(
+        self,
+        health_delta,
+        red_flash_ratio
+    ):
+
+        exploded = (
+            health_delta < -15
+            and red_flash_ratio > 0.30
+        )
+
+        if exploded:
+
+            self.add(
+                "barrel_explosion",
+                -4.0
+            )
+
+        return exploded
 
     def enemy_in_crosshair(self, frame):
         if frame is None:
