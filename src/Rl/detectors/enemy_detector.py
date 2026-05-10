@@ -3,7 +3,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import frame_cache
-import frame_processor
+from observation.frame_processor import FrameProcessor
 
 
 class EnemyDetector:
@@ -19,7 +19,7 @@ class EnemyDetector:
 
     def detect_enemy_presence(self, frame):
         # BGR: ch2=R, ch1=G → mean(R - G) > 15
-        dom = frame_processor.channel_diff_mean(frame, 3, 2, 1)
+        dom = FrameProcessor().channel_diff_mean(frame, 3, 2, 1)
         self.confidence += 1
         return dom > 15
     
@@ -42,14 +42,14 @@ class EnemyDetector:
 
         center = frame[cy1:cy2, cx1:cx2]
         self.confidence += 1
-        dom = frame_processor.centre_channel_diff_mean(frame, w, h, 3, 40, 2, 1)
+        dom = FrameProcessor().centre_channel_diff_mean(frame, w, h, 3, 40, 2, 1)
         return dom > 20
 
     def detect_enemy_size_growth(self):
         frame = self.capture()
         self.confidence += 1
         h, w, _ = frame.shape
-        enemy_pixels = frame_processor.centre_channel_count(frame, w, h, 3, 40, 2, 1, 20)
+        enemy_pixels = FrameProcessor().centre_channel_count(frame, w, h, 3, 40, 2, 1, 20)
 
         if self.previous_enemy_pixels is None:
             self.previous_enemy_pixels = enemy_pixels
@@ -65,7 +65,7 @@ class EnemyDetector:
         frame = self.capture()
         h, w, _ = frame.shape
         self.confidence += 1
-        current_center = frame_processor.centre_channel_x_mean(
+        current_center = FrameProcessor().centre_channel_x_mean(
             frame, w, h, 3, 40, 2, 1, 20
         )
 

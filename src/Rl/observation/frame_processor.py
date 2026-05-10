@@ -18,6 +18,15 @@ class FrameProcessor:
         a = region[:, :, channel_a - 1].astype(np.float32)
         b = region[:, :, channel_b - 1].astype(np.float32)
         return np.mean(a - b)
+    
+    def centre_channel_count(self, frame, width, height, channel_idx, region_size):
+        cx1 = width // 2 - region_size
+        cx2 = width // 2 + region_size
+        cy1 = height // 2 - region_size
+        cy2 = height // 2 + region_size
+        region = frame[cy1:cy2, cx1:cx2]
+        channel = region[:, :, channel_idx - 1]
+        return channel.size  # Total number of pixels   
 
     def floor_green_ratio(self, frame):
         h, w = frame.shape[:2]

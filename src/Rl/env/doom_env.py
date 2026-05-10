@@ -33,7 +33,7 @@ from recording.smart_clip_generator import SmartClipGenerator
 from recording.record_player_session import PlayerRecorder
 from recording.event_recorder import EventRecorder
 from curriculum.curriculum_manager import CurriculumManager
-from observation.frame_processor import 
+from observation.frame_processor import FrameProcessor
 
 
 DOOM_BINARY = "/home/steven/Downloads/doomretro-master/build/doomretro"
@@ -454,20 +454,9 @@ class DoomEnv(gym.Env):
         enemy_visible = self.reward_manager.enemy_detector.detect_enemy_presence(frame)
         self.enemy_visible_steps += 1 if enemy_visible else 0
 
-        floor_green_ratio = frame_processor.floor_green_ratio(frame)
+        floor_green_ratio = FrameProcessor().floor_green_ratio(frame)
 
-        self.reward_manager.detect_acid_damage(
-            game_state["health_delta"],
-            distance_moved,
-            floor_green_ratio
-        )
-
-        red_ratio = frame_processor.red_flash_ratio(frame)
-
-        self.reward_manager.detect_barrel_damage(
-            game_state["health_delta"],
-            red_ratio
-        )
+        red_ratio = FrameProcessor().red_flash_ratio(frame)
 
         if enemy_visible:
             self.reward_manager.enemy_visible()
@@ -643,7 +632,16 @@ class DoomEnv(gym.Env):
                 self.reward_manager.add("dodge_movement", 0.05)
                 self.dodge_enemies_count += 1
 
+        self.reward_manager.detect_acid_damage(
+            game_state["health_delta"],
+            distance_moved,
+            floor_green_ratio
+        )
 
+        if enemy_visible:
+            self.reward_manager.enemy_visible()
+
+            
         if action == "swap_weapon":
 
             if game_state["ammo"] <= 2:
@@ -752,6 +750,11 @@ class DoomEnv(gym.Env):
             pref_reward = self.preference_reward(frame)
             pref_reward = max(min(pref_reward, 3), -3)
             reward += 0.1 * pref_reward
+
+        self.reward_manager.detect_barrel_damage(
+            game_state["health_delta"],
+            red_ratio
+        )
 
         if self.record:
             self.logger.log(frame, action, game_state["health"], game_state["ammo"])

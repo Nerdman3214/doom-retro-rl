@@ -11,6 +11,8 @@ class RewardManager:
         self.reset_episode()
         self.last_tile_reward_count = 0
         self.visited_tiles = set()
+        self.acid_damage_frames = 0 
+           
 
     def reset_episode(self):
         self.total_reward = 0.0
