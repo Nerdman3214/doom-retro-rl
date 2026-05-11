@@ -6,47 +6,33 @@ class FrameProcessor:
     def __init__(self, width=84, height=84):
         self.width = width
         self.height = height
+        self.prev_gray = None
 
-        self.prev_frame = None
-
+    # -----------------------------
+    # CORE PREPROCESS
+    # -----------------------------
     def preprocess(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         resized = cv2.resize(gray, (self.width, self.height))
         return resized.astype(np.uint8)
-    
-    def enemy_heatmap(self, frame):
-        gray = self.preprocess(frame)
 
-        # simple proxy (replace later with real detector)
-        heatmap = (gray > 120).astype(np.float32)
-
-        return heatmap
-
+    # -----------------------------
+    # MOTION SIGNAL
+    # -----------------------------
     def motion(self, frame):
         gray = self.preprocess(frame)
 
-        if self.prev_frame is None:
-            self.prev_frame = gray
+        if self.prev_gray is None:
+            self.prev_gray = gray
             return 0.0
 
-        diff = np.abs(gray.astype(np.int16) - self.prev_frame.astype(np.int16))
-        self.prev_frame = gray
-
+        diff = np.abs(gray.astype(np.int16) - self.prev_gray.astype(np.int16))
+        self.prev_gray = gray
         return float(np.mean(diff))
-    
-    def attention_crop(self, frame, cx, cy, size=42):
-        h, w = frame.shape[:2]
 
-        x = int((cx + 1) * w / 2)
-        y = int((cy + 1) * h / 2)
-
-        x1 = max(0, x - size)
-        x2 = min(w, x + size)
-        y1 = max(0, y - size)
-        y2 = min(h, y + size)
-
-        return frame[y1:y2, x1:x2]
-
+    # -----------------------------
+    # CENTER OF MASS (enemy proxy)
+    # -----------------------------
     def center_of_mass(self, frame):
         gray = self.preprocess(frame)
 
@@ -60,6 +46,66 @@ class FrameProcessor:
 
         return (cx / w) * 2 - 1, (cy / h) * 2 - 1
 
+    # -----------------------------
+    # CHANNEL DIFFERENCE FEATURES
+    # -----------------------------
+    def channel_diff_mean(self, frame, c1, c2, c3):
+        # simple RGB/BGR channel contrast signal
+        return float(np.mean(frame[:, :, c1].astype(np.float32) - frame[:, :, c2]))
+
+    def centre_channel_diff_mean(self, frame, w, h, c1, crop, c2, c3):
+        h0, w0 = frame.shape[:2]
+        cx, cy = w0 // 2, h0 // 2
+
+        x1, x2 = cx - crop, cx + crop
+        y1, y2 = cy - crop, cy + crop
+
+        crop_img = frame[y1:y2, x1:x2]
+        return self.channel_diff_mean(crop_img, c1, c2, c3)
+
+    def centre_channel_count(self, frame, w, h, c1, crop, c2, c3, threshold):
+        h0, w0 = frame.shape[:2]
+        cx, cy = w0 // 2, h0 // 2
+
+        x1, x2 = cx - crop, cx + crop
+        y1, y2 = cy - crop, cy + crop
+
+        crop_img = frame[y1:y2, x1:x2]
+
+        diff = crop_img[:, :, c1].astype(np.int16) - crop_img[:, :, c2].astype(np.int16)
+        return float(np.sum(diff > threshold))
+
+    def centre_channel_x_mean(self, frame, w, h, c1, crop, c2, c3, threshold):
+        h0, w0 = frame.shape[:2]
+        cx, cy = w0 // 2, h0 // 2
+
+        x1, x2 = cx - crop, cx + crop
+        y1, y2 = cy - crop, cy + crop
+
+        crop_img = frame[y1:y2, x1:x2]
+
+        mask = (crop_img[:, :, c1].astype(np.int16) - crop_img[:, :, c2]) > threshold
+
+        if not np.any(mask):
+            return 0
+
+        xs = np.where(mask)[1]
+        return float(np.mean(xs))
+
+    # -----------------------------
+    # SIMPLE COLOR SIGNALS (YOU WERE MISSING THESE)
+    # -----------------------------
+    def floor_green_ratio(self, frame):
+        green = frame[:, :, 1]
+        return float(np.mean(green > 120))
+
+    def red_flash_ratio(self, frame):
+        red = frame[:, :, 2]
+        return float(np.mean(red > 150))
+
+    # -----------------------------
+    # MAIN EXTRACTOR
+    # -----------------------------
     def extract(self, frame):
         obs = self.preprocess(frame)
         motion = self.motion(frame)

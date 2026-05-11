@@ -412,528 +412,398 @@ class DoomEnv(gym.Env):
                 "swap_weapon",
             ]
 
-    def step(self, action_index):
+    # CORE STEP FLOW (STABLE VERSION)
 
-        pixel_diff = 999.0
+def step(self, action_index):
 
-        frame_cache.invalidate()
+    frame_cache.invalidate()
 
-        action = self.actions[action_index]
-        reward = 0.0
-        self.apply_movement(action)
-        if action == "swap_weapon":
-            self.swap_weapon_count += 1
+    reward = 0.0
+    done = False
 
-        turn_signal = 0.0
+    # ---------------------------------------------------------
+    # VALID ACTION MASKING
+    # ---------------------------------------------------------
 
-        if action == "turn_left":
-            turn_signal = -1.0
-        elif action == "turn_right":
-            turn_signal = 1.0
+    if action_index not in self.get_valid_actions():
+        reward -= 0.2
+        return obs, reward, False, False, {}
+    # ---------------------------------------------------------
+    # ACTION LOOKUP
+    # ---------------------------------------------------------
 
-        turn = turn_signal
+    action = self.actions[action_index]
 
-        self.apply_rotation(turn)
+    # ---------------------------------------------------------
+    # EXECUTE ACTION
+    # ---------------------------------------------------------
 
-        if action_index not in self.get_valid_actions():
-            reward -= 0.2
-            return obs, reward, False, False, {}
+    self.perform_action(action)
 
-        # FIX #4: Pass self.curriculum_stage so CurriculumManager stays synced.
-        stage = self.curriculum.get_stage_name(self.curriculum_stage)
+    # ---------------------------------------------------------
+    # OBSERVE FRAME
+    # ---------------------------------------------------------
 
-        config = self.get_stage_config()
+    frame = self.observer.get_frame()
 
-        # Update goal distance tracking
-        goal_pos = self.observer.get_goal_position()
-        player_pos = self.observer.get_player_position()
+    observation_tensor, motion, cx, cy = (
+        self.frame_processor.extract(frame)
+    )
 
-        if goal_pos is not None and player_pos is not None:
-            current_dist = np.linalg.norm(np.array(player_pos) - np.array(goal_pos))
-            if self.closest_distance is not None and current_dist < self.closest_distance:
-                self.closest_distance = current_dist
-                self.reward_manager.closest_distance = self.closest_distance
+    # ---------------------------------------------------------
+    # ENEMY DETECTION
+    # ---------------------------------------------------------
 
-        self.reward_manager.update_distance_reward(player_pos, goal_pos)
-        self.reward_manager.update_exploration_reward(player_pos)
+    enemy_visible = (
+        self.reward_manager.enemy_detector
+        .detect_enemy_presence(frame)
+    )
 
-        frame = self.observer.get_frame()
-        obs, motion, cx, cy = self.frame_processor.extract(frame)
+    if enemy_visible:
+        self.enemy_visible_steps += 1
 
-        if motion < 1.5:
-            self.stuck_counter += 1
-        else:
-            self.stuck_counter = 0
+    # ---------------------------------------------------------
+    # ENVIRONMENT ANALYSIS
+    # ---------------------------------------------------------
 
-        obs, motion, cx, cy = self.frame_processor.extract(frame)
+    floor_green_ratio = (
+        self.frame_processor.floor_green_ratio(frame)
+    )
 
-        enemy_visible = self.reward_manager.enemy_detector.detect_enemy_presence(frame)
-        self.enemy_visible_steps += 1 if enemy_visible else 0
+    red_ratio = (
+        self.frame_processor.red_flash_ratio(frame)
+    )
 
-        floor_green_ratio = FrameProcessor().floor_green_ratio(frame)
+    # ---------------------------------------------------------
+    # STUCK DETECTION
+    # ---------------------------------------------------------
 
-        red_ratio = FrameProcessor().red_flash_ratio(frame)
+    if motion < 1.5:
 
-        if motion < 1.0 and action == "move_forward":
-            reward -= 0.1
+        self.stuck_counter += 1
 
-        if self.stuck_counter > 20:
-            reward -= 1.0
+    else:
 
-        if enemy_visible:
-            self.reward_manager.enemy_visible()
+        if self.stuck_counter > 10:
+            reward += 2.0
 
-        if action in ["turn_left", "turn_right"]:
-            self.reward_manager.excessive_turn()
+        self.stuck_counter = 0
 
-        # FIX #5: Aiming reward was inverted — now correctly fires when enemy IS
-        # in crosshair (not when it isn't).
-        if enemy_visible and self.reward_manager.enemy_in_crosshair(frame):
-            self.reward_manager.add("aiming", +10)
-            self.reward_manager.enemy_centered()
+    # punish wall scraping
+    if motion < 1.0 and action == "move_forward":
 
-        # Enforce shoot restriction for stages that require enemy visibility
-        if action == "shoot" and config.get("require_enemy_visible_to_shoot", False) and not enemy_visible:
-            self.reward_manager.add("shoot_without_visible_enemy", -5.0)
-            # Do NOT perform the action — skip to next step logic
-        else:
-            self.perform_action(action)
+        reward -= 0.15
 
-        # Track exploration area changes (stage 1)
-        movement_actions = ["move_forward", "move_backward", "turn_left", "turn_right"]
-        if self.curriculum_stage == 1:
-            area_sig = self._get_area_signature()
-            if area_sig != self.last_area_signature:
-                self.exploration_count += 1
-                self.visited_areas.add(area_sig)
-                self.last_area_signature = area_sig
+    # reward escape behavior
+    if (
+        self.stuck_counter > 10
+        and action in [
+            "turn_left",
+            "turn_right",
+            "move_backward",
+            "strafe_left",
+            "strafe_right",
+        ]
+    ):
 
-        # FIX #2: Shooting rewards are now in ONE place only — removed duplicate
-        # wasted_shot / spam_penalty blocks that were scattered earlier in the
-        # original step(). This single block handles all shoot accounting.
-        if action == "shoot":
-            if self._step_count - self.last_shot_step < 5:
-                self.reward_manager.add("spam_penalty", -5.0)
-            else:
-                self.last_shot_step = self._step_count
+        reward += 0.1
 
-            if self.reward_manager.enemy_in_crosshair(frame):
-                self.reward_manager.add("good_shot", +10)
-                if self.curriculum_stage >= 3:
-                    self.enemy_engagement_count += 1
-                    self.valid_shot_count += 1
-            else:
-                self.reward_manager.add("wasted_shot", -5.0)
+    # severe stuck punishment
+    if self.stuck_counter > 25:
 
+        reward -= 1.0
 
-        frame = self.observer.build()
-        observation = self.frame_stack.add_frame(frame)
+    # ---------------------------------------------------------
+    # GAME STATE
+    # ---------------------------------------------------------
 
-        game_state = self.observer.get_game_state()
-        game_state["enemy_visible"] = enemy_visible
+    game_state = self.observer.get_game_state()
 
-        self.reward_manager.update_resource_reward(
-            game_state["health"],
-            game_state["ammo"],
+    game_state["enemy_visible"] = enemy_visible
+    game_state["motion"] = motion
+
+    # ---------------------------------------------------------
+    # DISTANCE TRACKING
+    # ---------------------------------------------------------
+
+    distance_moved = 0.0
+
+    if game_state["shared_state_available"]:
+
+        player_x = game_state["x"]
+        player_y = game_state["y"]
+
+        current_player_pos = (
+            player_x,
+            player_y
         )
 
-        # ----------------------------------------------------------------
-        # Position / movement tracking
-        # ----------------------------------------------------------------
-        distance_moved = 0.0
-        if game_state["shared_state_available"]:
-            player_x, player_y = game_state["x"], game_state["y"]
-            current_player_pos = (player_x, player_y)
+        if self.last_player_position is not None:
 
-            if self.last_player_position is not None:
-                distance_moved = float(
-                    np.linalg.norm(
-                        np.array(current_player_pos) - np.array(self.last_player_position)
-                    )
+            distance_moved = float(
+                np.linalg.norm(
+                    np.array(current_player_pos)
+                    - np.array(self.last_player_position)
                 )
-
-            self.last_player_position = current_player_pos
-            self.distance_traveled += distance_moved
-
-            if distance_moved > 5.0:
-                self.movement_count += 1
-
-            tile = (int(player_x // 64), int(player_y // 64))
-            if tile not in self.visited_tiles:
-                self.visited_tiles.add(tile)
-                reward += 0.03
-                self.exploration_count += 1
-
-            self.exploration_memory.visit(player_x, player_y)
-            novelty_reward = self.exploration_memory.get_novelty(player_x, player_y) * 0.3
-            self.reward_manager.add("exploration_novelty", novelty_reward)
-
-        # Expose distance_moved to game_state so movement_reward() can use it
-        game_state["distance_moved"] = distance_moved
-        game_state["action"] = action
-
-        # ----------------------------------------------------------------
-        # FIX #2 & #3: Stage-specific reward routing — each stage is now in
-        # its own exclusive branch with no overlap.
-        # FIX #3: Stage 5 (key_doors) is now reachable (was swallowed by >=4).
-        # ----------------------------------------------------------------
-        if self.curriculum_stage == 0:
-            # Stage 0: Real locomotion only — movement_reward() owns this signal
-            reward += self.reward_manager.movement_reward(game_state)
-
-        elif self.curriculum_stage == 1:
-            # Stage 1: Exploration + item pickups
-            if distance_moved > 5.0:
-                reward += 0.03
-            if len(self.visited_tiles) > 0 and action in movement_actions:
-                reward += 0.01
-            if game_state["health_delta"] > 0 or game_state["ammo_delta"] > 0:
-                reward += 0.5
-                self.pickup_count += 1
-
-        elif self.curriculum_stage == 2:
-            # Stage 2: Avoid stagnation
-            if distance_moved > 5.0:
-                reward += 0.03
-            if pixel_diff < 2.0:
-                reward -= 0.05
-            if self.stuck_counter > 20:
-                reward -= 0.75
-            if action in ["move_forward", "move_backward", "strafe_left",
-                          "strafe_right", "turn_left", "turn_right"] and pixel_diff > 1.0:
-                self.continuous_movement_steps += 1
-
-        elif self.curriculum_stage == 3:
-            # Stage 3: Basic combat — reward shooting visible enemies
-            if action == "shoot" and enemy_visible:
-                reward += 1.0
-            if self.reward_manager.enemy_in_crosshair(frame) and action == "shoot":
-                reward += 2.0
-            if action == "shoot" and not enemy_visible:
-                reward -= 1.5
-            if action == "use":
-                self.door_interaction_count += 1
-            if game_state["health_delta"] > 0 or game_state["ammo_delta"] > 0:
-                self.key_item_count += 1
-
-        elif self.curriculum_stage == 4:
-            # Stage 4: Full combat — accurate shooting rewarded via shoot block above
-            pass
-
-        elif self.curriculum_stage == 5:
-            # FIX #3: Stage 5 now reachable — door/key rewards restored (single reward per use)
-            if action == "use":
-                reward += 2.0
-                self.door_interaction_count += 1
-            if game_state["health_delta"] > 0 or game_state["ammo_delta"] > 0:
-                reward += 0.3
-                self.key_item_count += 1
-
-        elif self.curriculum_stage >= 6:
-            # Stage 6 & 7: Full game — combat handled by reward_manager
-            pass
-
-        # ----------------------------------------------------------------
-        # FIX #4: track_enemy and dodge_enemies routing now uses stage name
-        # that is correctly synced to self.curriculum_stage
-        # ----------------------------------------------------------------
-        if config.get("track_enemy", False) and enemy_visible:
-            enemy_x = game_state.get("enemy_x", 42)
-            center_distance = abs(enemy_x - 42)
-            tracking_reward = max(0.0, 1.0 - (center_distance / 42))
-            self.reward_manager.add("track_enemy", tracking_reward * 0.5)
-            self.track_enemy_count += 1
-
-        if config.get("dodge_enemies", False):
-            if enemy_visible:
-                self.reward_manager.add("enemy_visible_dodge", 0.1)
-            if game_state.get("damage_taken", False):
-                self.reward_manager.add("took_damage_penalty", -1.0)
-            if action in ["turn_left", "turn_right", "move_backward",
-                          "strafe_left", "strafe_right"]:
-                self.reward_manager.add("dodge_movement", 0.05)
-                self.dodge_enemies_count += 1
-
-        self.reward_manager.detect_acid_damage(
-            game_state["health_delta"],
-            distance_moved,
-            floor_green_ratio
-        )
-
-        if enemy_visible:
-            self.reward_manager.enemy_visible()
-
-
-        if action == "swap_weapon":
-
-            if game_state["ammo"] <= 2:
-                self.controller.swap_weapon()
-                reward += 0.2
-
-            else:
-                reward -= 0.5
-
-        # ----------------------------------------------------------------
-        # Stuck detection
-        # ----------------------------------------------------------------
-        current_frame = self.observer.get_frame()
-
-        if self._previous_frame is not None:
-
-            pixel_diff = float(
-                np.abs(
-                    current_frame.astype(int)
-                    - self._previous_frame.astype(int)
-                ).mean()
             )
 
-            self.reward_manager.penalize_stuck(pixel_diff)
+        self.last_player_position = current_player_pos
 
-        self._previous_frame = current_frame
+        self.distance_traveled += distance_moved
 
-        if pixel_diff < 2.0:
-            self.stuck_counter += 1
-        else:
-            self.stuck_counter = 0
-
-        self.reward_manager.reward_escape_behavior(action, pixel_diff)
-
-        # FIX #1: Raised stuck termination threshold from 7 to 30 frames.
-        # 7 frames (~0.4 seconds) was too aggressive — agent never had time to
-        # learn escape behavior. 30 frames gives it a reasonable window.
-        # FIX #7: long_stuck_penalty check moved BEFORE the counter reset so
-        # it can actually fire.
-        if self.stuck_counter > 40:
-            self.reward_manager.add("long_stuck_penalty", -1.0)
-
-        if self.stuck_counter >= 30:
-            severity = self.reward_manager.get_stuck_severity()
-            penalty = -2.0 * severity  # reduced from -5.0 to avoid overwhelming signal
-            self.reward_manager.add("prolonged_stuck_penalty", penalty)
-            self.stuck_counter = 0
-            done = True
-        else:
-            done = False
-
-        if game_state.get("level_complete", False):
-
-            reward += 100.0
-
-            self.level_completion_count += 1
-
-            done = True
-
-        self.reward_manager.update_stagnation_penalty(self.stuck_counter)
-
-        reward += self.reward_manager.get_reward()
-
-        # Helper bot alignment reward
-        helper_action = self.helper.get_action(game_state)
-        if action == helper_action:
-            reward += 0.2
-        else:
-            reward -= 0.05
-
-        self._step_count += 1
-        truncated = self._step_count >= self._max_episode_steps
-
-        # Event recording
-        frame = self.observer.get_frame()
-        if self.reward_overlay is not None:
-            frame = self.reward_overlay.draw(frame, self.reward_manager.breakdown)
-
-        player_health = game_state["health"]
-
-        if self.previous_health is not None and player_health < self.previous_health:
-            if self.record:
-                self.smart_clipper.trigger_event()
-                self.event_recorder.set_event("took_damage")
-
-        self.previous_health = player_health
-
-
-        if enemy_visible and self.record:
-            self.smart_clipper.trigger_event()
-            self.event_recorder.set_event("enemy_seen")
-
-        if (game_state["health_delta"] > 0 or game_state["ammo_delta"] > 0) and self.record:
-            self.smart_clipper.trigger_event()
-            self.event_recorder.set_event("pickup_collected")
-
-        if player_health < 25 and self.record:
-            self.smart_clipper.trigger_event()
-            self.event_recorder.set_event("low_health_escape")
-
-        if action == "use" and self.record:
-            self.smart_clipper.trigger_event()
-            self.event_recorder.set_event("door_open")
-
-        if self._use_preference:
-            pref_reward = self.preference_reward(frame)
-            pref_reward = max(min(pref_reward, 3), -3)
-            reward += 0.1 * pref_reward
-
-        self.reward_manager.detect_barrel_damage(
-            game_state["health_delta"],
-            red_ratio
+        # exploration reward
+        tile = (
+            int(player_x // 64),
+            int(player_y // 64)
         )
 
-        if self.record:
-            self.logger.log(frame, action, game_state["health"], game_state["ammo"])
-            self.traj_logger.record(frame, action, reward)
-            self.recorder.record_frame(frame)
-            self.event_recorder.record_frame(frame)
-            self.clipper.record(frame, action)
-            self.smart_clipper.observe(frame, action)
+        if tile not in self.visited_tiles:
 
-        self.curriculum_rewards.append(reward)
-        if len(self.curriculum_rewards) > 100:
-            self.curriculum_rewards.pop(0)
+            self.visited_tiles.add(tile)
 
-        self.update_curriculum()
+            reward += 0.05
 
-        return observation, reward, done, truncated, {}
+            self.exploration_count += 1
 
-    def update_curriculum(self):
+        # novelty memory
+        self.exploration_memory.visit(
+            player_x,
+            player_y
+        )
 
-        if len(self.curriculum_rewards) < 50:
-            return
+        novelty_reward = (
+            self.exploration_memory.get_novelty(
+                player_x,
+                player_y
+            ) * 0.3
+        )
 
-        avg_reward = sum(self.curriculum_rewards) / len(self.curriculum_rewards)
-        threshold = self.curriculum_thresholds.get(self.curriculum_stage, 0.0)
-        reward_ready = True if threshold <= 0.0 else avg_reward > threshold
-        behavior_ready = False
+        self.reward_manager.add(
+            "exploration_novelty",
+            novelty_reward
+        )
 
-        if self.curriculum_stage == 0:
-            behavior_ready = self.movement_count >= 20 and self.distance_traveled >= 150.0
-            print(f"  [Stage 0] real moves: {self.movement_count}/20 | distance: {self.distance_traveled:.1f}/150 | Reward: {avg_reward:.2f}/{threshold}")
+    # ---------------------------------------------------------
+    # COMBAT REWARDS
+    # ---------------------------------------------------------
 
-        elif self.curriculum_stage == 1:
-            behavior_ready = len(self.visited_tiles) >= 5 and self.pickup_count >= 1
-            print(f"  [Stage 1] tiles: {len(self.visited_tiles)}/5 | pickups: {self.pickup_count}/1 | Reward: {avg_reward:.2f}/{threshold}")
+    if action == "shoot":
 
-        elif self.curriculum_stage == 2:
-            behavior_ready = self.continuous_movement_steps >= 30 and self.stuck_counter == 0
-            print(f"  [Stage 2] movement steps: {self.continuous_movement_steps}/30 | stuck: {self.stuck_counter}")
+        if enemy_visible:
 
-        elif self.curriculum_stage == 3:
-            behavior_ready = self.enemy_engagement_count >= 10 and self.enemy_visible_steps >= 10
-            print(f"  [Stage 3] visible shots: {self.enemy_engagement_count}/10 | visible steps: {self.enemy_visible_steps}/10 | Reward: {avg_reward:.2f}/{threshold}")
+            reward += 1.0
 
-        elif self.curriculum_stage == 4:
-            behavior_ready = self.valid_shot_count >= 15
-            print(f"  [Stage 4] accurate shots: {self.valid_shot_count}/15 | Reward: {avg_reward:.2f}/{threshold}")
-
-        elif self.curriculum_stage == 5:
-            behavior_ready = self.door_interaction_count >= 1 and self.key_item_count >= 1
-            print(f"  [Stage 5] doors: {self.door_interaction_count}/1 | keys/items: {self.key_item_count}/1 | Reward: {avg_reward:.2f}/{threshold}")
-
-        elif self.curriculum_stage == 6:
-            behavior_ready = self.valid_shot_count >= 30
-            print(f"  [Stage 6] accurate shots: {self.valid_shot_count}/30 | Reward: {avg_reward:.2f}/{threshold}")
-
-        elif self.curriculum_stage == 7:
-            behavior_ready = True
-            print(f"  [Stage 7] final stage - Reward: {avg_reward:.2f}/{threshold}")
-
-        stage_ready = reward_ready and behavior_ready
-
-        if stage_ready and self.curriculum_stage < self.max_stage:
-            old_stage = self.curriculum_stage
-            self.curriculum_stage += 1
-            self.curriculum_rewards.clear()
-
-            # Reset all counters for next stage
-            self.movement_count = 0
-            self.exploration_count = 0
-            self.pickup_count = 0
-            self.continuous_movement_steps = 0
-            self.door_interaction_count = 0
-            self.key_item_count = 0
-            self.enemy_engagement_count = 0
-            self.valid_shot_count = 0
-            self.enemy_visible_steps = 0
-            self.stuck_counter = 0
-            self.visited_areas.clear()
-
-            print(f"[Curriculum] ADVANCING FROM STAGE {old_stage} → {self.curriculum_stage}")
-
-    def _get_area_signature(self):
-        frame = self.observer.get_frame()
-        small_frame = frame[::20, ::20]
-        return int(small_frame.mean())
-
-    def preference_reward(self, frame):
-        frame_tensor = torch.tensor(
-            frame
-        ).permute(2, 0, 1).unsqueeze(0).float()
-
-        with torch.no_grad():
-            score = self.preference_model(frame_tensor)
-
-        return score.item()
-
-    def perform_action(self, action):
-        allowed = self.get_allowed_actions()
-        config = self.get_stage_config()
-
-        if not config["allow_shoot"] and "shoot" in action:
-            return
-        
-        if action not in allowed:
-            return  # ignore invalid action OR penalize
-
-        elif action == "shoot":
-            self.controller.shoot()
-
-        elif action == "use":
-            self.controller.use()
-
-        elif action == "swap_weapon":
-            self.controller.swap_weapon()
-
-        elif action == "strafe_left":
-            self.controller.strafe_left()
-
-        elif action == "strafe_right":
-            self.controller.strafe_right()
-
-    def apply_rotation(self, turn_value):
-        if turn_value < -0.2:
-            self.controller.start_turn_left()
-            self.controller.key_up("Right")
-
-        elif turn_value > 0.2:
-            self.controller.start_turn_right()
-            self.controller.key_up("Left")
+            self.enemy_engagement_count += 1
 
         else:
-            self.controller.stop_turn()
 
-    def apply_movement(self, action):
+            reward -= 1.5
 
-        # stop old movement first
-        self.controller.stop_forward_backward()
+        if self.reward_manager.enemy_in_crosshair(frame):
 
-        if action == "move_forward":
-            self.controller.start_move_forward()
+            reward += 2.0
 
-        elif action == "move_backward":
-            self.controller.start_move_backward()
+            self.valid_shot_count += 1
 
-    def get_valid_actions(self):
-        if self.curriculum_stage == 0:
-            return [0, 1, 2]  # move + turn only
-        elif self.curriculum_stage == 1:
-            return [0, 1, 2, 4]  # + shoot
-        else:
-            return list(range(len(self.actions)))
+    # ---------------------------------------------------------
+    # AIMING REWARD
+    # ---------------------------------------------------------
 
-    def close(self):
-        if self.record:
-            if self.recorder:
-                self.recorder.save()
-            if self.event_recorder:
-                self.event_recorder.save()
-        if self.game_process:
-            self.game_process.terminate()
+    if (
+        enemy_visible
+        and self.reward_manager.enemy_in_crosshair(frame)
+    ):
+
+        reward += 0.3
+
+    # ---------------------------------------------------------
+    # ITEM REWARDS
+    # ---------------------------------------------------------
+
+    if (
+        game_state["health_delta"] > 0
+        or game_state["ammo_delta"] > 0
+    ):
+
+        reward += 0.5
+
+        self.pickup_count += 1
+
+    # ---------------------------------------------------------
+    # ACID / BARREL DAMAGE DETECTION
+    # ---------------------------------------------------------
+
+    self.reward_manager.detect_acid_damage(
+        game_state["health_delta"],
+        distance_moved,
+        floor_green_ratio
+    )
+
+    self.reward_manager.detect_barrel_damage(
+        game_state["health_delta"],
+        red_ratio
+    )
+
+    # ---------------------------------------------------------
+    # MOVEMENT REWARD
+    # ---------------------------------------------------------
+
+    if distance_moved > 5.0:
+
+        reward += 0.03
+
+        self.movement_count += 1
+
+    # ---------------------------------------------------------
+    # STAGNATION PENALTY
+    # ---------------------------------------------------------
+
+    self.reward_manager.update_stagnation_penalty(
+        self.stuck_counter
+    )
+
+    reward += self.reward_manager.get_reward()
+
+    # ---------------------------------------------------------
+    # LEVEL COMPLETION
+    # ---------------------------------------------------------
+
+    if game_state.get("level_complete", False):
+
+        reward += 100.0
+
+        self.level_completion_count += 1
+
+        done = True
+
+    # ---------------------------------------------------------
+    # PPO TIME LIMIT
+    # ---------------------------------------------------------
+
+    self._step_count += 1
+
+    truncated = (
+        self._step_count >= self._max_episode_steps
+    )
+
+    # ---------------------------------------------------------
+    # BUILD OBSERVATION
+    # ---------------------------------------------------------
+
+    processed_frame = self.observer.build()
+
+    observation = self.frame_stack.add_frame(
+        processed_frame
+    )
+
+    # ---------------------------------------------------------
+    # RECORDING
+    # ---------------------------------------------------------
+
+    if self.record:
+
+        self.logger.log(
+            frame,
+            action,
+            game_state["health"],
+            game_state["ammo"]
+        )
+
+        self.traj_logger.record(
+            frame,
+            action,
+            reward
+        )
+
+        self.recorder.record_frame(frame)
+
+        self.smart_clipper.observe(
+            frame,
+            action
+        )
+
+    # ---------------------------------------------------------
+    # CURRICULUM
+    # ---------------------------------------------------------
+
+    self.curriculum_rewards.append(reward)
+
+    if len(self.curriculum_rewards) > 100:
+
+        self.curriculum_rewards.pop(0)
+
+    self.update_curriculum()
+
+    return (
+        observation,
+        reward,
+        done,
+        truncated,
+        {}
+    )
+def perform_action(self, action):
+
+    allowed = self.get_allowed_actions()
+
+    if action not in allowed:
+        return
+
+    # STOP CONTINUOUS KEYS
+    self.controller.stop_forward_backward()
+    self.controller.stop_turn()
+
+    # ---------------------------------------------------
+    # MOVEMENT
+    # ---------------------------------------------------
+
+    if action == "move_forward":
+
+        self.controller.start_move_forward()
+
+    elif action == "move_backward":
+
+        self.controller.start_move_backward()
+
+    # ---------------------------------------------------
+    # TURNING
+    # ---------------------------------------------------
+
+    elif action == "turn_left":
+
+        self.controller.start_turn_left()
+
+    elif action == "turn_right":
+
+        self.controller.start_turn_right()
+
+    # ---------------------------------------------------
+    # STRAFING
+    # ---------------------------------------------------
+
+    elif action == "strafe_left":
+
+        self.controller.strafe_left()
+
+    elif action == "strafe_right":
+
+        self.controller.strafe_right()
+
+    # ---------------------------------------------------
+    # COMBAT
+    # ---------------------------------------------------
+
+    elif action == "shoot":
+
+        self.controller.shoot()
+
+    # ---------------------------------------------------
+    # INTERACTION
+    # ---------------------------------------------------
+
+    elif action == "use":
+
+        self.controller.use()
+
+    elif action == "swap_weapon":
+
+        self.controller.swap_weapon()

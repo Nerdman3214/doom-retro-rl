@@ -7,15 +7,21 @@ class DoomController:
     class RotationState:
         def __init__(self):
             self.turn_velocity = 0.0
-            self.speed = 0.0
-            self.acceleration = 0.15
-            self.friction = 0.90
-            self.speed = self.speed * self.friction + target * self.acceleration
+            self.acceleration = 0.12
+            self.friction = 0.85
+            self.max_speed = 1.0
 
-        def update(self, action_turn_signal, decay=0.4):
+        def update(self, action_turn_signal):
             self.turn_velocity = (
-                self.turn_velocity * decay + action_turn_signal
+                self.turn_velocity * self.friction
+                + action_turn_signal * self.acceleration
             )
+
+            self.turn_velocity = max(
+                -self.max_speed,
+                min(self.max_speed, self.turn_velocity)
+            )
+
             return self.turn_velocity
 
     def __init__(self):
@@ -66,6 +72,18 @@ class DoomController:
             "--sync",
             self.window_id
         ])
+
+    def apply_turn(self, turn_value):
+        if turn_value < -0.2:
+            self.start_turn_left()
+            self.key_up("Right")
+
+        elif turn_value > 0.2:
+            self.start_turn_right()
+            self.key_up("Left")
+
+        else:
+            self.stop_turn()
 
     def _tap(self, key):
         """Simulate a quick key press and release."""
@@ -139,6 +157,10 @@ class DoomController:
 
     def swap_weapon(self, slot=1):
         self._xkey(str(slot))
+
+    def release_all(self):
+        for key in list(self.held_keys):
+            self.key_up(key)
 
     def stop_movement(self):
         self.key_up("w")

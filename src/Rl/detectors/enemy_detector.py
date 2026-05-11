@@ -1,82 +1,167 @@
 import sys
 import os
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import numpy as np
 import frame_cache
+
 from observation.frame_processor import FrameProcessor
 
 
 class EnemyDetector:
 
     def __init__(self):
+
+        self.fp = FrameProcessor()
+
         self.previous_enemy_pixels = None
-        self.momentum = 0
         self.previous_enemy_center = None
-        self.confidence = 0
+
+        self.motion_momentum = 0.0
+        self.confidence = 0.0
+
+    def channel_diff_mean(self, frame, c1=2, c2=1):
+        diff = frame[:, :, c1].astype(np.int16) - frame[:, :, c2].astype(np.int16)
+        return float(np.mean(diff))
 
     def capture(self):
         return frame_cache.get_bgr()
 
+    # =========================================================
+    # MAIN ENEMY DETECTION
+    # =========================================================
+
     def detect_enemy_presence(self, frame):
-        # BGR: ch2=R, ch1=G → mean(R - G) > 15
-        dom = FrameProcessor().channel_diff_mean(frame, 3, 2, 1)
-        self.confidence += 1
-        return dom > 15
-    
 
-    def red_dominance(self):
-        self.confidence += 1
-    
+        red_dom = self.fp.channel_diff_mean(
+            frame,
+            c1=2,   # red
+            c2=1    # green
+        )
 
-    def humanoid_ratio(self):
-        self.confidence += 1
-        
+        center_dom = self.fp.centre_channel_diff_mean(
+            frame,
+            c1=2,
+            c2=1,
+            radius=32
+        )
+
+        confidence_score = (
+            red_dom * 0.4 +
+            center_dom * 0.6
+        )
+
+        detected = confidence_score > 18
+
+        if detected:
+            self.confidence = min(10.0, self.confidence + 1.0)
+        else:
+            self.confidence *= 0.90
+
+        return detected
+
+    # =========================================================
+    # CROSSHAIR TARGETING
+    # =========================================================
 
     def detect_enemy_centered(self, frame):
-        h, w = frame.shape[:2]
-        cx1 = int(w * 0.4)
-        cx2 = int(w * 0.6)
 
-        cy1 = int(h * 0.4)
-        cy2 = int(h * 0.6)
+        center_strength = self.fp.centre_channel_diff_mean(
+            frame,
+            c1=2,
+            c2=1,
+            radius=20
+        )
 
-        center = frame[cy1:cy2, cx1:cx2]
-        self.confidence += 1
-        dom = FrameProcessor().centre_channel_diff_mean(frame, w, h, 3, 40, 2, 1)
-        return dom > 20
+        return center_strength > 22
 
-    def detect_enemy_size_growth(self):
-        frame = self.capture()
-        self.confidence += 1
-        h, w, _ = frame.shape
-        enemy_pixels = FrameProcessor().centre_channel_count(frame, w, h, 3, 40, 2, 1, 20)
+    # =========================================================
+    # ENEMY SIZE CHANGE
+    # =========================================================
+
+    def detect_enemy_size_growth(self, frame):
+
+        enemy_pixels = self.fp.centre_channel_count(
+            frame,
+            c1=2,
+            c2=1,
+            threshold=20,
+            radius=40
+        )
 
         if self.previous_enemy_pixels is None:
             self.previous_enemy_pixels = enemy_pixels
-            return 0
+            return 0.0
 
         growth = enemy_pixels - self.previous_enemy_pixels
-        self.previous_enemy_pixels = enemy_pixels
-        smoothed = growth * 0.5 + self.momentum * 0.5
-        self.momentum = growth
-        return smoothed
 
-    def detect_enemy_motion_direction(self):
-        frame = self.capture()
-        h, w, _ = frame.shape
-        self.confidence += 1
-        current_center = FrameProcessor().centre_channel_x_mean(
-            frame, w, h, 3, 40, 2, 1, 20
+        self.previous_enemy_pixels = enemy_pixels
+
+        smoothed = (
+            growth * 0.5 +
+            self.motion_momentum * 0.5
         )
 
-        if current_center is None:
-            return 0
+        self.motion_momentum = smoothed
+
+        return smoothed
+
+    # =========================================================
+    # ENEMY MOVEMENT TRACKING
+    # =========================================================
+
+    def detect_enemy_motion_direction(self, frame):
+
+        center_x = self.fp.centre_channel_x_mean(
+            frame,
+            c1=2,
+            c2=1,
+            threshold=20,
+            radius=40
+        )
+
+        if center_x is None:
+            return 0.0
 
         if self.previous_enemy_center is None:
-            self.previous_enemy_center = current_center
-            return 0
+            self.previous_enemy_center = center_x
+            return 0.0
 
-        movement = current_center - self.previous_enemy_center
-        self.previous_enemy_center = current_center
-        return movement, self.confidence >= 3
-    
+        movement = center_x - self.previous_enemy_center
+
+        self.previous_enemy_center = center_x
+
+        return movement
+
+    # =========================================================
+    # DODGE SIGNAL
+    # =========================================================
+
+    def detect_threat_level(self, frame):
+
+        size_growth = self.detect_enemy_size_growth(frame)
+
+        centered = self.detect_enemy_centered(frame)
+
+        threat = 0.0
+
+        if size_growth > 5:
+            threat += 1.0
+
+        if centered:
+            threat += 1.0
+
+        return threat
+
+    # =========================================================
+    # RESET BETWEEN EPISODES
+    # =========================================================
+
+    def reset(self):
+
+        self.previous_enemy_pixels = None
+        self.previous_enemy_center = None
+
+        self.motion_momentum = 0.0
+        self.confidence = 0.0
