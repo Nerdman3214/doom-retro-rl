@@ -71,6 +71,7 @@ class DoomEnv(gym.Env):
         self.curriculum_stage = 0
         self.stage = 0
         self.rotation_state = DoomController.RotationState()
+        self.frame_processor = FrameProcessor()
 
         # FIX #4: CurriculumManager is now synced to self.curriculum_stage.
         # get_stage_name() takes curriculum_stage as an argument instead of
@@ -111,6 +112,7 @@ class DoomEnv(gym.Env):
         self.level_completion_count = 0
         self.visited_areas = set()
         self.swap_weapon_count = 0
+
 
         self.event_recorder = EventRecorder()
         self.smart_clipper = SmartClipGenerator()
@@ -156,6 +158,7 @@ class DoomEnv(gym.Env):
         self.last_shot_step = -100
         self.enemy_visible_steps = 0
         self.last_area_signature = None
+        frame = self.observer.get_frame()
 
         if self.record:
             self._kb_listener = keyboard.Listener(
@@ -432,6 +435,10 @@ class DoomEnv(gym.Env):
 
         self.apply_rotation(turn)
 
+        if action_index not in self.get_valid_actions():
+            reward -= 0.2
+            return obs, reward, False, False, {}
+
         # FIX #4: Pass self.curriculum_stage so CurriculumManager stays synced.
         stage = self.curriculum.get_stage_name(self.curriculum_stage)
 
@@ -451,12 +458,27 @@ class DoomEnv(gym.Env):
         self.reward_manager.update_exploration_reward(player_pos)
 
         frame = self.observer.get_frame()
+        obs, motion, cx, cy = self.frame_processor.extract(frame)
+
+        if motion < 1.5:
+            self.stuck_counter += 1
+        else:
+            self.stuck_counter = 0
+
+        obs, motion, cx, cy = self.frame_processor.extract(frame)
+
         enemy_visible = self.reward_manager.enemy_detector.detect_enemy_presence(frame)
         self.enemy_visible_steps += 1 if enemy_visible else 0
 
         floor_green_ratio = FrameProcessor().floor_green_ratio(frame)
 
         red_ratio = FrameProcessor().red_flash_ratio(frame)
+
+        if motion < 1.0 and action == "move_forward":
+            reward -= 0.1
+
+        if self.stuck_counter > 20:
+            reward -= 1.0
 
         if enemy_visible:
             self.reward_manager.enemy_visible()
@@ -641,7 +663,7 @@ class DoomEnv(gym.Env):
         if enemy_visible:
             self.reward_manager.enemy_visible()
 
-            
+
         if action == "swap_weapon":
 
             if game_state["ammo"] <= 2:
@@ -898,6 +920,14 @@ class DoomEnv(gym.Env):
 
         elif action == "move_backward":
             self.controller.start_move_backward()
+
+    def get_valid_actions(self):
+        if self.curriculum_stage == 0:
+            return [0, 1, 2]  # move + turn only
+        elif self.curriculum_stage == 1:
+            return [0, 1, 2, 4]  # + shoot
+        else:
+            return list(range(len(self.actions)))
 
     def close(self):
         if self.record:

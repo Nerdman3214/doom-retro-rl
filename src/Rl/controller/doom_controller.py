@@ -7,6 +7,10 @@ class DoomController:
     class RotationState:
         def __init__(self):
             self.turn_velocity = 0.0
+            self.speed = 0.0
+            self.acceleration = 0.15
+            self.friction = 0.90
+            self.speed = self.speed * self.friction + target * self.acceleration
 
         def update(self, action_turn_signal, decay=0.4):
             self.turn_velocity = (
