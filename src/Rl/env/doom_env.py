@@ -42,7 +42,7 @@ from observation.frame_processor import FrameProcessor
 
 
 DOOM_BINARY = "/home/steven/Downloads/doomretro-master/build/doomretro"
-DOOM_IWAD = "/usr/share/games/doom/freedoom2.wad"
+DOOM_IWAD = "/usr/share/games/doom/freedoom1.wad"
 
 
 class DoomEnv(gym.Env):
@@ -467,12 +467,6 @@ class DoomEnv(gym.Env):
         ammo_delta = game_state.get("ammo_delta", 0)
         weapon_delta = game_state.get("weapon_delta", 0)
         kill_delta = game_state.get("kill_delta", 0)
-
-        is_melee_weapon = (
-            "fist" in current_weapon
-            or "chainsaw" in current_weapon
-            or "ripter" in current_weapon
-        )
 
         enemy_close = (
             enemy_visible
