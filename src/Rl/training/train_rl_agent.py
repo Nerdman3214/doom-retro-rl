@@ -23,11 +23,15 @@ os.makedirs(BEST_MODEL_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
 
-def make_env(launch_doom=True):
-    env = DoomEnv(launch_doom=launch_doom)
+def make_env(launch_doom=True, record=False):
+    env = DoomEnv(
+        launch_doom=launch_doom,
+        record=record,
+    )
+
     time.sleep(2)
+
     env = NormalizeObservationWrapper(env)
-    env = Monitor(env, filename=os.path.join(LOG_DIR, "train_monitor.csv"))
     return env
 
 

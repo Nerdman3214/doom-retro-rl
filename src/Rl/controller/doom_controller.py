@@ -97,6 +97,17 @@ class DoomController:
     def start_turn_right(self):
         self.key_down("Right")
 
+    def quick_turn_left(self):
+        self.key_down("a")
+        time.sleep(0.08)
+        self.key_up("a")
+
+
+    def quick_turn_right(self):
+        self.key_down("d")
+        time.sleep(0.08)
+        self.key_up("d")
+
     # -------------------------
     # Tap actions
     # -------------------------

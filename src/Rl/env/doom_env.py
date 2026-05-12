@@ -262,9 +262,13 @@ class DoomEnv(gym.Env):
             7: {
                 "name": "complete_level",
                 "allow_shoot": True,
+                "allow_melee": True,
                 "require_enemy_visible_to_shoot": True,
                 "track_enemy": True,
                 "dodge_enemies": True,
+                "weapon_awareness": True,
+                "ammo_awareness": True,
+                "melee_awareness": True,
             },
         }
 
@@ -448,6 +452,16 @@ class DoomEnv(gym.Env):
 
         # Convert unsafe actions into safer actions.
         action = self.sanitize_action(action, pre_game_state, pre_enemy_visible)
+
+        # Aim assist: if an enemy is visible, turn the shortest direction
+        # or shoot if already centered.
+        action = self.aim_assist_action(
+            action=action,
+            frame=pre_frame,
+            enemy_visible=pre_enemy_visible,
+            enemy_centered=pre_enemy_centered,
+            ammo=pre_game_state.get("ammo", 0),
+        )
 
         # Helper alignment reward. Keep this small so it does not dominate PPO.
         helper_action = self.helper.get_action(pre_game_state)
@@ -857,10 +871,16 @@ class DoomEnv(gym.Env):
             self.controller.start_move_backward()
 
         elif action == "turn_left":
-            self.controller.start_turn_left()
+            if hasattr(self.controller, "quick_turn_left"):
+                self.controller.quick_turn_left()
+            else:
+                self.controller.start_turn_left()
 
         elif action == "turn_right":
-            self.controller.start_turn_right()
+            if hasattr(self.controller, "quick_turn_right"):
+                self.controller.quick_turn_right()
+            else:
+                self.controller.start_turn_right()
 
         elif action == "strafe_left":
             self.controller.start_strafe_left()
@@ -880,52 +900,54 @@ class DoomEnv(gym.Env):
         elif action == "swap_weapon":
             self.controller.swap_weapon()
 
+        
+
     # ---------------------------------------------------------
     # Tracking / reward helpers
     # ---------------------------------------------------------
 
-        def _visual_area_signature(self, frame):
-            """
-            Fallback exploration signature when shared-memory x/y is unavailable.
+    def _visual_area_signature(self, frame):
+        """
+        Fallback exploration signature when shared-memory x/y is unavailable.
 
-            This does not know the real map position. It only detects whether
-            the visual scene has changed enough to count as approximate progress.
-            """
-            if frame is None or frame.size == 0:
-                return None
+        This does not know the real map position. It only detects whether
+        the visual scene has changed enough to count as approximate progress.
+        """
+        if frame is None or frame.size == 0:
+            return None
 
-            small = frame[::8, ::8, :].astype(np.int16)
+        small = frame[::8, ::8, :].astype(np.int16)
 
-            # Quantize colors to reduce noise.
-            quantized = small // 32
+        # Quantize colors to reduce noise.
+        quantized = small // 32
 
-            return hash(quantized.tobytes())
+        return hash(quantized.tobytes())
 
     def _update_position_tracking(self, game_state, frame=None, motion=0.0):
         distance_moved = 0.0
 
         if not game_state.get("shared_state_available", False):
-                    # Fallback: use screen motion as approximate movement.
-                    if motion > 2.0:
-                        distance_moved = float(motion)
-                        self.distance_traveled += distance_moved
+            # Fallback: use screen motion as approximate movement.
+            if motion > 2.0:
+                distance_moved = float(motion)
+                self.distance_traveled += distance_moved
 
-                    signature = self._visual_area_signature(frame)
+            signature = self._visual_area_signature(frame)
 
-                    if signature is not None and signature != self.last_visual_signature:
-                        self.last_visual_signature = signature
-                        self.visual_area_steps += 1
+            if signature is not None and signature != self.last_visual_signature:
+                self.last_visual_signature = signature
+                self.visual_area_steps += 1
 
-                        # Every few meaningful visual changes count as a pseudo-tile.
-                        if self.visual_area_steps % 5 == 0:
-                            pseudo_tile = ("visual", self.visual_area_steps // 5)
+                # Every few meaningful visual changes count as a pseudo-tile.
+                if self.visual_area_steps % 5 == 0:
+                    pseudo_tile = ("visual", self.visual_area_steps // 5)
 
-                            if pseudo_tile not in self.visited_tiles:
-                                self.visited_tiles.add(pseudo_tile)
-                                self.exploration_count += 1
-                                self.reward_manager.add("visual_exploration", 0.05)
+                    if pseudo_tile not in self.visited_tiles:
+                        self.visited_tiles.add(pseudo_tile)
+                        self.exploration_count += 1
+                        self.reward_manager.add("visual_exploration", 0.05)
 
-                    return distance_moved
+            return distance_moved
 
         player_x = game_state.get("x")
         player_y = game_state.get("y")
@@ -1020,29 +1042,32 @@ class DoomEnv(gym.Env):
 
         if self.curriculum_stage == 0:
             behavior_ready = self.movement_count >= 20 and self.distance_traveled >= 150.0
-
-            print(
-                f"  [Stage 0] moves: {self.movement_count}/20 | "
-                f"distance: {self.distance_traveled:.1f}/150 | "
-                f"Reward: {avg_reward:.2f}/{threshold}"
-            )
+            if should_log:
+                print(
+                    f"  [Stage 0] moves: {self.movement_count}/20 | "
+                    f"distance: {self.distance_traveled:.1f}/150 | "
+                    f"Reward: {avg_reward:.2f}/{threshold}"
+                )
+            
 
         elif self.curriculum_stage == 1:
             behavior_ready = len(self.visited_tiles) >= 5 and self.pickup_count >= 1
 
-            print(
-                f"  [Stage 1] tiles: {len(self.visited_tiles)}/5 | "
-                f"pickups: {self.pickup_count}/1 | "
-                f"Reward: {avg_reward:.2f}/{threshold}"
-            )
+            if should_log:
+                print(
+                    f"  [Stage 1] tiles: {len(self.visited_tiles)}/5 | "
+                    f"pickups: {self.pickup_count}/1 | "
+                    f"Reward: {avg_reward:.2f}/{threshold}"
+                )
+            
 
         elif self.curriculum_stage == 2:
             behavior_ready = self.stuck_counter == 0 and self.movement_count >= 30
-
-            print(
-                f"  [Stage 2] moves: {self.movement_count}/30 | "
-                f"stuck: {self.stuck_counter}"
-            )
+            if should_log:
+                print(
+                    f"  [Stage 2] moves: {self.movement_count}/30 | "
+                    f"stuck: {self.stuck_counter}"
+                )
 
         elif self.curriculum_stage == 3:
             behavior_ready = (
@@ -1056,14 +1081,14 @@ class DoomEnv(gym.Env):
                     and self.door_interaction_count >= 1
                 )
             )
-
-            print(
-                f"  [Stage 3] shots: {self.enemy_engagement_count}/5 | "
-                f"visible: {self.enemy_visible_steps}/5 | "
-                f"tiles: {len(self.visited_tiles)}/8 | "
-                f"doors/use: {self.door_interaction_count}/1 | "
-                f"Reward: {avg_reward:.2f}/{threshold}"
-            )
+            if should_log:
+                print(
+                    f"  [Stage 3] shots: {self.enemy_engagement_count}/5 | "
+                    f"visible: {self.enemy_visible_steps}/5 | "
+                    f"tiles: {len(self.visited_tiles)}/8 | "
+                    f"doors/use: {self.door_interaction_count}/1 | "
+                    f"Reward: {avg_reward:.2f}/{threshold}"
+                )
 
         elif self.curriculum_stage == 4:
             combat_hits = self.valid_shot_count + self.melee_close_bonus_count
@@ -1083,24 +1108,24 @@ class DoomEnv(gym.Env):
                     and self.weapon_pickup_count >= 1
                 )
             )
-
-            print(
-                f"  [Stage 4] hits/melee: {combat_hits}/5 | "
-                f"visible: {self.enemy_visible_steps}/8 | "
-                f"kills: {self.enemy_kill_count}/1 | "
-                f"ammo: {self.ammo_pickup_count}/1 | "
-                f"weapons: {self.weapon_pickup_count}/1 | "
-                f"Reward: {avg_reward:.2f}/{threshold}"
-            )
+            if should_log:
+                print(
+                    f"  [Stage 4] hits/melee: {combat_hits}/5 | "
+                    f"visible: {self.enemy_visible_steps}/8 | "
+                    f"kills: {self.enemy_kill_count}/1 | "
+                    f"ammo: {self.ammo_pickup_count}/1 | "
+                    f"weapons: {self.weapon_pickup_count}/1 | "
+                    f"Reward: {avg_reward:.2f}/{threshold}"
+                )
 
         elif self.curriculum_stage == 5:
             behavior_ready = self.door_interaction_count >= 1 and self.key_item_count >= 1
-
-            print(
-                f"  [Stage 5] doors: {self.door_interaction_count}/1 | "
-                f"keys/items: {self.key_item_count}/1 | "
-                f"Reward: {avg_reward:.2f}/{threshold}"
-            )
+            if should_log:
+                print(
+                    f"  [Stage 5] doors: {self.door_interaction_count}/1 | "
+                    f"keys/items: {self.key_item_count}/1 | "
+                    f"Reward: {avg_reward:.2f}/{threshold}"
+                )
 
         elif self.curriculum_stage == 6:
             combat_hits = self.valid_shot_count + self.melee_close_bonus_count
@@ -1126,32 +1151,32 @@ class DoomEnv(gym.Env):
                     and self.enemy_visible_steps >= 5
                 )
             )
-
-            print(
-                f"  [Stage 6] tiles: {len(self.visited_tiles)}/12 | "
-                f"distance: {self.distance_traveled:.1f}/500 | "
-                f"doors: {self.door_interaction_count}/2 | "
-                f"pickups: {self.pickup_count}/1 | "
-                f"hits/melee: {combat_hits}/3 | "
-                f"visible: {self.enemy_visible_steps}/5 | "
-                f"complete: {self.level_completion_count}/1 | "
-                f"Reward: {avg_reward:.2f}/{threshold}"
-            )
+            if should_log:
+                print(
+                    f"  [Stage 6] tiles: {len(self.visited_tiles)}/12 | "
+                    f"distance: {self.distance_traveled:.1f}/500 | "
+                    f"doors: {self.door_interaction_count}/2 | "
+                    f"pickups: {self.pickup_count}/1 | "
+                    f"hits/melee: {combat_hits}/3 | "
+                    f"visible: {self.enemy_visible_steps}/5 | "
+                    f"complete: {self.level_completion_count}/1 | "
+                    f"Reward: {avg_reward:.2f}/{threshold}"
+                )
 
         elif self.curriculum_stage >= 7:
             behavior_ready = True
-
-            print(
-                f"  [Stage 7] final/full game | "
-                f"tiles: {len(self.visited_tiles)} | "
-                f"distance: {self.distance_traveled:.1f} | "
-                f"doors: {self.door_interaction_count} | "
-                f"pickups: {self.pickup_count} | "
-                f"hits: {self.valid_shot_count + self.melee_close_bonus_count} | "
-                f"kills: {self.enemy_kill_count} | "
-                f"complete: {self.level_completion_count} | "
-                f"Reward: {avg_reward:.2f}/{threshold}"
-            )
+            if should_log:
+                print(
+                    f"  [Stage 7] final/full game | "
+                    f"tiles: {len(self.visited_tiles)} | "
+                    f"distance: {self.distance_traveled:.1f} | "
+                    f"doors: {self.door_interaction_count} | "
+                    f"pickups: {self.pickup_count} | "
+                    f"hits: {self.valid_shot_count + self.melee_close_bonus_count} | "
+                    f"kills: {self.enemy_kill_count} | "
+                    f"complete: {self.level_completion_count} | "
+                    f"Reward: {avg_reward:.2f}/{threshold}"
+                )
 
         if reward_ready and behavior_ready and self.curriculum_stage < self.max_stage:
             old_stage = self.curriculum_stage
@@ -1160,17 +1185,69 @@ class DoomEnv(gym.Env):
             self._reset_stage_counters()
 
             print(
-                f"  [Stage 7] final/full game | "
-                f"tiles: {len(self.visited_tiles)} | "
-                f"distance: {self.distance_traveled:.1f} | "
-                f"doors: {self.door_interaction_count} | "
-                f"pickups: {self.pickup_count} | "
-                f"kills: {self.enemy_kill_count} | "
-                f"complete: {self.level_completion_count} | "
-                f"Reward: {avg_reward:.2f}/{threshold}"
-                f"[Curriculum] ADVANCING FROM STAGE "
-                f"{old_stage} → {self.curriculum_stage}"
-            )
+            f"[Curriculum] ADVANCING FROM STAGE "
+            f"{old_stage} → {self.curriculum_stage}"
+        )
+            
+    def _enemy_horizontal_error(self, frame):
+        """
+        Estimate whether the enemy is left or right of center.
+
+        Returns:
+            negative value = enemy is left
+            positive value = enemy is right
+            0.0 = centered or unknown
+        """
+        if frame is None or frame.size == 0:
+            return 0.0
+
+        heatmap = self.frame_processor.enemy_heatmap(frame)
+
+        if heatmap is None or heatmap.size == 0:
+            return 0.0
+
+        ys, xs = np.where(heatmap > 0.5)
+
+        if len(xs) == 0:
+            return 0.0
+
+        enemy_x = float(np.mean(xs))
+        center_x = heatmap.shape[1] / 2.0
+
+        # Normalize to roughly -1.0 to +1.0
+        return float((enemy_x - center_x) / center_x)
+    def aim_assist_action(self, action, frame, enemy_visible, enemy_centered, ammo):
+        """
+        Combat aim assist.
+
+        This prevents the agent from turning the long way around.
+        If the enemy is left, turn left.
+        If the enemy is right, turn right.
+        If centered and ammo exists, shoot.
+        """
+        if self.curriculum_stage < 3:
+            return action
+
+        if not enemy_visible:
+            return action
+
+        aim_error = self._enemy_horizontal_error(frame)
+
+        # Enemy is centered enough: shoot.
+        if enemy_centered or abs(aim_error) < 0.12:
+            if ammo > 0:
+                return "shoot"
+            return "melee_attack"
+
+        # Enemy is left of center.
+        if aim_error < -0.12:
+            return "turn_left"
+
+        # Enemy is right of center.
+        if aim_error > 0.12:
+            return "turn_right"
+
+        return action        
 
     def sanitize_action(self, action, game_state, enemy_visible):
         config = self.get_stage_config()
