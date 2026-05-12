@@ -76,6 +76,7 @@ class DoomEnv(gym.Env):
         self.helper = HelperBot()
         self.curriculum = CurriculumManager()
         self.prev_enemy_visible = False
+        self.curriculum_log_interval = 50
 
         # Recording/debug systems
         self.record = record
@@ -141,6 +142,9 @@ class DoomEnv(gym.Env):
         self.distance_traveled = 0.0
         self.visited_tiles = set()
         self.visited_areas = set()
+        self.visual_area_counter = 0
+        self.last_visual_signature = None
+        self.visual_area_steps = 0
 
         # Behavior counters
         self.movement_count = 0
@@ -476,7 +480,11 @@ class DoomEnv(gym.Env):
         game_state["action"] = action
         game_state["curriculum_stage"] = self.curriculum_stage
 
-        distance_moved = self._update_position_tracking(game_state)
+        distance_moved = self._update_position_tracking(
+            game_state,
+            frame=raw_frame,
+            motion=motion,
+        )
         game_state["distance_moved"] = distance_moved
 
         current_weapon = str(game_state.get("weapon", "")).lower()
@@ -673,13 +681,24 @@ class DoomEnv(gym.Env):
         # -----------------------------------------------------
 
         if action == "use":
-            self.door_interaction_count += 1
+            # Only count use as meaningful if the agent is not just spamming it.
+            meaningful_use = (
+                distance_moved > 2.0
+                or motion > 2.0
+                or self.stuck_counter < 5
+            )
 
-            if self.curriculum_stage == 3:
-                reward += 0.10
+            if meaningful_use:
+                self.door_interaction_count += 1
 
-            if self.curriculum_stage == 5:
-                reward += 2.0
+                if self.curriculum_stage == 3:
+                    reward += 0.05
+
+                if self.curriculum_stage == 5:
+                    reward += 1.0
+            else:
+                reward -= 0.1
+                self.reward_manager.add("use_spam_penalty", -0.1)
 
         if action == "swap_weapon":
             self.swap_weapon_count += 1
@@ -865,11 +884,48 @@ class DoomEnv(gym.Env):
     # Tracking / reward helpers
     # ---------------------------------------------------------
 
-    def _update_position_tracking(self, game_state):
+        def _visual_area_signature(self, frame):
+            """
+            Fallback exploration signature when shared-memory x/y is unavailable.
+
+            This does not know the real map position. It only detects whether
+            the visual scene has changed enough to count as approximate progress.
+            """
+            if frame is None or frame.size == 0:
+                return None
+
+            small = frame[::8, ::8, :].astype(np.int16)
+
+            # Quantize colors to reduce noise.
+            quantized = small // 32
+
+            return hash(quantized.tobytes())
+
+    def _update_position_tracking(self, game_state, frame=None, motion=0.0):
         distance_moved = 0.0
 
         if not game_state.get("shared_state_available", False):
-            return distance_moved
+                    # Fallback: use screen motion as approximate movement.
+                    if motion > 2.0:
+                        distance_moved = float(motion)
+                        self.distance_traveled += distance_moved
+
+                    signature = self._visual_area_signature(frame)
+
+                    if signature is not None and signature != self.last_visual_signature:
+                        self.last_visual_signature = signature
+                        self.visual_area_steps += 1
+
+                        # Every few meaningful visual changes count as a pseudo-tile.
+                        if self.visual_area_steps % 5 == 0:
+                            pseudo_tile = ("visual", self.visual_area_steps // 5)
+
+                            if pseudo_tile not in self.visited_tiles:
+                                self.visited_tiles.add(pseudo_tile)
+                                self.exploration_count += 1
+                                self.reward_manager.add("visual_exploration", 0.05)
+
+                    return distance_moved
 
         player_x = game_state.get("x")
         player_y = game_state.get("y")
@@ -960,6 +1016,7 @@ class DoomEnv(gym.Env):
 
         reward_ready = True if threshold <= 0.0 else avg_reward > threshold
         behavior_ready = False
+        should_log = self._step_count % self.curriculum_log_interval == 0
 
         if self.curriculum_stage == 0:
             behavior_ready = self.movement_count >= 20 and self.distance_traveled >= 150.0

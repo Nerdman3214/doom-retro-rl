@@ -31,7 +31,7 @@ def make_env(launch_doom=True):
     return env
 
 
-env = make_env(launch_doom=True)
+env = make_env(launch_doom=True, record=False)
 
 ppo_kwargs = dict(
     verbose=1,
@@ -77,7 +77,7 @@ try:
     model.learn(
         total_timesteps=1_000_000,
         callback=checkpoint_callback,
-        progress_bar=True,
+        progress_bar=False,
     )
 
 except KeyboardInterrupt:
