@@ -99,13 +99,13 @@ class DoomController:
 
     def quick_turn_left(self):
         self.key_down("a")
-        time.sleep(0.08)
+        time.sleep(0.10)
         self.key_up("a")
 
 
     def quick_turn_right(self):
         self.key_down("d")
-        time.sleep(0.08)
+        time.sleep(0.10)
         self.key_up("d")
 
     # -------------------------

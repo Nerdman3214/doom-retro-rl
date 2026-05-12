@@ -77,6 +77,12 @@ class DoomEnv(gym.Env):
         self.curriculum = CurriculumManager()
         self.prev_enemy_visible = False
         self.curriculum_log_interval = 50
+        self.mastery_level = 0
+        self.best_episode_reward = -float("inf")
+        self.episode_reward_total = 0.0
+        self.episode_level_completions = 0
+        self.final_mastery_level = 0
+        self.final_mastery_rewards = []
 
         # Recording/debug systems
         self.record = record
@@ -145,6 +151,7 @@ class DoomEnv(gym.Env):
         self.visual_area_counter = 0
         self.last_visual_signature = None
         self.visual_area_steps = 0
+        self.last_aim_assist_step = -100
 
         # Behavior counters
         self.movement_count = 0
@@ -339,6 +346,7 @@ class DoomEnv(gym.Env):
         self.visited_tiles.clear()
         self.visited_areas.clear()
         self.last_area_signature = None
+        self.episode_reward_total = 0.0
 
         self.movement_count = 0
         self.exploration_count = 0
@@ -359,6 +367,7 @@ class DoomEnv(gym.Env):
         self.ammo_pickup_count = 0
         self.enemy_kill_count = 0
         self.combat_survival_steps = 0
+        self.last_aim_assist_step = -100
 
         self.reward_manager.reset()
 
@@ -428,6 +437,7 @@ class DoomEnv(gym.Env):
         # Build safe observation before any possible early return.
         safe_frame = self.observer.build()
         safe_observation = self.frame_stack.add_frame(safe_frame)
+        self.episode_reward_total += reward
 
         # Reject invalid curriculum actions early.
         if action_index not in self.get_valid_actions():
@@ -745,25 +755,32 @@ class DoomEnv(gym.Env):
         # -----------------------------------------------------
 
         if self.curriculum_stage >= 7:
-            # Keep moving through the level.
-            if distance_moved > 5.0:
-                reward += 0.05
+            if self.final_mastery_level == 0:
+                # Learn to survive and move.
+                if distance_moved > 5.0:
+                    reward += 0.05
 
-            # Encourage using doors/switches/elevators.
-            if action == "use":
-                reward += 0.15
+            elif self.final_mastery_level == 1:
+                # Learn to explore more.
+                if len(self.visited_tiles) >= 5:
+                    reward += 0.10
 
-            # Discourage endless turning when no enemy is visible.
-            if action in ["turn_left", "turn_right"] and not enemy_visible:
-                reward -= 0.02
+            elif self.final_mastery_level == 2:
+                # Learn to use doors/switches.
+                if action == "use" and distance_moved > 1.0:
+                    reward += 0.15
 
-            # Reward survival lightly, but do not let survival farming dominate.
-            if game_state.get("health", 100) > 0:
-                reward += 0.005
+            elif self.final_mastery_level == 3:
+                # Learn combat/resource survival.
+                if self.enemy_kill_count > 0:
+                    reward += 0.25
+                if self.pickup_count > 0:
+                    reward += 0.10
 
-            # Strongly reward actual completion.
-            if game_state.get("level_complete", False):
-                reward += 100.0
+            elif self.final_mastery_level >= 4:
+                # Final objective.
+                if game_state.get("level_complete", False):
+                    reward += 150.0
 
         # -----------------------------------------------------
         # Damage/environment detection
@@ -849,6 +866,16 @@ class DoomEnv(gym.Env):
             self.curriculum_rewards.pop(0)
 
         self.update_curriculum()
+
+        if terminated or truncated:
+            if self.curriculum_stage >= 7:
+                if self.episode_reward_total > self.best_episode_reward:
+                    self.best_episode_reward = self.episode_reward_total
+                    print(
+                        f"[Mastery] New best episode reward: "
+                        f"{self.best_episode_reward:.2f}"
+                    )
+            
 
         return observation, float(reward), terminated, truncated, info
 
@@ -1165,9 +1192,39 @@ class DoomEnv(gym.Env):
 
         elif self.curriculum_stage >= 7:
             behavior_ready = True
+
+            if self.final_mastery_level == 0:
+                mastery_ready = self.distance_traveled >= 500.0
+
+            elif self.final_mastery_level == 1:
+                mastery_ready = len(self.visited_tiles) >= 10
+
+            elif self.final_mastery_level == 2:
+                mastery_ready = self.door_interaction_count >= 2
+
+            elif self.final_mastery_level == 3:
+                mastery_ready = (
+                    self.pickup_count >= 1
+                    or self.enemy_kill_count >= 1
+                    or self.valid_shot_count + self.melee_close_bonus_count >= 3
+                )
+
+            else:
+                mastery_ready = self.level_completion_count >= 1
+
+            if mastery_ready:
+                old_mastery = self.final_mastery_level
+                self.final_mastery_level += 1
+                self._reset_stage_counters()
+
+                print(
+                    f"[Mastery] ADVANCING FINAL MASTERY "
+                    f"{old_mastery} → {self.final_mastery_level}"
+                )
+
             if should_log:
                 print(
-                    f"  [Stage 7] final/full game | "
+                    f"  [Stage 7.{self.final_mastery_level}] final/full game | "
                     f"tiles: {len(self.visited_tiles)} | "
                     f"distance: {self.distance_traveled:.1f} | "
                     f"doors: {self.door_interaction_count} | "
@@ -1191,63 +1248,82 @@ class DoomEnv(gym.Env):
             
     def _enemy_horizontal_error(self, frame):
         """
-        Estimate whether the enemy is left or right of center.
+        Estimate enemy horizontal offset from the center.
 
         Returns:
-            negative value = enemy is left
-            positive value = enemy is right
-            0.0 = centered or unknown
+            aim_error: negative = enemy left, positive = enemy right
+            confidence: how many likely enemy pixels were found
         """
         if frame is None or frame.size == 0:
-            return 0.0
+            return 0.0, 0
 
         heatmap = self.frame_processor.enemy_heatmap(frame)
 
         if heatmap is None or heatmap.size == 0:
-            return 0.0
+            return 0.0, 0
 
-        ys, xs = np.where(heatmap > 0.5)
+        h, w = heatmap.shape
 
-        if len(xs) == 0:
-            return 0.0
+        # Ignore bottom HUD area. Doom HUD colors can confuse enemy detection.
+        gameplay_heatmap = heatmap[: int(h * 0.78), :]
+
+        ys, xs = np.where(gameplay_heatmap > 0.5)
+
+        confidence = len(xs)
+
+        if confidence < 8:
+            return 0.0, confidence
 
         enemy_x = float(np.mean(xs))
-        center_x = heatmap.shape[1] / 2.0
+        center_x = w / 2.0
 
-        # Normalize to roughly -1.0 to +1.0
-        return float((enemy_x - center_x) / center_x)
+        aim_error = float((enemy_x - center_x) / center_x)
+
+        return aim_error, confidence
+
+
     def aim_assist_action(self, action, frame, enemy_visible, enemy_centered, ammo):
         """
         Combat aim assist.
 
-        This prevents the agent from turning the long way around.
-        If the enemy is left, turn left.
-        If the enemy is right, turn right.
-        If centered and ammo exists, shoot.
+        This gives the agent FPS-style aim help:
+        - if enemy is left, turn left
+        - if enemy is right, turn right
+        - if enemy is centered, shoot
         """
         if self.curriculum_stage < 3:
             return action
 
-        if not enemy_visible:
+        aim_error, confidence = self._enemy_horizontal_error(frame)
+
+        # Allow aim assist if either the enemy detector sees something
+        # OR the heatmap has enough enemy-like pixels.
+        likely_enemy = enemy_visible or confidence >= 20
+
+        if not likely_enemy:
+            return action
+        
+
+        if self._step_count - self.last_aim_assist_step < 2:
             return action
 
-        aim_error = self._enemy_horizontal_error(frame)
-
-        # Enemy is centered enough: shoot.
-        if enemy_centered or abs(aim_error) < 0.12:
+        if enemy_centered or abs(aim_error) < 0.10:
+            self.last_aim_assist_step = self._step_count
             if ammo > 0:
                 return "shoot"
             return "melee_attack"
 
-        # Enemy is left of center.
-        if aim_error < -0.12:
+        if aim_error < -0.10:
+            self.last_aim_assist_step = self._step_count
             return "turn_left"
 
-        # Enemy is right of center.
-        if aim_error > 0.12:
+        if aim_error > 0.10:
+            self.last_aim_assist_step = self._step_count
             return "turn_right"
 
-        return action        
+        return action
+
+        
 
     def sanitize_action(self, action, game_state, enemy_visible):
         config = self.get_stage_config()
