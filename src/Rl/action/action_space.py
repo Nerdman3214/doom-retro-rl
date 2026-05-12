@@ -1,20 +1,16 @@
 class ActionSpace:
-
     ACTIONS = [
         "move_forward",
+        "move_backward",
         "turn_left",
         "turn_right",
-        "turn_left_shoot",
-        "turn_right_shoot",
-        "move_forward_shoot",
+        "strafe_left",
+        "strafe_right",
         "shoot",
-        "Strafe_Left",
-        "Strafe_Right",
-        "move_backward",
-        "move_backward_shoot",
+        "use",
         "swap_weapon",
-        "use"
-        ] 
+        "melee_attack"
+    ]
 
     def sample(self):
         import random

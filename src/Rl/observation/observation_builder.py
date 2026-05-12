@@ -27,6 +27,10 @@ class ObservationBuilder:
         self.shared_state_available = False
         self.goal_position = None
         self.estimated_goal = None
+        self.previous_ammo = None
+        self.previous_weapon = None
+        self.previous_kill_count = None
+        self.previous_health = None
 
     def get_player_position(self):
         """Return player position (x, y) from shared memory or fallback."""
@@ -59,6 +63,45 @@ class ObservationBuilder:
         """Manually set the goal position (called if known from map data)."""
         self.goal_position = (x, y)
 
+    def _estimate_current_weapon(self, ammo, health=None):
+        """
+        Best-effort weapon estimate.
+
+        Since Doom Retro/Freedoom does not automatically give us a clean
+        weapon name through normal screen capture, this starts as a safe
+        placeholder.
+
+        Later, this can be upgraded using:
+        - shared memory
+        - HUD weapon detection
+        - keypress tracking
+        - OCR/HUD image classification
+        """
+
+        # If ammo is 0, the player may be on fist/chainsaw/ripter,
+        # but this is not guaranteed.
+        if ammo is not None and ammo <= 0:
+            return "melee_unknown"
+
+        # Default assumption at pistol start.
+        return "pistol"
+    def _estimate_kill_delta(self, health_delta, enemy_visible):
+        """
+        Best-effort kill estimate.
+
+        This is intentionally conservative. Without direct game stats,
+        we do not truly know when an enemy died.
+
+        Later, improve this with:
+        - enemy disappearance after centered shots
+        - corpse detection
+        - dropped ammo pickup
+        - shared memory kill count
+        """
+
+        # Placeholder: do not guess kills yet.
+        return 0
+
     def get_game_state(self):
         """Returns a dict of tracked game variables and their deltas."""
         shared = read_player_state()
@@ -71,6 +114,7 @@ class ObservationBuilder:
             self.angle = shared["angle"]
             self.armor = shared["armor"]
             self.kills = shared["kills"]
+            
 
         state = {
             "health": self.health,
@@ -86,7 +130,73 @@ class ObservationBuilder:
         }
         self.prev_health = self.health
         self.prev_ammo = self.ammo
-        return state
+
+        health = 100
+        ammo = 50
+        armor = 0
+        x = None
+        y = None
+        shared_state_available = False
+
+        # -----------------------------------------------------
+        # Delta tracking
+        # -----------------------------------------------------
+
+        health_delta = 0
+        ammo_delta = 0
+        weapon_delta = 0
+        kill_delta = 0
+
+        if self.previous_health is not None and health is not None:
+            health_delta = health - self.previous_health
+
+        if self.previous_ammo is not None and ammo is not None:
+            ammo_delta = ammo - self.previous_ammo
+
+        current_weapon = self._estimate_current_weapon(ammo, health)
+
+        if self.previous_weapon is not None and current_weapon != self.previous_weapon:
+            weapon_delta = 1
+
+        kill_delta = self._estimate_kill_delta(
+        health_delta=health_delta,
+        enemy_visible=False,
+    )
+
+        enemy_visible = False
+
+        try:
+            enemy_visible = bool(game_state.get("enemy_visible", False))
+        except Exception:
+            enemy_visible = False
+
+        kill_delta = self._estimate_kill_delta(health_delta, enemy_visible)
+
+        self.previous_health = health
+        self.previous_ammo = ammo
+        self.previous_weapon = current_weapon
+        return state{
+            "health": health,
+            "ammo": ammo,
+            "armor": armor,
+
+            "health_delta": health_delta,
+            "ammo_delta": ammo_delta,
+
+            "weapon": current_weapon,
+            "weapon_delta": weapon_delta,
+            "kill_delta": kill_delta,
+
+            "x": x,
+            "y": y,
+            "shared_state_available": shared_state_available,
+        }
+
+    def reset_tracking(self):
+        self.previous_ammo = None
+        self.previous_weapon = None
+        self.previous_kill_count = None
+        self.previous_health = None
     
 
 

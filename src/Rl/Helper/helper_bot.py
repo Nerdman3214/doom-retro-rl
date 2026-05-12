@@ -1,18 +1,24 @@
 class HelperBot:
 
     def get_action(self, game_state):
-
-
-        health = game_state["health"]
+        health = game_state.get("health", 100)
+        ammo = game_state.get("ammo", 0)
         enemy_visible = game_state.get("enemy_visible", False)
+        enemy_centered = game_state.get("enemy_centered", False)
+        stage = game_state.get("curriculum_stage", 0)
 
-        # PRIORITY 1: survival
         if health < 30:
             return "move_backward"
 
-        # PRIORITY 2: combat
         if enemy_visible:
-            return "shoot"
+            if enemy_centered and ammo > 0:
+                return "shoot"
+            return "turn_right"
 
-        # PRIORITY 3: exploration
+        if stage == 3:
+            # Cautious combat search: keep progressing, but don't spam shoot.
+            if game_state.get("near_door", False):
+                return "use"
+            return "move_forward"
+
         return "move_forward"
