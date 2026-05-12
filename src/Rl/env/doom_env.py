@@ -42,7 +42,7 @@ from observation.frame_processor import FrameProcessor
 
 
 DOOM_BINARY = "/home/steven/Downloads/doomretro-master/build/doomretro"
-DOOM_IWAD = "/usr/share/games/doom/freedoom1.wad"
+DOOM_IWAD = "/usr/share/games/doom/freedoom2.wad"
 
 
 class DoomEnv(gym.Env):
@@ -247,9 +247,13 @@ class DoomEnv(gym.Env):
             6: {
                 "name": "full_game",
                 "allow_shoot": True,
+                "allow_melee": True,
                 "require_enemy_visible_to_shoot": True,
                 "track_enemy": True,
                 "dodge_enemies": True,
+                "weapon_awareness": True,
+                "ammo_awareness": True,
+                "melee_awareness": True,
             },
             7: {
                 "name": "complete_level",
@@ -986,10 +990,38 @@ class DoomEnv(gym.Env):
             )
 
         elif self.curriculum_stage == 6:
-            behavior_ready = self.valid_shot_count >= 30
+            combat_hits = self.valid_shot_count + self.melee_close_bonus_count
+
+            behavior_ready = (
+                (
+                    len(self.visited_tiles) >= 12
+                    and self.distance_traveled >= 500.0
+                    and self.pickup_count >= 1
+                )
+                or
+                (
+                    len(self.visited_tiles) >= 10
+                    and self.door_interaction_count >= 2
+                )
+                or
+                (
+                    self.level_completion_count >= 1
+                )
+                or
+                (
+                    combat_hits >= 3
+                    and self.enemy_visible_steps >= 5
+                )
+            )
 
             print(
-                f"  [Stage 6] accurate shots: {self.valid_shot_count}/30 | "
+                f"  [Stage 6] tiles: {len(self.visited_tiles)}/12 | "
+                f"distance: {self.distance_traveled:.1f}/500 | "
+                f"doors: {self.door_interaction_count}/2 | "
+                f"pickups: {self.pickup_count}/1 | "
+                f"hits/melee: {combat_hits}/3 | "
+                f"visible: {self.enemy_visible_steps}/5 | "
+                f"complete: {self.level_completion_count}/1 | "
                 f"Reward: {avg_reward:.2f}/{threshold}"
             )
 
@@ -1008,6 +1040,14 @@ class DoomEnv(gym.Env):
             self._reset_stage_counters()
 
             print(
+                f"  [Stage 7] final/full game | "
+                f"tiles: {len(self.visited_tiles)} | "
+                f"distance: {self.distance_traveled:.1f} | "
+                f"doors: {self.door_interaction_count} | "
+                f"pickups: {self.pickup_count} | "
+                f"kills: {self.enemy_kill_count} | "
+                f"complete: {self.level_completion_count} | "
+                f"Reward: {avg_reward:.2f}/{threshold}"
                 f"[Curriculum] ADVANCING FROM STAGE "
                 f"{old_stage} → {self.curriculum_stage}"
             )
@@ -1022,17 +1062,15 @@ class DoomEnv(gym.Env):
             "fist" in current_weapon
             or "chainsaw" in current_weapon
             or "ripter" in current_weapon
+            or "melee" in current_weapon
         )
 
-        # Never shoot if this stage disallows shooting.
         if action == "shoot" and not config.get("allow_shoot", False):
             return "move_forward"
 
-        # Never melee if this stage disallows melee.
         if action == "melee_attack" and not config.get("allow_melee", False):
             return "move_forward"
 
-        # If enemy visibility is required, avoid blind shooting.
         if (
             action == "shoot"
             and config.get("require_enemy_visible_to_shoot", False)
@@ -1040,14 +1078,19 @@ class DoomEnv(gym.Env):
         ):
             return "move_forward"
 
-        # If no ammo and enemy is visible, melee only if melee weapon is active.
         if action == "shoot" and ammo <= 0:
             if is_melee_weapon and enemy_visible:
                 return "melee_attack"
-
             return "swap_weapon"
 
-        # Do not melee randomly when no enemy is visible.
+        # New: prevent early/random weapon swapping.
+        if action == "swap_weapon":
+            if ammo > 5 and not enemy_visible:
+                return "move_forward"
+
+            if ammo > 5 and enemy_visible:
+                return "shoot"
+
         if action == "melee_attack" and not enemy_visible:
             return "move_forward"
 
