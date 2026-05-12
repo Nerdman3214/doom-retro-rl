@@ -4,8 +4,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+from sb3_contrib import RecurrentPPO
+from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
 
 from env.doom_env import DoomEnv
@@ -14,12 +14,10 @@ from wrappers.normalize_wrapper import NormalizeObservationWrapper
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHECKPOINT_DIR = os.path.join(ROOT_DIR, "checkpoints")
-CHECKPOINT = os.path.join(CHECKPOINT_DIR, "doom_rl_agent")
-BEST_MODEL_DIR = os.path.join(CHECKPOINT_DIR, "best_model")
+CHECKPOINT = os.path.join(CHECKPOINT_DIR, "doom_recurrent_ppo")
 LOG_DIR = os.path.join(ROOT_DIR, "logs")
 
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-os.makedirs(BEST_MODEL_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
 
@@ -27,7 +25,7 @@ def make_env(launch_doom=True):
     env = DoomEnv(launch_doom=launch_doom)
     time.sleep(2)
     env = NormalizeObservationWrapper(env)
-    env = Monitor(env, filename=os.path.join(LOG_DIR, "train_monitor.csv"))
+    env = Monitor(env, filename=os.path.join(LOG_DIR, "recurrent_train_monitor.csv"))
     return env
 
 
@@ -36,9 +34,9 @@ env = make_env(launch_doom=True)
 ppo_kwargs = dict(
     verbose=1,
     learning_rate=2.5e-4,
-    n_steps=2048,
+    n_steps=1024,
     batch_size=128,
-    n_epochs=6,
+    n_epochs=5,
     gamma=0.995,
     gae_lambda=0.95,
     clip_range=0.15,
@@ -47,21 +45,25 @@ ppo_kwargs = dict(
     max_grad_norm=0.5,
     policy_kwargs=dict(
         normalize_images=False,
+        lstm_hidden_size=256,
+        n_lstm_layers=1,
+        shared_lstm=False,
+        enable_critic_lstm=True,
     ),
-    tensorboard_log=os.path.join(ROOT_DIR, "tensorboard_logs", "doom_ppo"),
+    tensorboard_log=os.path.join(ROOT_DIR, "tensorboard_logs", "doom_recurrent_ppo"),
 )
 
 RESUME = "--resume" in sys.argv
 
 if RESUME and os.path.exists(CHECKPOINT + ".zip"):
     print(f"Resuming from {CHECKPOINT}.zip ...")
-    model = PPO.load(CHECKPOINT, env=env)
+    model = RecurrentPPO.load(CHECKPOINT, env=env)
 else:
     if RESUME:
         print("No checkpoint found — starting fresh.")
 
-    model = PPO(
-        "CnnPolicy",
+    model = RecurrentPPO(
+        "CnnLstmPolicy",
         env,
         **ppo_kwargs,
     )
@@ -69,7 +71,7 @@ else:
 checkpoint_callback = CheckpointCallback(
     save_freq=10_000,
     save_path=CHECKPOINT_DIR,
-    name_prefix="doom_rl_agent",
+    name_prefix="doom_recurrent_ppo",
     verbose=1,
 )
 
@@ -81,7 +83,7 @@ try:
     )
 
 except KeyboardInterrupt:
-    print("\nTraining interrupted — saving current model...")
+    print("\nTraining interrupted — saving current recurrent model...")
 
 finally:
     model.save(CHECKPOINT)

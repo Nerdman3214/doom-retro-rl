@@ -367,9 +367,22 @@ class DoomEnv(gym.Env):
         wid = self.controller.window_id
         if wid:
             subprocess.call(
-                ["xdotool", "windowfocus", "--sync", wid, "key", "Return"],
+                ["xdotool", "windowfocus", "--sync", wid],
                 stderr=subprocess.DEVNULL,
             )
+
+            time.sleep(0.2)
+
+            # Press Return more than once because Doom death/intermission/menu states
+            # may need an input to respawn or dismiss the screen.
+            for _ in range(3):
+                subprocess.call(
+                    ["xdotool", "key", "Return"],
+                    stderr=subprocess.DEVNULL,
+                )
+                time.sleep(0.25)
+
+            self.controller.release_all()
             time.sleep(1.0)
 
         player_pos = self.observer.get_player_position()
@@ -695,6 +708,31 @@ class DoomEnv(gym.Env):
                 reward += 0.05
 
         # -----------------------------------------------------
+        # Stage 7 final-game progression rewards
+        # -----------------------------------------------------
+
+        if self.curriculum_stage >= 7:
+            # Keep moving through the level.
+            if distance_moved > 5.0:
+                reward += 0.05
+
+            # Encourage using doors/switches/elevators.
+            if action == "use":
+                reward += 0.15
+
+            # Discourage endless turning when no enemy is visible.
+            if action in ["turn_left", "turn_right"] and not enemy_visible:
+                reward -= 0.02
+
+            # Reward survival lightly, but do not let survival farming dominate.
+            if game_state.get("health", 100) > 0:
+                reward += 0.005
+
+            # Strongly reward actual completion.
+            if game_state.get("level_complete", False):
+                reward += 100.0
+
+        # -----------------------------------------------------
         # Damage/environment detection
         # -----------------------------------------------------
 
@@ -718,17 +756,35 @@ class DoomEnv(gym.Env):
         self.prev_enemy_visible = enemy_visible
 
         # -----------------------------------------------------
-        # Completion / termination
+        # Completion / death / termination
         # -----------------------------------------------------
+
+        health = game_state.get("health", 100)
+
+        death_like_screen = (
+            health <= 0
+            or (
+                health < 5
+                and motion < 0.5
+                and self.stuck_counter > 15
+            )
+        )
 
         if game_state.get("level_complete", False):
             reward += 100.0
             self.level_completion_count += 1
             terminated = True
 
+        if death_like_screen:
+            reward -= 25.0
+            self.reward_manager.add("death_penalty", -25.0)
+            terminated = True
+            info["death"] = True
+
         if self.stuck_counter >= 35:
             reward -= 2.0
             terminated = True
+            info["stuck_reset"] = True
 
         self._step_count += 1
         truncated = self._step_count >= self._max_episode_steps
@@ -1029,7 +1085,14 @@ class DoomEnv(gym.Env):
             behavior_ready = True
 
             print(
-                f"  [Stage 7] final stage | "
+                f"  [Stage 7] final/full game | "
+                f"tiles: {len(self.visited_tiles)} | "
+                f"distance: {self.distance_traveled:.1f} | "
+                f"doors: {self.door_interaction_count} | "
+                f"pickups: {self.pickup_count} | "
+                f"hits: {self.valid_shot_count + self.melee_close_bonus_count} | "
+                f"kills: {self.enemy_kill_count} | "
+                f"complete: {self.level_completion_count} | "
                 f"Reward: {avg_reward:.2f}/{threshold}"
             )
 
