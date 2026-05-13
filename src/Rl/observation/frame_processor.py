@@ -128,14 +128,30 @@ class FrameProcessor:
         return float(np.mean(red > threshold))
 
     def enemy_heatmap(self, frame):
+        """
+        Simple enemy-like color heatmap.
+
+        BGR convention:
+            channel 0 = blue
+            channel 1 = green
+            channel 2 = red
+        """
         if frame is None or frame.size == 0:
             return np.zeros((self.height, self.width), dtype=np.float32)
 
         resized = cv2.resize(frame, (self.width, self.height))
-        red = resized[:, :, 2].astype(np.int16)
-        green = resized[:, :, 1].astype(np.int16)
 
-        heatmap = (red - green) > 20
+        blue = resized[:, :, 0].astype(np.int16)
+        green = resized[:, :, 1].astype(np.int16)
+        red = resized[:, :, 2].astype(np.int16)
+
+        # Enemy-ish pixels: red/brown stronger than green/blue.
+        heatmap = (
+            (red > 80)
+            & (red > green + 15)
+            & (red > blue + 10)
+        )
+
         return heatmap.astype(np.float32)
 
     def _center_crop(self, frame, radius):

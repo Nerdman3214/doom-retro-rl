@@ -42,7 +42,7 @@ from observation.frame_processor import FrameProcessor
 
 
 DOOM_BINARY = "/home/steven/Downloads/doomretro-master/build/doomretro"
-DOOM_IWAD = "/usr/share/games/doom/freedoom2.wad"
+DOOM_IWAD = "/usr/share/games/doom/freedoom1.wad"
 
 
 class DoomEnv(gym.Env):
@@ -926,7 +926,6 @@ class DoomEnv(gym.Env):
 
         elif action == "swap_weapon":
             self.controller.swap_weapon()
-
         
 
     # ---------------------------------------------------------
@@ -1247,14 +1246,10 @@ class DoomEnv(gym.Env):
         )
             
     def _enemy_horizontal_error(self, frame):
-        """
-        Estimate enemy horizontal offset from the center.
-
-        Returns:
-            aim_error: negative = enemy left, positive = enemy right
-            confidence: how many likely enemy pixels were found
-        """
         if frame is None or frame.size == 0:
+            return 0.0, 0
+
+        if not hasattr(self.frame_processor, "enemy_heatmap"):
             return 0.0, 0
 
         heatmap = self.frame_processor.enemy_heatmap(frame)
@@ -1264,7 +1259,7 @@ class DoomEnv(gym.Env):
 
         h, w = heatmap.shape
 
-        # Ignore bottom HUD area. Doom HUD colors can confuse enemy detection.
+        # Ignore HUD area.
         gameplay_heatmap = heatmap[: int(h * 0.78), :]
 
         ys, xs = np.where(gameplay_heatmap > 0.5)
@@ -1283,47 +1278,38 @@ class DoomEnv(gym.Env):
 
 
     def aim_assist_action(self, action, frame, enemy_visible, enemy_centered, ammo):
-        """
-        Combat aim assist.
-
-        This gives the agent FPS-style aim help:
-        - if enemy is left, turn left
-        - if enemy is right, turn right
-        - if enemy is centered, shoot
-        """
         if self.curriculum_stage < 3:
             return action
 
         aim_error, confidence = self._enemy_horizontal_error(frame)
 
-        # Allow aim assist if either the enemy detector sees something
-        # OR the heatmap has enough enemy-like pixels.
         likely_enemy = enemy_visible or confidence >= 20
 
         if not likely_enemy:
             return action
-        
 
-        if self._step_count - self.last_aim_assist_step < 2:
-            return action
+        if self._step_count % 10 == 0:
+            print(
+                f"[aim] visible={enemy_visible} centered={enemy_centered} "
+                f"error={aim_error:.2f} confidence={confidence} old_action={action}"
+            )
 
         if enemy_centered or abs(aim_error) < 0.10:
-            self.last_aim_assist_step = self._step_count
+            print(f"[aim assist] enemy CENTER error={aim_error:.2f} -> shoot")
             if ammo > 0:
                 return "shoot"
             return "melee_attack"
 
         if aim_error < -0.10:
-            self.last_aim_assist_step = self._step_count
+            print(f"[aim assist] enemy LEFT error={aim_error:.2f} -> turn_left")
             return "turn_left"
 
         if aim_error > 0.10:
-            self.last_aim_assist_step = self._step_count
+            print(f"[aim assist] enemy RIGHT error={aim_error:.2f} -> turn_right")
             return "turn_right"
 
         return action
 
-        
 
     def sanitize_action(self, action, game_state, enemy_visible):
         config = self.get_stage_config()
