@@ -42,7 +42,7 @@ from observation.frame_processor import FrameProcessor
 
 
 DOOM_BINARY = "/home/steven/Downloads/doomretro-master/build/doomretro"
-DOOM_IWAD = "/usr/share/games/doom/freedoom2.wad"
+DOOM_IWAD = "/usr/share/games/doom/freedoom1.wad"
 
 
 class DoomEnv(gym.Env):
@@ -83,6 +83,9 @@ class DoomEnv(gym.Env):
         self.episode_level_completions = 0
         self.final_mastery_level = 0
         self.final_mastery_rewards = []
+        self.last_target_signature = None
+        self.same_target_shot_count = 0
+        self.dead_target_ignore_steps = 0
 
         # Recording/debug systems
         self.record = record
@@ -347,6 +350,9 @@ class DoomEnv(gym.Env):
         self.visited_areas.clear()
         self.last_area_signature = None
         self.episode_reward_total = 0.0
+        self.last_target_signature = None
+        self.same_target_shot_count = 0
+        self.dead_target_ignore_steps = 0
 
         self.movement_count = 0
         self.exploration_count = 0
@@ -438,6 +444,15 @@ class DoomEnv(gym.Env):
         safe_frame = self.observer.build()
         safe_observation = self.frame_stack.add_frame(safe_frame)
         self.episode_reward_total += reward
+
+        if terminated or truncated:
+            if self.curriculum_stage >= 7:
+                if self.episode_reward_total > self.best_episode_reward:
+                    self.best_episode_reward = self.episode_reward_total
+                    print(
+                        f"[Mastery] New best episode reward: "
+                        f"{self.best_episode_reward:.2f}"
+                    )
 
         # Reject invalid curriculum actions early.
         if action_index not in self.get_valid_actions():
@@ -1104,8 +1119,14 @@ class DoomEnv(gym.Env):
 
         elif self.curriculum_stage == 3:
             combat_ready = (
-                self.enemy_engagement_count >= 3
+                self.enemy_engagement_count >= 2
                 and self.enemy_visible_steps >= 3
+            )
+
+            survival_combat_ready = (
+                self.enemy_visible_steps >= 5
+                and self._step_count >= 150
+                and self.stuck_counter < 20
             )
 
             exploration_ready = (
@@ -1118,11 +1139,16 @@ class DoomEnv(gym.Env):
                 and self.distance_traveled >= 75.0
             )
 
-            behavior_ready = combat_ready or exploration_ready or door_ready
+            behavior_ready = (
+                combat_ready
+                or survival_combat_ready
+                or exploration_ready
+                or door_ready
+            )
 
             if should_log:
                 print(
-                    f"  [Stage 3] combat: {self.enemy_engagement_count}/3 | "
+                    f"  [Stage 3] combat: {self.enemy_engagement_count}/2 | "
                     f"visible: {self.enemy_visible_steps}/3 | "
                     f"tiles: {len(self.visited_tiles)}/5 | "
                     f"distance: {self.distance_traveled:.1f}/150 | "
@@ -1289,83 +1315,96 @@ class DoomEnv(gym.Env):
         aim_error = float((enemy_x - center_x) / center_x)
 
         return aim_error, confidence
+    
+    def _target_signature(self, frame):
+        """
+        Coarse signature for the current enemy-like target.
+
+        Used to avoid shooting the same dead body / wall stain forever.
+        """
+        aim_error, confidence = self._enemy_horizontal_error(frame)
+
+        if confidence < 20:
+            return None
+
+        # Quantize aim position so tiny camera changes do not create a new target.
+        return round(aim_error, 1)
 
 
     def aim_assist_action(self, action, frame, enemy_visible, enemy_centered, ammo):
         """
         Combat aim assist.
 
-        Important:
-        Do NOT aim-assist only from color heatmap confidence.
-        The heatmap is noisy in Doom/Freedoom and can detect walls as enemies.
+        Only assists when the enemy detector says an enemy is visible.
+        Avoids repeatedly shooting the same dead body / false target.
         """
         if self.curriculum_stage < 3:
             return action
 
-        # Main fix:
-        # If the real enemy detector does not see an enemy, do not rotate/shoot.
+        if self.dead_target_ignore_steps > 0:
+            self.dead_target_ignore_steps -= 1
+            return action
+
         if not enemy_visible:
             return action
 
         aim_error, confidence = self._enemy_horizontal_error(frame)
 
-        # If confidence is too weak, do not override movement.
         if confidence < 20:
             return action
 
-        if self._step_count % 25 == 0:
-            print(
-                f"[aim] visible={enemy_visible} centered={enemy_centered} "
-                f"error={aim_error:.2f} confidence={confidence} old_action={action}"
-            )
+        target_sig = self._target_signature(frame)
 
-        # Enemy is centered enough: shoot.
+        if target_sig is not None and target_sig == self.last_target_signature:
+            if action == "shoot" or enemy_centered or abs(aim_error) < 0.10:
+                self.same_target_shot_count += 1
+        else:
+            self.same_target_shot_count = 0
+            self.last_target_signature = target_sig
+
+        # If we have shot the same target several times with no useful result,
+        # assume corpse/false positive and force movement instead.
+        if self.same_target_shot_count >= 5:
+            self.dead_target_ignore_steps = 20
+            self.same_target_shot_count = 0
+            return "move_forward"
+
         if enemy_centered or abs(aim_error) < 0.10:
             if ammo > 0:
-                print(f"[aim assist] enemy CENTER error={aim_error:.2f} -> shoot")
                 return "shoot"
             return "melee_attack"
 
-        # Enemy is left.
         if aim_error < -0.10:
-            print(f"[aim assist] enemy LEFT error={aim_error:.2f} -> turn_left")
             return "turn_left"
 
-        # Enemy is right.
         if aim_error > 0.10:
-            print(f"[aim assist] enemy RIGHT error={aim_error:.2f} -> turn_right")
             return "turn_right"
 
         return action
     
-    def exploration_assist_action(self, action, enemy_visible, distance_moved, motion):
+    def exploration_assist_action(self, action, enemy_visible):
         """
-        Keeps the agent from standing still or spinning when there is no enemy.
-
-        This is not meant to play the whole game for the agent.
-        It only prevents useless stationary behavior.
+        Prevents stationary spinning/shooting when combat is not active.
         """
         if enemy_visible:
             return action
 
-        # If stuck, force an escape behavior.
-        if self.stuck_counter > 20:
-            if self._step_count % 3 == 0:
-                return "move_backward"
-            if self._step_count % 3 == 1:
-                return "turn_right"
-            return "strafe_left"
-
-        # If the policy wants to shoot with no enemy, move instead.
         if action in ["shoot", "melee_attack"]:
             return "move_forward"
 
-        # If it keeps turning while making no progress, force movement.
-        if action in ["turn_left", "turn_right"] and motion < 1.5:
+        if self.stuck_counter > 15:
+            cycle = self._step_count % 4
+
+            if cycle == 0:
+                return "move_backward"
+            if cycle == 1:
+                return "turn_right"
+            if cycle == 2:
+                return "strafe_left"
+
             return "move_forward"
 
-        # If it is stationary, move forward.
-        if distance_moved <= 0.0 and motion < 1.0:
+        if action in ["turn_left", "turn_right"] and self.stuck_counter > 5:
             return "move_forward"
 
         return action
