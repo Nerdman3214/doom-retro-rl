@@ -42,7 +42,7 @@ from observation.frame_processor import FrameProcessor
 
 
 DOOM_BINARY = "/home/steven/Downloads/doomretro-master/build/doomretro"
-DOOM_IWAD = "/usr/share/games/doom/freedoom1.wad"
+DOOM_IWAD = "/usr/share/games/doom/freedoom2.wad"
 
 
 class DoomEnv(gym.Env):
@@ -473,6 +473,13 @@ class DoomEnv(gym.Env):
             ammo=pre_game_state.get("ammo", 0),
         )
 
+        action = self.exploration_assist_action(
+            action=action,
+            enemy_visible=pre_enemy_visible,
+            distance_moved=pre_game_state.get("distance_moved", 0.0),
+            motion=pre_game_state.get("motion", 0.0),
+        )
+
         # Helper alignment reward. Keep this small so it does not dominate PPO.
         helper_action = self.helper.get_action(pre_game_state)
 
@@ -598,7 +605,7 @@ class DoomEnv(gym.Env):
             if not enemy_visible and action == "move_forward":
                 reward += 0.03
 
-            if not enemy_visible and action == "use":
+            if not enemy_visible and action == "use" and (distance_moved > 1.0 or motion > 2.0):
                 reward += 0.08
 
             if distance_moved > 5.0:
@@ -1096,22 +1103,29 @@ class DoomEnv(gym.Env):
                 )
 
         elif self.curriculum_stage == 3:
-            behavior_ready = (
-                (
-                    self.enemy_engagement_count >= 5
-                    and self.enemy_visible_steps >= 5
-                )
-                or
-                (
-                    len(self.visited_tiles) >= 8
-                    and self.door_interaction_count >= 1
-                )
+            combat_ready = (
+                self.enemy_engagement_count >= 3
+                and self.enemy_visible_steps >= 3
             )
+
+            exploration_ready = (
+                len(self.visited_tiles) >= 5
+                and self.distance_traveled >= 150.0
+            )
+
+            door_ready = (
+                self.door_interaction_count >= 1
+                and self.distance_traveled >= 75.0
+            )
+
+            behavior_ready = combat_ready or exploration_ready or door_ready
+
             if should_log:
                 print(
-                    f"  [Stage 3] shots: {self.enemy_engagement_count}/5 | "
-                    f"visible: {self.enemy_visible_steps}/5 | "
-                    f"tiles: {len(self.visited_tiles)}/8 | "
+                    f"  [Stage 3] combat: {self.enemy_engagement_count}/3 | "
+                    f"visible: {self.enemy_visible_steps}/3 | "
+                    f"tiles: {len(self.visited_tiles)}/5 | "
+                    f"distance: {self.distance_traveled:.1f}/150 | "
                     f"doors/use: {self.door_interaction_count}/1 | "
                     f"Reward: {avg_reward:.2f}/{threshold}"
                 )
@@ -1278,35 +1292,81 @@ class DoomEnv(gym.Env):
 
 
     def aim_assist_action(self, action, frame, enemy_visible, enemy_centered, ammo):
+        """
+        Combat aim assist.
+
+        Important:
+        Do NOT aim-assist only from color heatmap confidence.
+        The heatmap is noisy in Doom/Freedoom and can detect walls as enemies.
+        """
         if self.curriculum_stage < 3:
+            return action
+
+        # Main fix:
+        # If the real enemy detector does not see an enemy, do not rotate/shoot.
+        if not enemy_visible:
             return action
 
         aim_error, confidence = self._enemy_horizontal_error(frame)
 
-        likely_enemy = enemy_visible or confidence >= 20
-
-        if not likely_enemy:
+        # If confidence is too weak, do not override movement.
+        if confidence < 20:
             return action
 
-        if self._step_count % 10 == 0:
+        if self._step_count % 25 == 0:
             print(
                 f"[aim] visible={enemy_visible} centered={enemy_centered} "
                 f"error={aim_error:.2f} confidence={confidence} old_action={action}"
             )
 
+        # Enemy is centered enough: shoot.
         if enemy_centered or abs(aim_error) < 0.10:
-            print(f"[aim assist] enemy CENTER error={aim_error:.2f} -> shoot")
             if ammo > 0:
+                print(f"[aim assist] enemy CENTER error={aim_error:.2f} -> shoot")
                 return "shoot"
             return "melee_attack"
 
+        # Enemy is left.
         if aim_error < -0.10:
             print(f"[aim assist] enemy LEFT error={aim_error:.2f} -> turn_left")
             return "turn_left"
 
+        # Enemy is right.
         if aim_error > 0.10:
             print(f"[aim assist] enemy RIGHT error={aim_error:.2f} -> turn_right")
             return "turn_right"
+
+        return action
+    
+    def exploration_assist_action(self, action, enemy_visible, distance_moved, motion):
+        """
+        Keeps the agent from standing still or spinning when there is no enemy.
+
+        This is not meant to play the whole game for the agent.
+        It only prevents useless stationary behavior.
+        """
+        if enemy_visible:
+            return action
+
+        # If stuck, force an escape behavior.
+        if self.stuck_counter > 20:
+            if self._step_count % 3 == 0:
+                return "move_backward"
+            if self._step_count % 3 == 1:
+                return "turn_right"
+            return "strafe_left"
+
+        # If the policy wants to shoot with no enemy, move instead.
+        if action in ["shoot", "melee_attack"]:
+            return "move_forward"
+
+        # If it keeps turning while making no progress, force movement.
+        if action in ["turn_left", "turn_right"] and motion < 1.5:
+            return "move_forward"
+
+        # If it is stationary, move forward.
+        if distance_moved <= 0.0 and motion < 1.0:
+            return "move_forward"
 
         return action
 

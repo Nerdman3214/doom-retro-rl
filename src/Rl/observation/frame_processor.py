@@ -129,30 +129,36 @@ class FrameProcessor:
 
     def enemy_heatmap(self, frame):
         """
-        Simple enemy-like color heatmap.
+        Enemy-like color heatmap.
 
-        BGR convention:
-            channel 0 = blue
-            channel 1 = green
-            channel 2 = red
+        This is intentionally stricter than red-green difference alone,
+        because Doom/Freedoom has lots of brown/red walls and HUD elements.
         """
         if frame is None or frame.size == 0:
             return np.zeros((self.height, self.width), dtype=np.float32)
 
         resized = cv2.resize(frame, (self.width, self.height))
 
-        blue = resized[:, :, 0].astype(np.int16)
-        green = resized[:, :, 1].astype(np.int16)
-        red = resized[:, :, 2].astype(np.int16)
+        h, w = resized.shape[:2]
 
-        # Enemy-ish pixels: red/brown stronger than green/blue.
+        # Ignore HUD / weapon area near bottom.
+        gameplay = resized[: int(h * 0.75), :]
+
+        blue = gameplay[:, :, 0].astype(np.int16)
+        green = gameplay[:, :, 1].astype(np.int16)
+        red = gameplay[:, :, 2].astype(np.int16)
+
         heatmap = (
-            (red > 80)
-            & (red > green + 15)
-            & (red > blue + 10)
+            (red > 90)
+            & (red > green + 25)
+            & (red > blue + 20)
+            & (green < 120)
         )
 
-        return heatmap.astype(np.float32)
+        full = np.zeros((self.height, self.width), dtype=np.float32)
+        full[: gameplay.shape[0], :] = heatmap.astype(np.float32)
+
+        return full
 
     def _center_crop(self, frame, radius):
         if frame is None or frame.size == 0:
