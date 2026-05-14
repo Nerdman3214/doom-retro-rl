@@ -42,7 +42,11 @@ from curriculum.curriculum_manager import CurriculumManager
 from observation.frame_processor import FrameProcessor
 from navigation.checkpoint_tracker import CheckpointTracker
 from navigation.level_guides import get_level_guide
-from observation.vision_detector import VisionDetector
+
+try:
+    from observation.vision_detector import VisionDetector
+except ImportError:
+    VisionDetector = None
 
 try:
     from combat.combat_tactics import CombatTactics
@@ -90,7 +94,12 @@ class DoomEnv(gym.Env):
         self.helper = HelperBot()
         self.curriculum = CurriculumManager()
         self.combat_tactics = CombatTactics()
-        self.vision_detector = VisionDetector(frame_processor=self.frame_processor)
+
+        if VisionDetector is not None:
+            self.vision_detector = VisionDetector(frame_processor=self.frame_processor)
+        else:
+            self.vision_detector = None
+            print("[vision] observation.vision_detector not found — using built-in fallback vision.")
 
         self.checkpoint_tracker = CheckpointTracker(reach_radius=128.0)
 
@@ -99,8 +108,6 @@ class DoomEnv(gym.Env):
             checkpoints=level_guide["checkpoints"],
             secrets=level_guide["secrets"],
         )
-
-        self.last_checkpoint_debug_step = -100
 
         # -----------------------------------------------------
         # Penalty tuning
@@ -118,11 +125,8 @@ class DoomEnv(gym.Env):
         self.event_recorder = EventRecorder()
         self.smart_clipper = SmartClipGenerator()
 
-        # -----------------------------------------------------
-        # Vision dataset collection
-        # -----------------------------------------------------
-
-        self.collect_vision_frames = True
+        # Turn off while debugging movement. Turn on later for dataset collection.
+        self.collect_vision_frames = False
         self.vision_frame_interval = 5
         self.vision_frame_count = 0
         self.vision_dataset_dir = os.path.join(
@@ -131,13 +135,7 @@ class DoomEnv(gym.Env):
             "vision_dataset",
             "raw_frames",
         )
-
         os.makedirs(self.vision_dataset_dir, exist_ok=True)
-
-        self.wall_escape_mode = False
-        self.wall_escape_step = 0
-        self.wall_escape_direction = "right"
-        self.wall_escape_start_step = -100
 
         if self.record:
             self.logger = BehaviorLogger()
@@ -197,49 +195,46 @@ class DoomEnv(gym.Env):
 
         self._step_count = 0
         self._max_episode_steps = 1000
+        self.episode_reward_total = 0.0
+        self.best_episode_reward = -float("inf")
+
         self.stuck_counter = 0
+        self.wall_contact_steps = 0
+        self.last_wall_escape_step = -100
+        self.route_progress_level = 0
+
+        self.wall_escape_mode = False
+        self.wall_escape_step = 0
+        self.wall_escape_direction = "right"
+        self.wall_escape_start_step = -100
+
         self.previous_health = None
         self._previous_frame = None
-        self.last_shot_step = -100
         self.last_player_position = None
-        self.last_area_signature = None
         self.initial_distance = None
         self.closest_distance = None
         self.distance_traveled = 0.0
         self.visited_tiles = set()
         self.visited_areas = set()
-        self.visual_area_counter = 0
+        self.last_area_signature = None
         self.last_visual_signature = None
         self.visual_area_steps = 0
         self.prev_enemy_visible = False
 
         # -----------------------------------------------------
-        # Wall / route state
-        # -----------------------------------------------------
-
-        self.wall_contact_steps = 0
-        self.last_wall_escape_step = -100
-        self.route_progress_level = 0
-
-        # -----------------------------------------------------
-        # Mastery tracking
-        # -----------------------------------------------------
-
-        self.mastery_level = 0
-        self.final_mastery_level = 0
-        self.final_mastery_rewards = []
-        self.best_episode_reward = -float("inf")
-        self.episode_reward_total = 0.0
-        self.episode_level_completions = 0
-
-        # -----------------------------------------------------
-        # Target / aim memory
+        # Aim/combat memory
         # -----------------------------------------------------
 
         self.last_target_signature = None
         self.same_target_shot_count = 0
         self.dead_target_ignore_steps = 0
         self.last_aim_assist_step = -100
+        self.last_shot_step = -100
+
+        self.consecutive_melee_steps = 0
+        self.last_melee_step = -100
+        self.consecutive_swap_steps = 0
+        self.last_swap_step = -100
 
         # -----------------------------------------------------
         # Behavior counters
@@ -266,6 +261,11 @@ class DoomEnv(gym.Env):
         self.combat_survival_steps = 0
         self.dodge_when_damaged_count = 0
         self.retreat_from_close_enemy_count = 0
+        self.episode_level_completions = 0
+
+        self.mastery_level = 0
+        self.final_mastery_level = 0
+        self.final_mastery_rewards = []
 
         self._use_preference = False
         self._load_preference_model()
@@ -400,9 +400,6 @@ class DoomEnv(gym.Env):
                 "use",
             ]
 
-        # Important:
-        # Stage 3 does NOT allow use.
-        # This prevents the agent from pressing E forever during shooting practice.
         if stage == 3:
             return [
                 "move_forward",
@@ -456,32 +453,37 @@ class DoomEnv(gym.Env):
         self.prev_enemy_visible = False
 
         self._step_count = 0
+        self.episode_reward_total = 0.0
         self.stuck_counter = 0
-        self.previous_health = None
-        self._previous_frame = None
-        self.last_shot_step = -100
-        self.distance_traveled = 0.0
-        self.visited_tiles.clear()
-        self.visited_areas.clear()
-        self.last_area_signature = None
-        self.last_player_position = None
-
         self.wall_contact_steps = 0
         self.last_wall_escape_step = -100
         self.route_progress_level = 0
-        self.checkpoint_tracker.reset()
-        self.last_checkpoint_debug_step = -100
+
         self.wall_escape_mode = False
         self.wall_escape_step = 0
         self.wall_escape_direction = "right"
         self.wall_escape_start_step = -100
 
-        self.episode_reward_total = 0.0
+        self.previous_health = None
+        self._previous_frame = None
+        self.last_player_position = None
+        self.last_area_signature = None
+        self.last_visual_signature = None
+        self.visual_area_steps = 0
+        self.distance_traveled = 0.0
+        self.visited_tiles.clear()
+        self.visited_areas.clear()
 
         self.last_target_signature = None
         self.same_target_shot_count = 0
         self.dead_target_ignore_steps = 0
         self.last_aim_assist_step = -100
+        self.last_shot_step = -100
+
+        self.consecutive_melee_steps = 0
+        self.last_melee_step = -100
+        self.consecutive_swap_steps = 0
+        self.last_swap_step = -100
 
         self.movement_count = 0
         self.exploration_count = 0
@@ -506,6 +508,7 @@ class DoomEnv(gym.Env):
         self.retreat_from_close_enemy_count = 0
 
         self.reward_manager.reset()
+        self.checkpoint_tracker.reset()
 
         if hasattr(self.observer, "reset_tracking"):
             self.observer.reset_tracking()
@@ -517,10 +520,10 @@ class DoomEnv(gym.Env):
         frame_cache.reset_monitor()
         frame_cache.invalidate()
 
-        wid = self.controller.window_id
+        wid = getattr(self.controller, "window_id", None)
         if wid:
             subprocess.call(
-                ["xdotool", "windowfocus", "--sync", wid],
+                ["xdotool", "windowfocus", "--sync", str(wid)],
                 stderr=subprocess.DEVNULL,
             )
 
@@ -538,7 +541,6 @@ class DoomEnv(gym.Env):
 
         player_pos = self.observer.get_player_position()
         goal_pos = self.observer.get_goal_position()
-
         self.last_player_position = player_pos
 
         if player_pos is not None and goal_pos is not None:
@@ -585,12 +587,10 @@ class DoomEnv(gym.Env):
 
         pre_frame = self.observer.get_frame()
         pre_game_state = self.observer.get_game_state()
-        pre_vision = self.vision_detector.detect(pre_frame)
+        pre_vision = self.detect_vision(pre_frame)
 
         pre_enemy_visible = pre_vision["enemy_visible"]
         pre_enemy_centered = pre_vision["enemy_centered"]
-
-        aim_error, confidence = self._enemy_horizontal_error(pre_frame)
 
         pre_game_state["curriculum_stage"] = self.curriculum_stage
         pre_game_state["enemy_visible"] = pre_enemy_visible
@@ -598,59 +598,199 @@ class DoomEnv(gym.Env):
         pre_game_state["enemy_left"] = pre_vision["enemy_left"]
         pre_game_state["enemy_right"] = pre_vision["enemy_right"]
         pre_game_state["enemy_close"] = pre_vision["enemy_confidence"] >= 120
-
         pre_game_state["door_visible"] = pre_vision["door_visible"]
         pre_game_state["door_centered"] = pre_vision["door_centered"]
         pre_game_state["front_wall_close"] = pre_vision["front_wall_close"]
         pre_game_state["left_wall_close"] = pre_vision["left_wall_close"]
         pre_game_state["right_wall_close"] = pre_vision["right_wall_close"]
+        pre_game_state["stuck_counter"] = self.stuck_counter
+        pre_game_state["distance_traveled"] = self.distance_traveled
+        pre_game_state["wall_contact_steps"] = self.wall_contact_steps
         pre_game_state["action"] = action
 
         # -----------------------------------------------------
         # Action correction stack
         # -----------------------------------------------------
 
+        original_action = action
+
+        # 1) Sanitize the PPO action for the current stage.
         action = self.sanitize_action(action, pre_game_state, pre_enemy_visible)
+        if action != original_action:
+            print(f"[override] sanitize: {original_action} -> {action}")
 
-        tactical_action = self.combat_tactics.choose_combat_action(pre_game_state)
+        pre_game_state["action"] = action
 
-        if tactical_action is not None:
-            action = tactical_action
+        # 2) Stage 0/1/2 are movement/door learning only.
+        # Combat helpers must not hijack these stages.
+        if self.curriculum_stage < 3:
+            before = action
+            action = self.exploration_assist_action(
+                action=action,
+                enemy_visible=False,
+                distance_moved=None,
+                motion=None,
+            )
+            if action != before:
+                print(f"[override] exploration: {before} -> {action}")
+
+            before = action
+            action = self.wall_assist_action(
+                action=action,
+                frame=pre_frame,
+                enemy_visible=False,
+                distance_moved=None,
+                motion=None,
+            )
+            if action != before:
+                print(f"[override] wall: {before} -> {action}")
+
+            if self.curriculum_stage == 2:
+                before = action
+                action = self.door_assist_action(
+                    action=action,
+                    frame=pre_frame,
+                    enemy_visible=False,
+                    distance_moved=None,
+                    motion=None,
+                )
+                if action != before:
+                    print(f"[override] door: {before} -> {action}")
+
+        # 3) Combat stages: aim first, then combat, then movement/route helpers.
         else:
-            action = self.aim_assist_action(
+            aimed_this_step = False
+
+            # Aim alignment gets priority over shooting/swap logic.
+            if pre_enemy_visible and not pre_enemy_centered:
+                if pre_game_state.get("enemy_left", False):
+                    before = action
+                    action = "turn_left"
+                    aimed_this_step = True
+                    print(f"[override] aim_priority: {before} -> {action}")
+
+                elif pre_game_state.get("enemy_right", False):
+                    before = action
+                    action = "turn_right"
+                    aimed_this_step = True
+                    print(f"[override] aim_priority: {before} -> {action}")
+
+            if not aimed_this_step:
+                before = action
+                pre_game_state["action"] = action
+                tactical_action = self.combat_tactics.choose_combat_action(pre_game_state)
+
+                if tactical_action is not None:
+                    # If route stages have made no progress, do not replace
+                    # all movement with shoot/melee/swap.
+                    if self.curriculum_stage >= 5 and self.distance_traveled < 25.0:
+                        if tactical_action in ["shoot", "melee_attack", "swap_weapon"]:
+                            tactical_action = "move_forward"
+
+                    # Anti-melee-spam rule.
+                    if tactical_action == "melee_attack" and self.consecutive_melee_steps >= 3:
+                        if self.stuck_counter >= 3:
+                            tactical_action = "move_backward"
+                        else:
+                            tactical_action = (
+                                "strafe_left"
+                                if (self._step_count // 5) % 2 == 0
+                                else "strafe_right"
+                            )
+
+                    action = tactical_action
+                    if action != before:
+                        print(f"[override] combat_tactics: {before} -> {action}")
+
+                else:
+                    before = action
+                    action = self.aim_assist_action(
+                        action=action,
+                        frame=pre_frame,
+                        enemy_visible=pre_enemy_visible,
+                        enemy_centered=pre_enemy_centered,
+                        ammo=pre_game_state.get("ammo", 0),
+                    )
+                    if action != before:
+                        print(f"[override] aim_assist: {before} -> {action}")
+
+            before = action
+            action = self.exploration_assist_action(
+                action=action,
+                enemy_visible=pre_enemy_visible,
+                distance_moved=None,
+                motion=None,
+            )
+            if action != before:
+                print(f"[override] exploration: {before} -> {action}")
+
+            before = action
+            action = self.wall_assist_action(
                 action=action,
                 frame=pre_frame,
                 enemy_visible=pre_enemy_visible,
-                enemy_centered=pre_enemy_centered,
-                ammo=pre_game_state.get("ammo", 0),
+                distance_moved=None,
+                motion=None,
             )
+            if action != before:
+                print(f"[override] wall: {before} -> {action}")
 
-        action = self.exploration_assist_action(
-            action=action,
-            enemy_visible=pre_enemy_visible,
-            distance_moved=None,
-            motion=None,
-        )
+            before = action
+            action = self.door_assist_action(
+                action=action,
+                frame=pre_frame,
+                enemy_visible=pre_enemy_visible,
+                distance_moved=None,
+                motion=None,
+            )
+            if action != before:
+                print(f"[override] door: {before} -> {action}")
 
-        # Wall helper is conservative.
-        # It uses previous stuck/wall state, not fake current movement.
-        action = self.wall_assist_action(
-            action=action,
-            frame=pre_frame,
-            enemy_visible=pre_enemy_visible,
-            distance_moved=None,
-            motion=None,
-        )
+        # Track melee streak after final helper choice.
+        if action == "melee_attack":
+            self.consecutive_melee_steps += 1
+            self.last_melee_step = self._step_count
+        else:
+            self.consecutive_melee_steps = 0
 
-        # Door helper is also conservative.
-        # It only activates in Stage 2 or Stage 5+.
-        action = self.door_assist_action(
-            action=action,
-            frame=pre_frame,
-            enemy_visible=pre_enemy_visible,
-            distance_moved=None,
-            motion=None,
-        )
+        # Prevent endless swap_weapon loops BEFORE executing the action.
+        if action == "swap_weapon":
+            self.consecutive_swap_steps += 1
+            self.last_swap_step = self._step_count
+
+            if self.consecutive_swap_steps > 3:
+                before = action
+
+                if pre_enemy_visible and not pre_enemy_centered:
+                    if pre_game_state.get("enemy_left", False):
+                        action = "turn_left"
+                    elif pre_game_state.get("enemy_right", False):
+                        action = "turn_right"
+                    else:
+                        action = "move_backward"
+                elif self.stuck_counter >= 3:
+                    action = "move_backward"
+                else:
+                    action = "move_forward"
+
+                print(f"[override] swap_spam: {before} -> {action}")
+        else:
+            self.consecutive_swap_steps = 0
+
+        # Final safety pass BEFORE action execution.
+        final_before = action
+        action = self.sanitize_action(action, pre_game_state, pre_enemy_visible)
+
+        if action != final_before:
+            print(f"[override] final_sanitize: {final_before} -> {action}")
+
+        if action not in self.get_allowed_actions():
+            fixed_action = "move_forward"
+            print(
+                f"[override] final_safety: {action} -> {fixed_action} "
+                f"because stage={self.curriculum_stage} allowed={self.get_allowed_actions()}"
+            )
+            action = fixed_action
 
         helper_action = self.helper.get_action(pre_game_state)
 
@@ -670,12 +810,13 @@ class DoomEnv(gym.Env):
         # -----------------------------------------------------
 
         raw_frame = self.observer.get_frame()
-        vision = self.vision_detector.detect(raw_frame)
+        vision = self.detect_vision(raw_frame)
+
         _, motion, _, _ = self.frame_processor.extract(raw_frame)
         self._save_vision_frame(raw_frame)
 
-        enemy_visible = self.reward_manager.enemy_detector.detect_enemy_presence(raw_frame)
-        enemy_centered = self.reward_manager.enemy_in_crosshair(raw_frame)
+        enemy_visible = vision["enemy_visible"]
+        enemy_centered = vision["enemy_centered"]
 
         if enemy_visible:
             self.enemy_visible_steps += 1
@@ -722,13 +863,6 @@ class DoomEnv(gym.Env):
         # Wall/contact detection
         # -----------------------------------------------------
 
-        movement_action = action in [
-            "move_forward",
-            "move_backward",
-            "strafe_left",
-            "strafe_right",
-        ]
-
         wall_contact = (
             action == "move_forward"
             and motion < 1.0
@@ -746,11 +880,6 @@ class DoomEnv(gym.Env):
         game_state["front_wall_ratio"] = wall_info["front_ratio"]
         game_state["right_wall_ratio"] = wall_info["right_ratio"]
 
-        # -----------------------------------------------------
-        # Checkpoint / secret navigation reward
-        # -----------------------------------------------------
-
-        # Keep disabled until you replace placeholder coordinates.
         checkpoint_reward = 0.0
         checkpoint_info = {
             "distance_to_checkpoint": None,
@@ -769,10 +898,6 @@ class DoomEnv(gym.Env):
         game_state["nearest_secret_name"] = checkpoint_info.get("nearest_secret_name")
         game_state["secret_reached"] = checkpoint_info.get("secret_reached")
         game_state["all_checkpoints_reached"] = checkpoint_info.get("all_checkpoints_reached")
-
-        # -----------------------------------------------------
-        # Tactical state
-        # -----------------------------------------------------
 
         should_fight = enemy_visible and ammo > 0
         should_dodge = enemy_visible and health_delta < 0
@@ -842,6 +967,28 @@ class DoomEnv(gym.Env):
         if self.wall_escape_mode and distance_moved > 4.0 and motion > 2.0:
             reward += 0.5
             self.reward_manager.add("successful_wall_escape", 0.5)
+
+        # -----------------------------------------------------
+        # Stage-specific movement/combat reward
+        # -----------------------------------------------------
+
+        if self.curriculum_stage >= 5:
+            if distance_moved > 3.0:
+                reward += 0.15
+                self.reward_manager.add("route_movement_progress", 0.15)
+
+            if action in ["move_forward", "move_backward", "strafe_left", "strafe_right"]:
+                reward += 0.03
+                self.reward_manager.add("route_movement_action", 0.03)
+
+            if action == "melee_attack" and self.consecutive_melee_steps > 3:
+                reward += self.add_penalty("melee_spam", -1.0)
+
+            if action == "swap_weapon" and self.consecutive_swap_steps > 3:
+                reward += self.add_penalty("swap_spam", -1.0)
+
+            if self.distance_traveled < 25.0 and self._step_count > 100:
+                reward += self.add_penalty("no_route_progress", -1.5)
 
         # -----------------------------------------------------
         # Debug prints
@@ -959,7 +1106,7 @@ class DoomEnv(gym.Env):
             self.key_item_count += 1
 
         # -----------------------------------------------------
-        # Stage 3 cautious combat progression
+        # Stage 3 combat progression
         # -----------------------------------------------------
 
         if self.curriculum_stage == 3:
@@ -1011,10 +1158,6 @@ class DoomEnv(gym.Env):
             if action == "shoot" and not enemy_visible:
                 reward += self.add_penalty("stage3_shoot_without_enemy", -2.0)
 
-        # -----------------------------------------------------
-        # Generic combat rewards after Stage 3
-        # -----------------------------------------------------
-
         elif self.curriculum_stage >= 4:
             if action == "shoot":
                 if not config.get("allow_shoot", False):
@@ -1047,7 +1190,7 @@ class DoomEnv(gym.Env):
                         reward += self.add_penalty("low_ammo_shot_pressure", -0.5)
 
         # -----------------------------------------------------
-        # Melee combat rewards
+        # Melee/use/swap rewards
         # -----------------------------------------------------
 
         if action == "melee_attack":
@@ -1070,10 +1213,6 @@ class DoomEnv(gym.Env):
 
             else:
                 reward += self.add_penalty("bad_melee_spacing", -0.2)
-
-        # -----------------------------------------------------
-        # Use / weapon rewards
-        # -----------------------------------------------------
 
         if action == "use":
             meaningful_use = (
@@ -1131,33 +1270,6 @@ class DoomEnv(gym.Env):
 
             if self.weapon_pickup_count > 0:
                 reward += 0.05
-
-        # -----------------------------------------------------
-        # Stage 7 final mastery rewards
-        # -----------------------------------------------------
-
-        if self.curriculum_stage >= 7:
-            if self.final_mastery_level == 0:
-                if distance_moved > 5.0:
-                    reward += 0.05
-
-            elif self.final_mastery_level == 1:
-                if len(self.visited_tiles) >= 5:
-                    reward += 0.10
-
-            elif self.final_mastery_level == 2:
-                if action == "use" and distance_moved > 1.0:
-                    reward += 0.15
-
-            elif self.final_mastery_level == 3:
-                if self.enemy_kill_count > 0:
-                    reward += 0.25
-                if self.pickup_count > 0:
-                    reward += 0.10
-
-            elif self.final_mastery_level >= 4:
-                if game_state.get("level_complete", False):
-                    reward += 150.0
 
         # -----------------------------------------------------
         # Route progress milestones
@@ -1224,7 +1336,7 @@ class DoomEnv(gym.Env):
         self.prev_enemy_visible = enemy_visible
 
         # -----------------------------------------------------
-        # Completion / death / termination
+        # Termination
         # -----------------------------------------------------
 
         health = game_state.get("health", 100)
@@ -1260,23 +1372,11 @@ class DoomEnv(gym.Env):
         if terminated or truncated:
             self.controller.release_all()
 
-        # -----------------------------------------------------
-        # Final observation
-        # -----------------------------------------------------
-
         processed_frame = self.observer.build()
         observation = self.frame_stack.add_frame(processed_frame)
 
-        # -----------------------------------------------------
-        # Recording
-        # -----------------------------------------------------
-
         if self.record:
             self._record_step(raw_frame, action, reward, game_state)
-
-        # -----------------------------------------------------
-        # Curriculum update
-        # -----------------------------------------------------
 
         self.curriculum_rewards.append(reward)
 
@@ -1284,10 +1384,6 @@ class DoomEnv(gym.Env):
             self.curriculum_rewards.pop(0)
 
         self.update_curriculum()
-
-        # -----------------------------------------------------
-        # Episode reward tracking
-        # -----------------------------------------------------
 
         self.episode_reward_total += float(reward)
 
@@ -1309,34 +1405,38 @@ class DoomEnv(gym.Env):
     def perform_action(self, action):
         allowed = self.get_allowed_actions()
 
+        if self._step_count % 10 == 0:
+            print(
+                f"[perform_action] step={self._step_count} "
+                f"stage={self.curriculum_stage} "
+                f"action={action} "
+                f"allowed={action in allowed} "
+                f"window_id={getattr(self.controller, 'window_id', None)}"
+            )
+
         if action not in allowed:
+            print(f"[perform_action] BLOCKED action={action} allowed={allowed}")
             return
 
         self.controller.release_all()
 
         if action == "move_forward":
-            self.controller.start_move_forward()
+            self.controller.hold_key("w", duration=0.12)
 
         elif action == "move_backward":
-            self.controller.start_move_backward()
+            self.controller.hold_key("s", duration=0.12)
 
         elif action == "turn_left":
-            if hasattr(self.controller, "quick_turn_left"):
-                self.controller.quick_turn_left()
-            else:
-                self.controller.start_turn_left()
+            self.controller.hold_key("Left", duration=0.06)
 
         elif action == "turn_right":
-            if hasattr(self.controller, "quick_turn_right"):
-                self.controller.quick_turn_right()
-            else:
-                self.controller.start_turn_right()
+            self.controller.hold_key("Right", duration=0.06)
 
         elif action == "strafe_left":
-            self.controller.start_strafe_left()
+            self.controller.hold_key("a", duration=0.12)
 
         elif action == "strafe_right":
-            self.controller.start_strafe_right()
+            self.controller.hold_key("d", duration=0.12)
 
         elif action == "shoot":
             self.controller.shoot()
@@ -1351,7 +1451,68 @@ class DoomEnv(gym.Env):
             self.controller.swap_weapon()
 
     # ---------------------------------------------------------
-    # Tracking / reward helpers
+    # Vision helpers
+    # ---------------------------------------------------------
+
+    def detect_vision(self, frame):
+        if self.vision_detector is not None:
+            result = self.vision_detector.detect(frame)
+
+            # Guarantee expected keys exist even if the external detector is incomplete.
+            fallback = self._fallback_vision(frame)
+            for key, value in fallback.items():
+                result.setdefault(key, value)
+
+            return result
+
+        return self._fallback_vision(frame)
+
+    def _fallback_vision(self, frame):
+        enemy_error, enemy_confidence = self._enemy_horizontal_error(frame)
+        door_error, door_confidence = self._door_horizontal_error(frame)
+        wall_info = self._wall_direction_info(frame)
+
+        return {
+            "enemy_visible": enemy_confidence >= 20,
+            "enemy_centered": abs(enemy_error) < 0.18 and enemy_confidence >= 20,
+            "enemy_left": enemy_error < -0.18 and enemy_confidence >= 20,
+            "enemy_right": enemy_error > 0.18 and enemy_confidence >= 20,
+            "enemy_confidence": float(enemy_confidence),
+            "enemy_x": float(enemy_error) if enemy_confidence >= 20 else None,
+            "enemy_y": None,
+
+            "door_visible": door_confidence >= 250,
+            "door_centered": abs(door_error) < 0.15 and door_confidence >= 250,
+            "door_left": door_error < -0.20 and door_confidence >= 250,
+            "door_right": door_error > 0.20 and door_confidence >= 250,
+            "door_confidence": float(door_confidence),
+
+            "pickup_visible": False,
+            "weapon_visible": False,
+            "ammo_visible": False,
+            "health_visible": False,
+
+            "projectile_visible": False,
+            "barrel_visible": False,
+            "exit_visible": False,
+
+            "front_wall_close": wall_info["front_wall"],
+            "left_wall_close": wall_info["left_wall"],
+            "right_wall_close": wall_info["right_wall"],
+            "front_wall_ratio": wall_info["front_ratio"],
+            "left_wall_ratio": wall_info["left_ratio"],
+            "right_wall_ratio": wall_info["right_ratio"],
+
+            "scene_label": None,
+            "scene_confidence": 0.0,
+
+            "depth_center": None,
+            "depth_left": None,
+            "depth_right": None,
+        }
+
+    # ---------------------------------------------------------
+    # Tracking / recording helpers
     # ---------------------------------------------------------
 
     def _visual_area_signature(self, frame):
@@ -1473,17 +1634,7 @@ class DoomEnv(gym.Env):
         if self.smart_clipper is not None:
             self.smart_clipper.observe(frame, action)
 
-    # ---------------------------------------------------------
-    # Curriculum
-    # ---------------------------------------------------------
-
     def _save_vision_frame(self, frame, game_state=None, action=None):
-        """
-        Save gameplay frames for later YOLO / vision model labeling.
-
-        This runs inside the RL environment, so it does not compete with
-        a separate frame-capture script.
-        """
         if not self.collect_vision_frames:
             return
 
@@ -1503,6 +1654,10 @@ class DoomEnv(gym.Env):
 
         if self.vision_frame_count % 50 == 0:
             print(f"[vision] saved {self.vision_frame_count} frames")
+
+    # ---------------------------------------------------------
+    # Curriculum
+    # ---------------------------------------------------------
 
     def update_curriculum(self):
         if len(self.curriculum_rewards) < 50:
@@ -1604,14 +1759,13 @@ class DoomEnv(gym.Env):
                 )
 
         elif self.curriculum_stage == 5:
-            combat_hits = self.valid_shot_count + self.melee_close_bonus_count
-
             behavior_ready = (
                 self.distance_traveled >= 250.0
+                and len(self.visited_tiles) >= 4
                 and (
                     self.door_interaction_count >= 1
-                    or combat_hits >= 2
                     or self.enemy_kill_count >= 1
+                    or self.valid_shot_count >= 3
                 )
             )
 
@@ -1620,7 +1774,7 @@ class DoomEnv(gym.Env):
                     f"  [Stage 5] move_shoot_open_doors | "
                     f"distance: {self.distance_traveled:.1f}/250 | "
                     f"doors: {self.door_interaction_count}/1 | "
-                    f"hits/melee: {combat_hits}/2 | "
+                    f"hits: {self.valid_shot_count}/3 | "
                     f"kills: {self.enemy_kill_count}/1 | "
                     f"Reward: {avg_reward:.2f}/{threshold}"
                 )
@@ -1809,7 +1963,6 @@ class DoomEnv(gym.Env):
             return 1.0
 
         progress = min(1.0, self._step_count / float(self.penalty_decay_steps))
-
         return 4.0 - (3.0 * progress)
 
     def add_penalty(self, name, base_penalty):
@@ -1898,18 +2051,6 @@ class DoomEnv(gym.Env):
         return error, confidence
 
     def wall_assist_action(self, action, frame, enemy_visible, distance_moved=None, motion=None):
-        """
-        Rotation-based wall escape helper.
-
-        If the agent gets stuck against a wall:
-        1. move backward
-        2. rotate slightly away
-        3. strafe away
-        4. try moving forward
-        5. if still blocked, rotate a little more and repeat
-
-        This lets the agent gradually turn out of wall traps instead of only backing up.
-        """
         if enemy_visible:
             self.wall_escape_mode = False
             self.wall_escape_step = 0
@@ -1921,9 +2062,6 @@ class DoomEnv(gym.Env):
         wall_info = self._wall_direction_info(frame)
 
         front_wall = wall_info["front_wall"]
-        left_wall = wall_info["left_wall"]
-        right_wall = wall_info["right_wall"]
-
         left_ratio = wall_info["left_ratio"]
         right_ratio = wall_info["right_ratio"]
         front_ratio = wall_info["front_ratio"]
@@ -1942,31 +2080,23 @@ class DoomEnv(gym.Env):
         ):
             blocked = True
 
-        # If a wall is visually in front and the agent is trying to walk forward,
-        # treat it as a possible block only when stuck/wall-contact is already rising.
         if action == "move_forward" and front_wall and front_ratio > 0.60 and self.stuck_counter >= 2:
             blocked = True
 
-        # Start escape mode.
         if blocked and not self.wall_escape_mode:
             self.wall_escape_mode = True
             self.wall_escape_step = 0
             self.wall_escape_start_step = self._step_count
 
-            # Choose the direction with more open space.
-            # If left has more wall, rotate/strafe right.
-            # If right has more wall, rotate/strafe left.
             if left_ratio > right_ratio + 0.05:
                 self.wall_escape_direction = "right"
             elif right_ratio > left_ratio + 0.05:
                 self.wall_escape_direction = "left"
             else:
-                # Alternate direction so it does not always choose the same side.
                 self.wall_escape_direction = (
                     "right" if (self._step_count // 20) % 2 == 0 else "left"
                 )
 
-        # Exit escape mode if the agent has clearly moved again.
         if self.wall_escape_mode:
             if (
                 distance_moved is not None
@@ -1979,7 +2109,6 @@ class DoomEnv(gym.Env):
                 self.wall_escape_step = 0
                 return action
 
-            # Safety timeout so it does not get trapped in escape mode forever.
             if self._step_count - self.wall_escape_start_step > 18:
                 self.wall_escape_mode = False
                 self.wall_escape_step = 0
@@ -2027,7 +2156,6 @@ class DoomEnv(gym.Env):
             frame = np.transpose(frame[:3], (1, 2, 0))
 
         h, w = frame.shape[:2]
-
         gameplay = frame[: int(h * 0.70), :]
 
         blue = gameplay[:, :, 0].astype(np.int16)
@@ -2143,6 +2271,12 @@ class DoomEnv(gym.Env):
         self.wall_contact_steps = 0
         self.last_wall_escape_step = -100
         self.route_progress_level = 0
+
+        self.consecutive_melee_steps = 0
+        self.last_melee_step = -100
+        self.consecutive_swap_steps = 0
+        self.last_swap_step = -100
+
         self.wall_escape_mode = False
         self.wall_escape_step = 0
         self.wall_escape_direction = "right"
