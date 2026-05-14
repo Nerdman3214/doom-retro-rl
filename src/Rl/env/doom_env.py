@@ -1382,16 +1382,18 @@ class DoomEnv(gym.Env):
 
         return action
     
-    def exploration_assist_action(self, action, enemy_visible):
+    def exploration_assist_action(self, action, enemy_visible, distance_moved=0.0, motion=0.0):
         """
         Prevents stationary spinning/shooting when combat is not active.
         """
         if enemy_visible:
             return action
 
+        # If the policy wants to shoot with no enemy, move instead.
         if action in ["shoot", "melee_attack"]:
             return "move_forward"
 
+        # If stuck, force an escape behavior.
         if self.stuck_counter > 15:
             cycle = self._step_count % 4
 
@@ -1404,7 +1406,12 @@ class DoomEnv(gym.Env):
 
             return "move_forward"
 
-        if action in ["turn_left", "turn_right"] and self.stuck_counter > 5:
+        # If it keeps turning while making no progress, force movement.
+        if action in ["turn_left", "turn_right"] and motion < 1.5:
+            return "move_forward"
+
+        # If it is stationary, move forward.
+        if distance_moved <= 0.0 and motion < 1.0:
             return "move_forward"
 
         return action
