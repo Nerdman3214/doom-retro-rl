@@ -1,5 +1,6 @@
 import sys
 import os
+import cv2
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -116,6 +117,22 @@ class DoomEnv(gym.Env):
         self.reward_overlay = RewardDebugOverlay() if RewardDebugOverlay is not None else None
         self.event_recorder = EventRecorder()
         self.smart_clipper = SmartClipGenerator()
+
+        # -----------------------------------------------------
+        # Vision dataset collection
+        # -----------------------------------------------------
+
+        self.collect_vision_frames = True
+        self.vision_frame_interval = 5
+        self.vision_frame_count = 0
+        self.vision_dataset_dir = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "vision_dataset",
+            "raw_frames",
+        )
+
+        os.makedirs(self.vision_dataset_dir, exist_ok=True)
 
         self.wall_escape_mode = False
         self.wall_escape_step = 0
@@ -655,6 +672,7 @@ class DoomEnv(gym.Env):
         raw_frame = self.observer.get_frame()
         vision = self.vision_detector.detect(raw_frame)
         _, motion, _, _ = self.frame_processor.extract(raw_frame)
+        self._save_vision_frame(raw_frame)
 
         enemy_visible = self.reward_manager.enemy_detector.detect_enemy_presence(raw_frame)
         enemy_centered = self.reward_manager.enemy_in_crosshair(raw_frame)
@@ -1458,6 +1476,33 @@ class DoomEnv(gym.Env):
     # ---------------------------------------------------------
     # Curriculum
     # ---------------------------------------------------------
+
+    def _save_vision_frame(self, frame, game_state=None, action=None):
+        """
+        Save gameplay frames for later YOLO / vision model labeling.
+
+        This runs inside the RL environment, so it does not compete with
+        a separate frame-capture script.
+        """
+        if not self.collect_vision_frames:
+            return
+
+        if frame is None or frame.size == 0:
+            return
+
+        if self._step_count % self.vision_frame_interval != 0:
+            return
+
+        path = os.path.join(
+            self.vision_dataset_dir,
+            f"frame_{self.vision_frame_count:06d}.jpg",
+        )
+
+        cv2.imwrite(path, frame)
+        self.vision_frame_count += 1
+
+        if self.vision_frame_count % 50 == 0:
+            print(f"[vision] saved {self.vision_frame_count} frames")
 
     def update_curriculum(self):
         if len(self.curriculum_rewards) < 50:
