@@ -137,9 +137,16 @@ class FrameProcessor:
         if frame is None or frame.size == 0:
             return np.zeros((self.height, self.width), dtype=np.float32)
 
+        # Make sure frame is HWC, not CHW.
+        # HWC = height, width, channels
+        # CHW = channels, height, width
+        if len(frame.shape) == 3 and frame.shape[0] in [3, 9] and frame.shape[-1] not in [3, 4]:
+            frame = np.transpose(frame[:3], (1, 2, 0))
+
         resized = cv2.resize(frame, (self.width, self.height))
 
-        h, w = resized.shape[:2]
+        # Important: h must be an int, not resized.shape[:2].
+        h = resized.shape[0]
 
         # Ignore HUD / weapon area near bottom.
         gameplay = resized[: int(h * 0.75), :]
