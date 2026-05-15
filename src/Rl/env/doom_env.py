@@ -94,6 +94,9 @@ class DoomEnv(gym.Env):
         self.helper = HelperBot()
         self.curriculum = CurriculumManager()
         self.combat_tactics = CombatTactics()
+        self.corner_trap_position = None
+        self.corner_trap_steps = 0
+        self.last_corner_escape_step = -100
 
         if VisionDetector is not None:
             self.vision_detector = VisionDetector(frame_processor=self.frame_processor)
@@ -173,8 +176,8 @@ class DoomEnv(gym.Env):
         # Curriculum
         # -----------------------------------------------------
 
-        self.curriculum_stage = 0
-        self.max_stage = 7
+        self.curriculum_stage = 1
+        self.max_stage = 2
         self.curriculum_rewards = []
         self.curriculum_log_interval = 50
 
@@ -473,6 +476,9 @@ class DoomEnv(gym.Env):
         self.distance_traveled = 0.0
         self.visited_tiles.clear()
         self.visited_areas.clear()
+        self.corner_trap_position = None
+        self.corner_trap_steps = 0
+        self.last_corner_escape_step = -100
 
         self.last_target_signature = None
         self.same_target_shot_count = 0
@@ -678,7 +684,7 @@ class DoomEnv(gym.Env):
             if not aimed_this_step:
                 before = action
                 pre_game_state["action"] = action
-                tactical_action = self.combat_tactics.choose_combat_action(pre_game_state)
+                tactical_action = None #self.combat_tactics.choose_combat_action(pre_game_state)
 
                 if tactical_action is not None:
                     # If route stages have made no progress, do not replace
@@ -777,6 +783,24 @@ class DoomEnv(gym.Env):
         else:
             self.consecutive_swap_steps = 0
 
+        if self.stuck_counter >= 8:
+            cycle = self._step_count % 8
+
+            before = action
+
+            if cycle in [0, 1]:
+                action = "move_backward"
+            elif cycle in [2, 3]:
+                action = "turn_right"
+            elif cycle == 4:
+                action = "strafe_right"
+            elif cycle == 5:
+                action = "turn_left"
+            else:
+                action = "move_forward"
+
+            print(f"[override] hard_stuck_escape: {before} -> {action}")
+
         # Final safety pass BEFORE action execution.
         final_before = action
         action = self.sanitize_action(action, pre_game_state, pre_enemy_visible)
@@ -840,6 +864,29 @@ class DoomEnv(gym.Env):
         )
 
         game_state["distance_moved"] = distance_moved
+        corner_trapped = self.detect_corner_trap(game_state)
+        game_state["corner_trapped"] = corner_trapped
+
+        if self.corner_trap_steps >= 20:
+            before = action
+
+            cycle = self.corner_trap_steps % 12
+
+            if cycle in [0, 1, 2]:
+                action = "move_backward"
+            elif cycle in [3, 4, 5]:
+                action = "turn_right"
+            elif cycle in [6, 7]:
+                action = "strafe_right"
+            elif cycle in [8, 9]:
+                action = "turn_left"
+            else:
+                action = "move_forward"
+
+            print(
+                f"[override] corner_escape: {before} -> {action} "
+                f"corner_steps={self.corner_trap_steps}"
+    )
 
         # -----------------------------------------------------
         # Current state values
@@ -1971,6 +2018,9 @@ class DoomEnv(gym.Env):
         return scaled_penalty
 
     def door_assist_action(self, action, frame, enemy_visible, distance_moved=None, motion=None):
+        if self.stuck_counter >= 6 or self.wall_contact_steps >= 2 or self.corner_trap_steps >= 12:
+            return action
+        
         if enemy_visible:
             return action
 
@@ -2049,11 +2099,40 @@ class DoomEnv(gym.Env):
         error = float((door_x - center_x) / center_x)
 
         return error, confidence
+    
+    def detect_corner_trap(self, game_state):
+        """
+        Detect when the agent keeps returning to the same small coordinate area.
+
+        This is different from basic wall contact. The agent may have motion,
+        but still be trapped in a corner loop.
+        """
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        if x is None or y is None:
+            return False
+
+        current_tile = (int(x // 32), int(y // 32))
+
+        if self.corner_trap_position is None:
+            self.corner_trap_position = current_tile
+            self.corner_trap_steps = 0
+            return False
+
+        if current_tile == self.corner_trap_position:
+            self.corner_trap_steps += 1
+        else:
+            self.corner_trap_position = current_tile
+            self.corner_trap_steps = 0
+
+        return self.corner_trap_steps >= 20
 
     def wall_assist_action(self, action, frame, enemy_visible, distance_moved=None, motion=None):
-        if enemy_visible:
-            self.wall_escape_mode = False
-            self.wall_escape_step = 0
+        if action == "move_backward" and self.stuck_counter < 8 and self.corner_trap_steps < 12:
+            return action
+        
+        if enemy_visible and self.stuck_counter < 6 and self.wall_contact_steps < 2:
             return action
 
         if self.curriculum_stage < 1:
