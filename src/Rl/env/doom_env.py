@@ -97,6 +97,8 @@ class DoomEnv(gym.Env):
         self.corner_trap_position = None
         self.corner_trap_steps = 0
         self.last_corner_escape_step = -100
+        self.goal_turn_steps = 0
+        self.max_goal_turn_steps = 6
 
         if VisionDetector is not None:
             self.vision_detector = VisionDetector(frame_processor=self.frame_processor)
@@ -111,6 +113,16 @@ class DoomEnv(gym.Env):
             checkpoints=level_guide["checkpoints"],
             secrets=level_guide["secrets"],
         )
+
+        # -----------------------------------------------------
+        # Corridor milestone tracking
+        # -----------------------------------------------------
+        # Freedoom places enemies early, so we do not require full level completion
+        # before combat. First we count whether the agent can consistently reach
+        # the first dangerous corridor/elevator area.
+        self.corridor_reach_count = 0
+        self.corridor_reached_this_episode = False
+        self.corridor_reach_target = 20
 
         # -----------------------------------------------------
         # Penalty tuning
@@ -129,8 +141,8 @@ class DoomEnv(gym.Env):
         self.smart_clipper = SmartClipGenerator()
 
         # Turn off while debugging movement. Turn on later for dataset collection.
-        self.collect_vision_frames = False
-        self.vision_frame_interval = 5
+        self.collect_vision_frames = True
+        self.vision_frame_interval = 1
         self.vision_frame_count = 0
         self.vision_dataset_dir = os.path.join(
             os.path.dirname(__file__),
@@ -177,7 +189,7 @@ class DoomEnv(gym.Env):
         # -----------------------------------------------------
 
         self.curriculum_stage = 1
-        self.max_stage = 2
+        self.max_stage = 3
         self.curriculum_rewards = []
         self.curriculum_log_interval = 50
 
@@ -461,6 +473,7 @@ class DoomEnv(gym.Env):
         self.wall_contact_steps = 0
         self.last_wall_escape_step = -100
         self.route_progress_level = 0
+        self.goal_turn_steps = 0
 
         self.wall_escape_mode = False
         self.wall_escape_step = 0
@@ -515,6 +528,7 @@ class DoomEnv(gym.Env):
 
         self.reward_manager.reset()
         self.checkpoint_tracker.reset()
+        self.corridor_reached_this_episode = False
 
         if hasattr(self.observer, "reset_tracking"):
             self.observer.reset_tracking()
@@ -597,6 +611,16 @@ class DoomEnv(gym.Env):
 
         pre_enemy_visible = pre_vision["enemy_visible"]
         pre_enemy_centered = pre_vision["enemy_centered"]
+
+        # Stages 0-2 are navigation-only stages.
+        # The current color-based enemy detector can be noisy, so we ignore enemy
+        # labels until combat training starts at Stage 3.
+        if self.curriculum_stage < 3:
+            pre_enemy_visible = False
+            pre_enemy_centered = False
+            pre_vision["enemy_left"] = False
+            pre_vision["enemy_right"] = False
+            pre_vision["enemy_confidence"] = 0.0
 
         pre_game_state["curriculum_stage"] = self.curriculum_stage
         pre_game_state["enemy_visible"] = pre_enemy_visible
@@ -842,6 +866,12 @@ class DoomEnv(gym.Env):
         enemy_visible = vision["enemy_visible"]
         enemy_centered = vision["enemy_centered"]
 
+        # Ignore noisy enemy vision before combat stages.
+        if self.curriculum_stage < 3:
+            enemy_visible = False
+            enemy_centered = False
+            vision["enemy_confidence"] = 0.0
+
         if enemy_visible:
             self.enemy_visible_steps += 1
 
@@ -866,6 +896,27 @@ class DoomEnv(gym.Env):
         game_state["distance_moved"] = distance_moved
         corner_trapped = self.detect_corner_trap(game_state)
         game_state["corner_trapped"] = corner_trapped
+
+        # -----------------------------------------------------
+        # Corridor milestone
+        # -----------------------------------------------------
+        # The first corridor is the first real danger checkpoint.
+        # Reaching it consistently means the movement/route policy is good enough
+        # to begin learning basic combat.
+        corridor_reached = self.detect_corridor_reached(game_state)
+        game_state["corridor_reached"] = corridor_reached
+
+        if corridor_reached and not self.corridor_reached_this_episode:
+            self.corridor_reached_this_episode = True
+            self.corridor_reach_count += 1
+
+            reward += 5.0
+            self.reward_manager.add("corridor_reached", 5.0)
+
+            print(
+                f"[milestone] corridor reached "
+                f"{self.corridor_reach_count}/{self.corridor_reach_target}"
+            )
 
         if self.corner_trap_steps >= 20:
             before = action
@@ -900,6 +951,9 @@ class DoomEnv(gym.Env):
         health = game_state.get("health", 100)
         health_delta = game_state.get("health_delta", 0)
 
+        if self.curriculum_stage >= 3 and health > 0:
+            self.combat_survival_steps += 1
+
         enemy_close = (
             enemy_visible
             and enemy_centered
@@ -926,6 +980,52 @@ class DoomEnv(gym.Env):
         game_state["left_wall_ratio"] = wall_info["left_ratio"]
         game_state["front_wall_ratio"] = wall_info["front_ratio"]
         game_state["right_wall_ratio"] = wall_info["right_ratio"]
+
+                # -----------------------------------------------------
+        # Goal steering
+        # -----------------------------------------------------
+        # This gives the agent a simple navigation bias:
+        # rotate toward the goal, then move forward.
+        # It does not run if walls are too close because wall escape
+        # should take priority in tight spaces.
+        before_goal = action
+        action = self.goal_assist_action(
+            action=action,
+            game_state=game_state,
+            wall_info=wall_info,
+            enemy_visible=enemy_visible,
+        )
+
+        if action != before_goal:
+            print(f"[override] goal_assist: {before_goal} -> {action}")
+
+        # Reward open-space movement and penalize wall-hugging.
+        # This is the part that teaches the agent not to use walls as rails.
+        wall_space_reward = self.wall_proximity_penalty(wall_info, action)
+        reward += wall_space_reward
+        if wall_space_reward < 0:
+            self.reward_manager.add("wall_hugging_penalty", wall_space_reward)
+        elif wall_space_reward > 0:
+            self.reward_manager.add("wall_avoidance_reward", wall_space_reward)
+
+        open_reward = self.open_space_reward(wall_info, distance_moved, action)
+        reward += open_reward
+        if open_reward > 0:
+            self.reward_manager.add("open_space_movement", open_reward)
+
+        enemy_confidence = vision.get("enemy_confidence", 0.0)
+        spacing_reward = self.enemy_spacing_reward(
+            enemy_visible=enemy_visible,
+            enemy_centered=enemy_centered,
+            enemy_confidence=enemy_confidence,
+            action=action,
+            health_delta=health_delta,
+        )
+        reward += spacing_reward
+        if spacing_reward < 0:
+            self.reward_manager.add("bad_enemy_spacing", spacing_reward)
+        elif spacing_reward > 0:
+            self.reward_manager.add("good_enemy_spacing", spacing_reward)
 
         checkpoint_reward = 0.0
         checkpoint_info = {
@@ -1262,36 +1362,27 @@ class DoomEnv(gym.Env):
                 reward += self.add_penalty("bad_melee_spacing", -0.2)
 
         if action == "use":
+            # Only count "use" as successful when the vision system sees a likely
+            # door/button in front of the agent. This prevents use-spam from being
+            # treated as door mastery.
+            door_visible = vision.get("door_visible", False)
+            door_centered = vision.get("door_centered", False)
+
             meaningful_use = (
-                self.curriculum_stage == 2
+                self.curriculum_stage in [2, 5, 6, 7]
+                and door_visible
+                and door_centered
                 and (
-                    distance_moved > 2.0
-                    or motion > 2.0
-                    or wall_contact
+                    self.stuck_counter >= 2
                     or self.wall_contact_steps >= 1
-                    or self.stuck_counter >= 3
-                )
-            ) or (
-                self.curriculum_stage >= 5
-                and (
-                    distance_moved > 2.0
-                    or motion > 2.0
-                    or wall_contact
-                    or self.wall_contact_steps >= 1
-                    or self.stuck_counter >= 3
+                    or distance_moved < 1.0
                 )
             )
 
             if meaningful_use:
                 self.door_interaction_count += 1
-
-                if self.curriculum_stage == 2:
-                    reward += 1.0
-                    self.reward_manager.add("stage2_use_practice", 1.0)
-
-                elif self.curriculum_stage >= 5:
-                    reward += 0.4
-                    self.reward_manager.add("door_use", 0.4)
+                reward += 1.0
+                self.reward_manager.add("meaningful_door_use", 1.0)
             else:
                 reward += self.add_penalty("use_spam_penalty", -1.0)
 
@@ -1382,11 +1473,20 @@ class DoomEnv(gym.Env):
 
         self.prev_enemy_visible = enemy_visible
 
+
         # -----------------------------------------------------
         # Termination
         # -----------------------------------------------------
 
         health = game_state.get("health", 100)
+
+        # Emergency combat override:
+        # Freedoom has enemies very early. If the agent is still in Stage 2 but
+        # taking damage, allow simple defensive shooting instead of dying helplessly.
+        if self.curriculum_stage == 2 and health_delta < 0 and ammo > 0:
+            if enemy_visible and enemy_centered:
+                reward += 0.5
+                self.reward_manager.add("emergency_enemy_defense", 0.5)
 
         death_like_screen = (
             health <= 0
@@ -1749,15 +1849,15 @@ class DoomEnv(gym.Env):
 
         elif self.curriculum_stage == 2:
             behavior_ready = (
-                self.door_interaction_count >= 2
-                and self.distance_traveled >= 150.0
+                self.corridor_reach_count >= self.corridor_reach_target
             )
 
             if should_log:
                 print(
-                    f"  [Stage 2] doors_and_use | "
-                    f"doors/use: {self.door_interaction_count}/2 | "
-                    f"distance: {self.distance_traveled:.1f}/150 | "
+                    f"  [Stage 2] reach_corridor | "
+                    f"corridor: {self.corridor_reach_count}/{self.corridor_reach_target} | "
+                    f"distance: {self.distance_traveled:.1f} | "
+                    f"doors/use: {self.door_interaction_count} | "
                     f"Reward: {avg_reward:.2f}/{threshold}"
                 )
 
@@ -1765,19 +1865,15 @@ class DoomEnv(gym.Env):
             behavior_ready = (
                 self.valid_shot_count >= 3
                 or self.enemy_kill_count >= 1
-                or (
-                    self.enemy_visible_steps >= 8
-                    and self.enemy_engagement_count >= 2
-                )
+                or self.combat_survival_steps >= 100
             )
 
             if should_log:
                 print(
-                    f"  [Stage 3] shoot_visible_enemies | "
-                    f"visible: {self.enemy_visible_steps}/8 | "
-                    f"shots/hits: {self.valid_shot_count}/3 | "
-                    f"engage: {self.enemy_engagement_count}/2 | "
+                    f"  [Stage 3] corridor_combat_survival | "
+                    f"valid_shots: {self.valid_shot_count}/3 | "
                     f"kills: {self.enemy_kill_count}/1 | "
+                    f"survival: {self.combat_survival_steps}/100 | "
                     f"Reward: {avg_reward:.2f}/{threshold}"
                 )
 
@@ -2140,6 +2236,8 @@ class DoomEnv(gym.Env):
 
         wall_info = self._wall_direction_info(frame)
 
+        # Wall assist should only choose safer actions.
+        # Reward/penalty math happens inside step(), where reward exists.
         front_wall = wall_info["front_wall"]
         left_ratio = wall_info["left_ratio"]
         right_ratio = wall_info["right_ratio"]
@@ -2275,6 +2373,222 @@ class DoomEnv(gym.Env):
             "front_wall": front_ratio > 0.42,
             "right_wall": right_ratio > 0.42,
         }
+    
+    def enemy_spacing_reward(self, enemy_visible, enemy_centered, enemy_confidence, action, health_delta):
+        """
+        Encourage keeping distance from close enemies.
+        High enemy_confidence usually means the enemy occupies a large part of the screen,
+        so it is probably close.
+        """
+        reward = 0.0
+
+        enemy_close = enemy_visible and enemy_confidence >= 120
+        enemy_very_close = enemy_visible and enemy_confidence >= 220
+
+        if not enemy_visible:
+            return 0.0
+
+        # Walking into a visible/centered enemy is dangerous.
+        if enemy_centered and action == "move_forward":
+            reward -= 0.75
+
+        # Very close enemies should trigger retreat or strafe.
+        if enemy_close and action in ["move_backward", "strafe_left", "strafe_right"]:
+            reward += 0.35
+
+        if enemy_very_close and action == "move_forward":
+            reward -= 1.25
+
+        # If taking damage, reward evasive movement.
+        if health_delta < 0 and action in ["move_backward", "strafe_left", "strafe_right"]:
+            reward += 0.75
+
+        # Standing close and using/shooting without repositioning can be risky.
+        if enemy_very_close and action == "use":
+            reward -= 0.50
+
+        return reward
+
+    def wall_proximity_penalty(self, wall_info, action):
+        """
+        Penalize hugging walls even if the agent is technically moving.
+        We want the agent to use open space, not scrape along walls.
+        """
+        penalty = 0.0
+
+        left = wall_info["left_ratio"]
+        front = wall_info["front_ratio"]
+        right = wall_info["right_ratio"]
+
+        side_wall = max(left, right)
+
+        # Strong side-wall hugging penalty.
+        if side_wall > 0.55:
+            penalty -= 0.20
+
+        if side_wall > 0.75:
+            penalty -= 0.45
+
+        # Front wall danger.
+        if front > 0.45 and action == "move_forward":
+            penalty -= 0.60
+
+        # Strafing into a wall is bad.
+        if left > 0.55 and action == "strafe_left":
+            penalty -= 0.50
+
+        if right > 0.55 and action == "strafe_right":
+            penalty -= 0.50
+
+        # Turning away from a wall is good.
+        if left > 0.55 and action == "turn_right":
+            penalty += 0.20
+
+        if right > 0.55 and action == "turn_left":
+            penalty += 0.20
+
+        return penalty
+
+    def open_space_reward(self, wall_info, distance_moved, action):
+        """
+        Reward movement through open space instead of scraping along walls.
+
+        The agent should learn that distance only counts as useful movement
+        when there is enough open space around it.
+        """
+        left = wall_info["left_ratio"]
+        front = wall_info["front_ratio"]
+        right = wall_info["right_ratio"]
+        side_wall = max(left, right)
+
+        if distance_moved > 3.0 and front < 0.25 and side_wall < 0.35:
+            if action in ["move_forward", "strafe_left", "strafe_right"]:
+                return 0.20
+
+        return 0.0
+    
+    def _angle_to_goal(self, game_state):
+        """
+        Calculate the angle from the player's current position to the current goal.
+
+        This uses the shared-memory x/y position and the observer's goal position.
+        It returns None if we do not have enough information.
+        """
+        x = game_state.get("x")
+        y = game_state.get("y")
+        angle = game_state.get("angle")
+
+        goal = self.observer.get_goal_position()
+
+        if x is None or y is None or angle is None or goal is None:
+            return None
+
+        goal_x, goal_y = goal
+
+        dx = goal_x - x
+        dy = goal_y - y
+
+        # Angle from player to goal in degrees.
+        target_angle = np.degrees(np.arctan2(dy, dx))
+
+        # Normalize both angles to 0-360.
+        current_angle = float(angle) % 360.0
+        target_angle = float(target_angle) % 360.0
+
+        # Shortest signed angular difference: -180 to +180.
+        diff = (target_angle - current_angle + 180.0) % 360.0 - 180.0
+
+        return diff
+
+    def goal_assist_action(self, action, game_state, wall_info=None, enemy_visible=False):
+        """
+        Navigation helper.
+
+        If the agent is wandering, this nudges it toward the current goal:
+        - large angle error -> rotate toward goal
+        - small angle error -> move forward
+        - nearby wall -> let wall logic handle it instead
+
+        This keeps the agent from drifting aimlessly around the map.
+        """
+
+        # Do not goal-steer while the agent is trapped.
+        # Corner/wall escape must win, or goal assist will keep rotating the agent
+        # back into the same corner.
+        if self.corner_trap_steps >= 12 or self.wall_escape_mode or self.stuck_counter >= 8:
+            return action
+        
+        if enemy_visible and self.curriculum_stage >= 3:
+            return action
+
+        # Goal steering is useful from Stage 2 onward.
+        # Stage 1 should still focus mostly on raw movement/escape.
+        if self.curriculum_stage < 2:
+            return action
+
+        if wall_info is not None:
+            front_wall = wall_info.get("front_wall", False)
+            front_ratio = wall_info.get("front_ratio", 0.0)
+            side_wall = max(
+                wall_info.get("left_ratio", 0.0),
+                wall_info.get("right_ratio", 0.0),
+            )
+
+            # If we are too close to walls, do not force goal movement.
+            # Wall escape should take priority.
+            if front_wall or front_ratio > 0.45 or side_wall > 0.70:
+                return action
+
+        angle_error = self._angle_to_goal(game_state)
+
+        if angle_error is None:
+            return action
+
+        # Do not let goal assist hijack every frame.
+        if self._step_count % 3 != 0:
+            return action
+
+        # If we have been rotating too long, force forward movement briefly.
+        if self.goal_turn_steps >= self.max_goal_turn_steps:
+            self.goal_turn_steps = 0
+            return "move_forward"
+
+        # If facing far away from the goal, rotate first.
+        if angle_error < -25.0:
+            self.goal_turn_steps += 1
+            return "turn_left"
+
+        if angle_error > 25.0:
+            self.goal_turn_steps += 1
+            return "turn_right"
+
+        # If roughly facing the goal, move forward and reset turn counter.
+        if abs(angle_error) <= 25.0:
+            self.goal_turn_steps = 0
+            return "move_forward"
+
+        return action
+    
+    def detect_corridor_reached(self, game_state):
+        """
+        Detect whether the agent reached the early dangerous corridor/elevator area.
+
+        These coordinates are based on the logs you showed. The agent repeatedly
+        reaches around x=800-950 and y=450-600 before enemy damage becomes serious.
+
+        You can tune these numbers later after collecting more coordinates.
+        """
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        if x is None or y is None:
+            return False
+
+        return (
+            750.0 <= float(x) <= 980.0
+            and 420.0 <= float(y) <= 650.0
+        )
+
 
     def sanitize_action(self, action, game_state, enemy_visible):
         config = self.get_stage_config()
@@ -2350,6 +2664,9 @@ class DoomEnv(gym.Env):
         self.wall_contact_steps = 0
         self.last_wall_escape_step = -100
         self.route_progress_level = 0
+        self.corner_trap_position = None
+        self.corner_trap_steps = 0
+        self.last_corner_escape_step = -100
 
         self.consecutive_melee_steps = 0
         self.last_melee_step = -100
