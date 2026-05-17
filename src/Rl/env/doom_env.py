@@ -42,6 +42,7 @@ from curriculum.curriculum_manager import CurriculumManager
 from observation.frame_processor import FrameProcessor
 from navigation.checkpoint_tracker import CheckpointTracker
 from navigation.level_guides import get_level_guide
+from vision.scene_predictor import ScenePredictor
 
 try:
     from observation.vision_detector import VisionDetector
@@ -99,6 +100,9 @@ class DoomEnv(gym.Env):
         self.last_corner_escape_step = -100
         self.goal_turn_steps = 0
         self.max_goal_turn_steps = 6
+        self.scene_predictor = None
+        self.use_scene_classifier = True
+        self.secret_use_locations = set()
 
         if VisionDetector is not None:
             self.vision_detector = VisionDetector(frame_processor=self.frame_processor)
@@ -122,7 +126,7 @@ class DoomEnv(gym.Env):
         # the first dangerous corridor/elevator area.
         self.corridor_reach_count = 0
         self.corridor_reached_this_episode = False
-        self.corridor_reach_target = 20
+        self.corridor_reach_target = 3
 
         # -----------------------------------------------------
         # Penalty tuning
@@ -141,7 +145,7 @@ class DoomEnv(gym.Env):
         self.smart_clipper = SmartClipGenerator()
 
         # Turn off while debugging movement. Turn on later for dataset collection.
-        self.collect_vision_frames = True
+        self.collect_vision_frames = False
         self.vision_frame_interval = 1
         self.vision_frame_count = 0
         self.vision_dataset_dir = os.path.join(
@@ -285,6 +289,13 @@ class DoomEnv(gym.Env):
         self._use_preference = False
         self._load_preference_model()
 
+        if self.use_scene_classifier:
+            try:
+                self.scene_predictor = ScenePredictor()
+            except Exception as e:
+                print(f"[vision] Could not load scene classifier: {e}")
+                self.scene_predictor = None
+
     # ---------------------------------------------------------
     # Setup helpers
     # ---------------------------------------------------------
@@ -341,8 +352,8 @@ class DoomEnv(gym.Env):
                 "allow_melee": False,
                 "require_enemy_visible_to_shoot": True,
                 "track_enemy": True,
-                "dodge_enemies": False,
-                "allow_use": False,
+                "dodge_enemies": True,
+                "allow_use": True,
             },
             4: {
                 "name": "combat_movement",
@@ -423,6 +434,7 @@ class DoomEnv(gym.Env):
                 "turn_right",
                 "strafe_left",
                 "strafe_right",
+                "use",
                 "shoot",
                 "swap_weapon",
             ]
@@ -436,6 +448,7 @@ class DoomEnv(gym.Env):
                 "strafe_left",
                 "strafe_right",
                 "shoot",
+                "use",
                 "melee_attack",
                 "swap_weapon",
             ]
@@ -530,6 +543,10 @@ class DoomEnv(gym.Env):
         self.checkpoint_tracker.reset()
         self.corridor_reached_this_episode = False
 
+        # Do not clear self.secret_use_locations every episode.
+        # This memory should persist across episodes.
+        pass
+
         if hasattr(self.observer, "reset_tracking"):
             self.observer.reset_tracking()
 
@@ -609,8 +626,49 @@ class DoomEnv(gym.Env):
         pre_game_state = self.observer.get_game_state()
         pre_vision = self.detect_vision(pre_frame)
 
+        # -----------------------------------------------------
+        # Pre-action learned scene prediction
+        # -----------------------------------------------------
+        # This must happen BEFORE perform_action().
+        # Any action override after perform_action() only changes the log,
+        # not the keypress sent to Doom.
+        pre_scene_label = "unclear"
+        pre_scene_confidence = 0.0
+        pre_scene_probs = {}
+
+        if self.scene_predictor is not None:
+            pre_scene_result = self.scene_predictor.predict(pre_frame)
+            pre_scene_label = pre_scene_result["label"]
+            pre_scene_confidence = pre_scene_result["confidence"]
+            pre_scene_probs = pre_scene_result["probs"]
+
+            if self._step_count % 25 == 0:
+                print(
+                    f"[vision_model] label={pre_scene_label} "
+                    f"conf={pre_scene_confidence:.2f}"
+                )
+
         pre_enemy_visible = pre_vision["enemy_visible"]
         pre_enemy_centered = pre_vision["enemy_centered"]
+
+        # In Stage 3+, the learned classifier is the authority for enemy
+        # existence. The older color detector is only used for left/right/center
+        # aiming hints after the classifier confirms an enemy.
+        if self.curriculum_stage >= 3 and self.scene_predictor is not None:
+            classifier_enemy = (
+                pre_scene_label == "enemy"
+                and pre_scene_confidence >= 0.75
+            )
+
+            if classifier_enemy:
+                pre_enemy_visible = True
+                pre_enemy_centered = pre_vision["enemy_centered"]
+            else:
+                pre_enemy_visible = False
+                pre_enemy_centered = False
+                pre_vision["enemy_left"] = False
+                pre_vision["enemy_right"] = False
+                pre_vision["enemy_confidence"] = 0.0
 
         # Stages 0-2 are navigation-only stages.
         # The current color-based enemy detector can be noisy, so we ignore enemy
@@ -636,6 +694,9 @@ class DoomEnv(gym.Env):
         pre_game_state["stuck_counter"] = self.stuck_counter
         pre_game_state["distance_traveled"] = self.distance_traveled
         pre_game_state["wall_contact_steps"] = self.wall_contact_steps
+        pre_game_state["scene_label"] = pre_scene_label
+        pre_game_state["scene_confidence"] = pre_scene_confidence
+        pre_game_state["scene_probs"] = pre_scene_probs
         pre_game_state["action"] = action
 
         # -----------------------------------------------------
@@ -776,6 +837,112 @@ class DoomEnv(gym.Env):
             if action != before:
                 print(f"[override] door: {before} -> {action}")
 
+
+        # -----------------------------------------------------
+        # Pre-action learned-vision safety and combat
+        # -----------------------------------------------------
+        # These happen BEFORE perform_action(), so they affect the real keypress.
+
+        pre_wall_info = self._wall_direction_info(pre_frame)
+
+        before_goal = action
+        action = self.goal_assist_action(
+            action=action,
+            game_state=pre_game_state,
+            wall_info=pre_wall_info,
+            enemy_visible=pre_enemy_visible,
+        )
+        if action != before_goal:
+            print(f"[override] goal_assist: {before_goal} -> {action}")
+
+        if (
+            pre_scene_label in ["front_wall", "obstacle"]
+            and pre_scene_confidence >= 0.60
+            and action == "move_forward"
+        ):
+            before = action
+
+            if pre_scene_label == "obstacle":
+                # Low walls / half walls often require sidestepping,
+                # not just backing up forever.
+                if self._step_count % 4 in [0, 1]:
+                    action = "move_backward"
+                elif self._step_count % 4 == 2:
+                    action = "strafe_left"
+                else:
+                    action = "strafe_right"
+            else:
+                action = "move_backward"
+
+            print(
+                f"[override] vision_blocker: {before} -> {action} "
+                f"label={pre_scene_label} conf={pre_scene_confidence:.2f}"
+            )
+
+        # Corner/stuck escape beats combat. Do not shoot while trapped.
+        if self.corner_trap_steps >= 20:
+            before = action
+            cycle = self.corner_trap_steps % 12
+
+            if cycle in [0, 1, 2]:
+                action = "move_backward"
+            elif cycle in [3, 4, 5]:
+                action = "turn_right"
+            elif cycle in [6, 7]:
+                action = "strafe_right"
+            elif cycle in [8, 9]:
+                action = "turn_left"
+            else:
+                action = "move_forward"
+
+            print(
+                f"[override] corner_escape: {before} -> {action} "
+                f"corner_steps={self.corner_trap_steps}"
+            )
+        else:
+            before_vision_combat = action
+            action = self.vision_combat_action(
+                action=action,
+                scene_label=pre_scene_label,
+                scene_confidence=pre_scene_confidence,
+                health=pre_game_state.get("health", 100),
+                ammo=pre_game_state.get("ammo", 0),
+            )
+
+            if action != before_vision_combat:
+                print(
+                    f"[override] vision_combat: "
+                    f"{before_vision_combat} -> {action} "
+                    f"label={pre_scene_label} conf={pre_scene_confidence:.2f}"
+                )
+
+        # -----------------------------------------------------
+        # Pre-action wall bubble safety
+        # -----------------------------------------------------
+        # This runs BEFORE perform_action(), so it affects the real keypress.
+        #
+        # The post-action wall bubble is still useful for rewards/debugging,
+        # but action overrides must happen before Doom receives input.
+        pre_wall_bubble = self.wall_bubble_state(
+            wall_info=pre_wall_info,
+            distance_moved=None,
+            motion=None,
+            action=action,
+        )
+
+        before_wall_bubble = action
+        action = self.wall_bubble_action(action, pre_wall_bubble)
+
+        if action != before_wall_bubble:
+            print(
+                f"[override] pre_wall_bubble: {before_wall_bubble} -> {action} "
+                f"level={pre_wall_bubble['level']} "
+                f"dir={pre_wall_bubble['direction']} "
+                f"L={pre_wall_bubble['left']:.2f} "
+                f"F={pre_wall_bubble['front']:.2f} "
+                f"R={pre_wall_bubble['right']:.2f}"
+            )
+
         # Track melee streak after final helper choice.
         if action == "melee_attack":
             self.consecutive_melee_steps += 1
@@ -833,7 +1000,12 @@ class DoomEnv(gym.Env):
             print(f"[override] final_sanitize: {final_before} -> {action}")
 
         if action not in self.get_allowed_actions():
-            fixed_action = "move_forward"
+            # Safer fallback than always moving forward.
+            if pre_wall_info.get("front_wall", False) or pre_wall_info.get("front_ratio", 0.0) > 0.45:
+                fixed_action = "move_backward"
+            else:
+                fixed_action = "move_forward"
+
             print(
                 f"[override] final_safety: {action} -> {fixed_action} "
                 f"because stage={self.curriculum_stage} allowed={self.get_allowed_actions()}"
@@ -896,6 +1068,19 @@ class DoomEnv(gym.Env):
         game_state["distance_moved"] = distance_moved
         corner_trapped = self.detect_corner_trap(game_state)
         game_state["corner_trapped"] = corner_trapped
+
+        # -----------------------------------------------------
+        # Post-action scene state
+        # -----------------------------------------------------
+        # Use the pre-action prediction for reward/state consistency.
+        # Do not modify action here; Doom already received the keypress.
+        scene_label = pre_scene_label
+        scene_confidence = pre_scene_confidence
+        scene_probs = pre_scene_probs
+
+        game_state["scene_label"] = scene_label
+        game_state["scene_confidence"] = scene_confidence
+        game_state["scene_probs"] = scene_probs
 
         # -----------------------------------------------------
         # Corridor milestone
@@ -980,25 +1165,6 @@ class DoomEnv(gym.Env):
         game_state["left_wall_ratio"] = wall_info["left_ratio"]
         game_state["front_wall_ratio"] = wall_info["front_ratio"]
         game_state["right_wall_ratio"] = wall_info["right_ratio"]
-
-                # -----------------------------------------------------
-        # Goal steering
-        # -----------------------------------------------------
-        # This gives the agent a simple navigation bias:
-        # rotate toward the goal, then move forward.
-        # It does not run if walls are too close because wall escape
-        # should take priority in tight spaces.
-        before_goal = action
-        action = self.goal_assist_action(
-            action=action,
-            game_state=game_state,
-            wall_info=wall_info,
-            enemy_visible=enemy_visible,
-        )
-
-        if action != before_goal:
-            print(f"[override] goal_assist: {before_goal} -> {action}")
-
         # Reward open-space movement and penalize wall-hugging.
         # This is the part that teaches the agent not to use walls as rails.
         wall_space_reward = self.wall_proximity_penalty(wall_info, action)
@@ -1057,6 +1223,55 @@ class DoomEnv(gym.Env):
         game_state["should_retreat"] = should_retreat
         game_state["should_escape_wall"] = should_escape_wall
 
+        wall_info = self._wall_direction_info(raw_frame)
+
+        game_state["left_wall_ratio"] = wall_info["left_ratio"]
+        game_state["front_wall_ratio"] = wall_info["front_ratio"]
+        game_state["right_wall_ratio"] = wall_info["right_ratio"]
+
+        # -----------------------------------------------------
+        # Wall proximity bubble
+        # -----------------------------------------------------
+        # This gives the agent a simple safety field:
+        # green = safe, orange = too close, red = bumping/trapped.
+        wall_bubble = self.wall_bubble_state(
+            wall_info=wall_info,
+            distance_moved=distance_moved,
+            motion=motion,
+            action=action,
+        )
+
+        game_state["wall_bubble_level"] = wall_bubble["level"]
+        game_state["wall_bubble_direction"] = wall_bubble["direction"]
+
+        before_bubble = action
+        action = self.wall_bubble_action(action, wall_bubble)
+
+        if action != before_bubble:
+            print(
+                f"[override] wall_bubble: {before_bubble} -> {action} "
+                f"level={wall_bubble['level']} dir={wall_bubble['direction']} "
+                f"L={wall_bubble['left']:.2f} F={wall_bubble['front']:.2f} R={wall_bubble['right']:.2f}"
+            )
+
+        if wall_bubble["level"] == "red":
+            reward += self.add_penalty("red_wall_bubble", -1.5)
+
+        elif wall_bubble["level"] == "orange":
+            reward += self.add_penalty("orange_wall_bubble", -0.4)
+
+        elif wall_bubble["level"] == "green":
+            if distance_moved > 2.0 and action in ["move_forward", "strafe_left", "strafe_right"]:
+                reward += 0.15
+                self.reward_manager.add("green_space_movement", 0.15)
+
+        if scene_label == "obstacle" and scene_confidence >= 0.60:
+            if action == "move_forward":
+                reward += self.add_penalty("push_into_obstacle", -1.5)
+
+        elif action in ["move_backward", "strafe_left", "strafe_right", "turn_left", "turn_right"]:
+            reward += 0.35
+            self.reward_manager.add("avoid_obstacle", 0.35)
         # -----------------------------------------------------
         # Tactical behavior rewards
         # -----------------------------------------------------
@@ -1092,8 +1307,8 @@ class DoomEnv(gym.Env):
             self.reward_manager.add("escape_right_wall", 0.25)
 
         if enemy_visible and action == "shoot" and ammo > 0:
-            reward += 0.75
-            self.reward_manager.add("shoot_enemy_on_sight", 0.75)
+            reward += 0.25
+            self.reward_manager.add("shoot_enemy_on_sight", 0.25)
 
         if enemy_visible and health_delta < 0 and action in ["strafe_left", "strafe_right"]:
             reward += 0.8
@@ -1136,6 +1351,12 @@ class DoomEnv(gym.Env):
 
             if self.distance_traveled < 25.0 and self._step_count > 100:
                 reward += self.add_penalty("no_route_progress", -1.5)
+
+        if self.corner_trap_steps >= 60:
+            reward -= 5.0
+            terminated = True
+            info["corner_trap_reset"] = True
+            print("[reset] corner trap timeout")
 
         # -----------------------------------------------------
         # Debug prints
@@ -1265,6 +1486,7 @@ class DoomEnv(gym.Env):
                 "strafe_left",
                 "strafe_right",
                 "shoot",
+                "use",
                 "swap_weapon",
             ]
 
@@ -1294,11 +1516,12 @@ class DoomEnv(gym.Env):
                 reward += 1.00
                 self.track_enemy_count += 1
 
-            if action == "shoot" and enemy_visible:
-                reward += 1.00
+            if action == "shoot" and enemy_visible and ammo > 0:
+                # Smaller reward to avoid ammo-spam learning.
+                reward += 0.30
 
                 if enemy_centered:
-                    reward += 2.00
+                    reward += 0.50
                     self.enemy_engagement_count += 1
                     self.valid_shot_count += 1
 
@@ -1362,20 +1585,40 @@ class DoomEnv(gym.Env):
                 reward += self.add_penalty("bad_melee_spacing", -0.2)
 
         if action == "use":
-            # Only count "use" as successful when the vision system sees a likely
-            # door/button in front of the agent. This prevents use-spam from being
-            # treated as door mastery.
+            # -------------------------------------------------
+            # Door / button / secret use logic
+            # -------------------------------------------------
+            # IMPORTANT:
+            # meaningful_use must be calculated BEFORE we check it.
+            #
+            # This fixes:
+            # UnboundLocalError: cannot access local variable
+            # 'meaningful_use' where it is not associated with a value.
+            #
+            # The agent only gets credit for pressing use when:
+            #   - use is allowed in the current stage
+            #   - a door/button is likely visible and centered
+            #   - the agent is close enough / slowed enough for use to matter
             door_visible = vision.get("door_visible", False)
             door_centered = vision.get("door_centered", False)
 
+            # The learned scene classifier can also help identify doors/buttons.
+            if scene_label == "door_or_button" and scene_confidence >= 0.45:
+                door_visible = True
+
+                # If the classifier sees a door/button, treat it as centered enough
+                # for now. Later you can improve this with object localization.
+                door_centered = True
+
             meaningful_use = (
-                self.curriculum_stage in [2, 5, 6, 7]
+                self.curriculum_stage in [2, 3, 5, 6, 7]
                 and door_visible
                 and door_centered
                 and (
                     self.stuck_counter >= 2
                     or self.wall_contact_steps >= 1
-                    or distance_moved < 1.0
+                    or distance_moved < 2.0
+                    or scene_label == "door_or_button"
                 )
             )
 
@@ -1383,8 +1626,27 @@ class DoomEnv(gym.Env):
                 self.door_interaction_count += 1
                 reward += 1.0
                 self.reward_manager.add("meaningful_door_use", 1.0)
+
+                x = game_state.get("x")
+                y = game_state.get("y")
+
+                if x is not None and y is not None:
+                    use_tile = (int(float(x) // 64), int(float(y) // 64))
+
+                    # Remember useful use locations across episodes.
+                    # This helps with secret doors/buttons because the agent
+                    # can discover that use worked at this approximate tile.
+                    if use_tile not in self.secret_use_locations:
+                        self.secret_use_locations.add(use_tile)
+
+                        reward += 3.0
+                        self.reward_manager.add("new_use_location_discovered", 3.0)
+
+                        print(f"[memory] useful use location discovered: {use_tile}")
+
             else:
                 reward += self.add_penalty("use_spam_penalty", -1.0)
+
 
         if action == "swap_weapon":
             self.swap_weapon_count += 1
@@ -1862,10 +2124,16 @@ class DoomEnv(gym.Env):
                 )
 
         elif self.curriculum_stage == 3:
+            # Do not advance just because the agent spammed shots.
+            # Require either an actual kill, or survival with limited,
+            # controlled shooting and some ammo remaining.
             behavior_ready = (
-                self.valid_shot_count >= 3
-                or self.enemy_kill_count >= 1
-                or self.combat_survival_steps >= 100
+                self.enemy_kill_count >= 1
+                or (
+                    self.combat_survival_steps >= 250
+                    and self.valid_shot_count >= 5
+                    and self.valid_shot_count <= 80
+                )
             )
 
             if should_log:
@@ -2011,7 +2279,20 @@ class DoomEnv(gym.Env):
 
         return round(aim_error, 1)
 
+
     def aim_assist_action(self, action, frame, enemy_visible, enemy_centered, ammo):
+        """
+        Aim helper only.
+
+        This function is intentionally NOT allowed to choose shoot anymore.
+        The old version returned shoot from too many branches, which caused:
+        - random shooting
+        - ammo drain
+        - valid_shot_count going up without kills
+        - shoot/melee/move_forward override loops
+
+        Shooting is handled only by vision_combat_action().
+        """
         if self.curriculum_stage < 3:
             return action
 
@@ -2022,33 +2303,20 @@ class DoomEnv(gym.Env):
         if not enemy_visible:
             return action
 
+        ammo = int(ammo or 0)
+
+        # No ammo means do not aim-shoot. Back up / strafe instead.
+        if ammo <= 0:
+            if self._step_count % 2 == 0:
+                return "move_backward"
+            return "strafe_right"
+
         aim_error, confidence = self._enemy_horizontal_error(frame)
 
+        # If the old color detector is weak/noisy, do not shoot.
+        # The learned scene classifier decides enemy existence.
         if confidence < 12:
-            if ammo > 0:
-                self.last_aim_assist_step = self._step_count
-                return "shoot"
-            return action
-
-        target_sig = self._target_signature(frame)
-
-        if target_sig is not None and target_sig == self.last_target_signature:
-            if action == "shoot" or enemy_centered or abs(aim_error) < 0.18:
-                self.same_target_shot_count += 1
-        else:
-            self.same_target_shot_count = 0
-            self.last_target_signature = target_sig
-
-        if self.same_target_shot_count >= 6:
-            self.dead_target_ignore_steps = 15
-            self.same_target_shot_count = 0
-            return "move_forward"
-
-        if enemy_centered or abs(aim_error) < 0.18:
-            self.last_aim_assist_step = self._step_count
-            if ammo > 0:
-                return "shoot"
-            return "melee_attack"
+            return "move_backward"
 
         if aim_error < -0.18:
             self.last_aim_assist_step = self._step_count
@@ -2058,10 +2326,7 @@ class DoomEnv(gym.Env):
             self.last_aim_assist_step = self._step_count
             return "turn_right"
 
-        if ammo > 0:
-            self.last_aim_assist_step = self._step_count
-            return "shoot"
-
+        # Already roughly aimed; leave shoot decision to vision_combat_action().
         return action
 
     def exploration_assist_action(self, action, enemy_visible, distance_moved=None, motion=None):
@@ -2374,6 +2639,109 @@ class DoomEnv(gym.Env):
             "right_wall": right_ratio > 0.42,
         }
     
+    def wall_bubble_state(self, wall_info, distance_moved=None, motion=None, action=None):
+        """
+        Convert wall ratios into a green/orange/red proximity bubble.
+
+        Important:
+        - Pre-action calls do not know distance_moved or motion yet.
+        - So pre-action bubble must NOT treat distance_moved=0 as bumping.
+        - Bumping should only be detected after the action has actually happened.
+        """
+        left = float(wall_info.get("left_ratio", 0.0))
+        front = float(wall_info.get("front_ratio", 0.0))
+        right = float(wall_info.get("right_ratio", 0.0))
+
+        side = max(left, right)
+
+        # Only detect bumping when we have real post-action movement data.
+        has_motion_data = distance_moved is not None and motion is not None
+
+        bumping_forward = (
+            has_motion_data
+            and action == "move_forward"
+            and distance_moved <= 0.5
+            and motion < 1.5
+        )
+
+        # Red should mean serious danger, not normal side wall proximity.
+        front_blocked = front >= 0.65
+        side_cramped = side >= 0.85
+
+        if front_blocked or bumping_forward:
+            level = "red"
+        elif side_cramped or front >= 0.45 or side >= 0.60:
+            level = "orange"
+        else:
+            level = "green"
+
+        if front >= max(left, right):
+            direction = "front"
+        elif left > right:
+            direction = "left"
+        else:
+            direction = "right"
+
+        return {
+            "level": level,
+            "direction": direction,
+            "left": left,
+            "front": front,
+            "right": right,
+            "side": side,
+            "front_blocked": front_blocked,
+            "side_cramped": side_cramped,
+            "bumping_forward": bumping_forward,
+        }
+    
+    def wall_bubble_action(self, action, bubble):
+        """
+        Safer wall-bubble correction.
+
+        Orange does not mean panic. It only nudges the agent away.
+        Red means blocked/bumping and should force a stronger escape.
+        """
+        level = bubble["level"]
+        direction = bubble["direction"]
+
+        if level == "green":
+            return action
+
+        # Red = blocked or actually bumping.
+        if level == "red":
+            if direction == "front":
+                if action == "move_forward":
+                    return "move_backward"
+
+                # Rotate away after backing up.
+                if bubble["left"] > bubble["right"]:
+                    return "turn_right"
+                return "turn_left"
+
+            if direction == "left":
+                if action in ["move_forward", "strafe_left"]:
+                    return "strafe_right"
+                return "turn_right"
+
+            if direction == "right":
+                if action in ["move_forward", "strafe_right"]:
+                    return "strafe_left"
+                return "turn_left"
+
+        # Orange = close to wall, but not necessarily stuck.
+        # Do not override turning/use/shoot unless it is clearly bad.
+        if level == "orange":
+            if direction == "front" and action == "move_forward":
+                return "move_backward"
+
+            if direction == "left" and action == "strafe_left":
+                return "strafe_right"
+
+            if direction == "right" and action == "strafe_right":
+                return "strafe_left"
+
+        return action
+    
     def enemy_spacing_reward(self, enemy_visible, enemy_centered, enemy_confidence, action, health_delta):
         """
         Encourage keeping distance from close enemies.
@@ -2512,6 +2880,17 @@ class DoomEnv(gym.Env):
         This keeps the agent from drifting aimlessly around the map.
         """
 
+        # Wall, obstacle, and stuck escape must beat goal steering.
+        if self.stuck_counter >= 3 or self.wall_contact_steps >= 1 or self.corner_trap_steps >= 10:
+            return action
+
+        if game_state.get("scene_label") in ["front_wall", "obstacle"]:
+            if game_state.get("scene_confidence", 0.0) >= 0.50:
+                return action
+
+        if self.corner_trap_steps >= 10 or self.stuck_counter >= 5:
+            return action
+
         # Do not goal-steer while the agent is trapped.
         # Corner/wall escape must win, or goal assist will keep rotating the agent
         # back into the same corner.
@@ -2588,12 +2967,76 @@ class DoomEnv(gym.Env):
             750.0 <= float(x) <= 980.0
             and 420.0 <= float(y) <= 650.0
         )
+    
+
+    def vision_combat_action(self, action, scene_label, scene_confidence, health, ammo):
+        """
+        The ONLY helper that may turn an action into shoot.
+
+        Rules:
+        - Never shoot before Stage 3.
+        - Never shoot with no ammo.
+        - Never shoot while stuck/corner trapped.
+        - Only shoot when the learned scene classifier is confident.
+        - Fire short bursts, then move to keep distance.
+        """
+        if self.curriculum_stage < 3:
+            return action
+
+        # Corner/stuck escape beats combat.
+        if self.corner_trap_steps >= 15 or self.stuck_counter >= 5:
+            return action
+
+        enemy_seen = (
+            scene_label == "enemy"
+            and scene_confidence >= 0.80
+        )
+
+        if not enemy_seen:
+            return action
+
+        ammo = int(ammo or 0)
+        health = int(health or 0)
+
+        # Never choose shoot with no ammo.
+        if ammo <= 0:
+            if health <= 50:
+                return "move_backward"
+            return "strafe_right"
+
+        # Low health means survival first.
+        if health <= 40:
+            if self._step_count % 3 == 0:
+                return "move_backward"
+            return "strafe_right"
+
+        # Controlled burst pattern:
+        # 2 shoot steps, then movement/spacing.
+        cycle = self._step_count % 8
+
+        if cycle in [0, 1]:
+            return "shoot"
+
+        if cycle in [2, 3]:
+            return "strafe_left"
+
+        if cycle in [4, 5]:
+            return "move_backward"
+
+        return action
 
 
     def sanitize_action(self, action, game_state, enemy_visible):
+        """
+        Final action gate for the current curriculum stage.
+
+        This blocks illegal/impossible actions, but it does NOT create new
+        combat behavior. In particular, it must not convert swap_weapon or
+        no-ammo cases back into shoot.
+        """
         config = self.get_stage_config()
 
-        ammo = game_state.get("ammo", 0)
+        ammo = int(game_state.get("ammo", 0) or 0)
         current_weapon = str(game_state.get("weapon", "")).lower()
 
         is_melee_weapon = (
@@ -2606,33 +3049,36 @@ class DoomEnv(gym.Env):
         if action == "use" and not config.get("allow_use", False):
             return "move_forward"
 
-        if action == "shoot" and not config.get("allow_shoot", False):
-            return "move_forward"
-
-        if action == "melee_attack" and not config.get("allow_melee", False):
-            return "move_forward"
-
-        if (
-            action == "shoot"
-            and config.get("require_enemy_visible_to_shoot", False)
-            and not enemy_visible
-        ):
-            return "move_forward"
-
-        if action == "shoot" and ammo <= 0:
-            if is_melee_weapon and enemy_visible:
-                return "melee_attack"
-            return "swap_weapon"
-
-        if action == "swap_weapon":
-            if ammo > 5 and not enemy_visible:
+        if action == "shoot":
+            if not config.get("allow_shoot", False):
                 return "move_forward"
 
-            if ammo > 5 and enemy_visible:
-                return "shoot"
+            # No ammo means no shoot. Do not convert back into shoot later.
+            if ammo <= 0:
+                if is_melee_weapon and enemy_visible and config.get("allow_melee", False):
+                    return "melee_attack"
+                return "move_backward"
 
-        if action == "melee_attack" and not enemy_visible:
-            return "move_forward"
+            if config.get("require_enemy_visible_to_shoot", False) and not enemy_visible:
+                return "move_forward"
+
+            return action
+
+        if action == "melee_attack":
+            if not config.get("allow_melee", False):
+                return "move_forward"
+
+            if not enemy_visible:
+                return "move_forward"
+
+            return action
+
+        if action == "swap_weapon":
+            # Swap is allowed, but not repeatedly.
+            # Never turn swap_weapon into shoot here.
+            if self.consecutive_swap_steps >= 2:
+                return "move_backward" if enemy_visible else "move_forward"
+            return action
 
         return action
 
