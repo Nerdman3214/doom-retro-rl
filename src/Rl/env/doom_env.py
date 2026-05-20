@@ -58,7 +58,7 @@ except ImportError:
 
 
 DOOM_BINARY = "/home/steven/Downloads/doomretro-master/build/doomretro"
-DOOM_IWAD = "/usr/share/games/doom/freedoom1.wad"
+DOOM_IWAD = "/usr/share/games/doom/freedoom2.wad"
 
 
 class DoomEnv(gym.Env):
