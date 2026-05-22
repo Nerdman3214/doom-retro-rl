@@ -43,6 +43,8 @@ from observation.frame_processor import FrameProcessor
 from navigation.checkpoint_tracker import CheckpointTracker
 from navigation.level_guides import get_level_guide
 from vision.scene_predictor import ScenePredictor
+from sensory.sensory_model import SensoryModel
+from director.route_director import RouteDirector
 
 try:
     from observation.vision_detector import VisionDetector
@@ -58,7 +60,7 @@ except ImportError:
 
 
 DOOM_BINARY = "/home/steven/Downloads/doomretro-master/build/doomretro"
-DOOM_IWAD = "/usr/share/games/doom/freedoom2.wad"
+DOOM_IWAD = "/usr/share/games/doom/freedoom1.wad"
 
 
 class DoomEnv(gym.Env):
@@ -103,6 +105,23 @@ class DoomEnv(gym.Env):
         self.scene_predictor = None
         self.use_scene_classifier = True
         self.secret_use_locations = set()
+        self.sensory_model = SensoryModel()
+        self.route_director = RouteDirector()
+
+        # -----------------------------------------------------
+        # Sensory memory
+        # -----------------------------------------------------
+        # The scene classifier only sees one frame. These fields let the
+        # environment remember whether the agent is repeatedly returning to
+        # the same coordinate area, especially near the Freedoom spawn-room
+        # boundary. This prevents fake "open_path" predictions from causing
+        # endless forward movement into corners/walls.
+        self.recent_position_tiles = []
+        self.repeated_position_steps = 0
+        self.last_sensory_scene_label = "unclear"
+        self.last_sensory_scene_confidence = 0.0
+        self.scene_predictor = None
+        self.use_scene_classifier = True
 
         if VisionDetector is not None:
             self.vision_detector = VisionDetector(frame_processor=self.frame_processor)
@@ -487,6 +506,15 @@ class DoomEnv(gym.Env):
         self.last_wall_escape_step = -100
         self.route_progress_level = 0
         self.goal_turn_steps = 0
+        self.recent_position_tiles = []
+        self.repeated_position_steps = 0
+        self.last_sensory_scene_label = "unclear"
+        self.last_sensory_scene_confidence = 0.0
+        self.secret_area_reached_this_episode = False
+        self.last_sensory_scene_label = "unclear"
+        self.last_sensory_scene_confidence = 0.0
+        self.sensory_model.reset()
+        self.route_director.reset()
 
         self.wall_escape_mode = False
         self.wall_escape_step = 0
@@ -616,6 +644,17 @@ class DoomEnv(gym.Env):
             return safe_observation, float(reward), terminated, truncated, info
 
         action = self.actions[action_index]
+        decision_trace = {
+            "ppo_action": action,
+            "final_action": None,
+            "scene_label": None,
+            "scene_confidence": None,
+            "x": None,
+            "y": None,
+            "stuck_counter": self.stuck_counter,
+            "wall_contact_steps": self.wall_contact_steps,
+            "changes": [],
+        }
         config = self.get_stage_config()
 
         # -----------------------------------------------------
@@ -657,7 +696,7 @@ class DoomEnv(gym.Env):
         if self.curriculum_stage >= 3 and self.scene_predictor is not None:
             classifier_enemy = (
                 pre_scene_label == "enemy"
-                and pre_scene_confidence >= 0.75
+                and pre_scene_confidence >= 0.85
             )
 
             if classifier_enemy:
@@ -700,6 +739,26 @@ class DoomEnv(gym.Env):
         pre_game_state["action"] = action
 
         # -----------------------------------------------------
+        # Pre-action sensory override
+        # -----------------------------------------------------
+        # The neural classifier can call spawn-boundary/corner views open_path.
+        # The sensory layer corrects that using position memory and wall ratios.
+        pre_wall_info = self._wall_direction_info(pre_frame)
+        pre_scene_label, pre_scene_confidence = self.sensory_scene_override(
+            scene_label=pre_scene_label,
+            scene_confidence=pre_scene_confidence,
+            scene_probs=pre_scene_probs,
+            game_state=pre_game_state,
+            wall_info=pre_wall_info,
+            distance_moved=None,
+            motion=None,
+            action=action,
+        )
+
+        pre_game_state["scene_label"] = pre_scene_label
+        pre_game_state["scene_confidence"] = pre_scene_confidence
+
+        # -----------------------------------------------------
         # Action correction stack
         # -----------------------------------------------------
 
@@ -724,6 +783,8 @@ class DoomEnv(gym.Env):
             )
             if action != before:
                 print(f"[override] exploration: {before} -> {action}")
+
+                decision_trace["changes"].append(("exploration", before, action))
 
             before = action
             action = self.wall_assist_action(
@@ -843,7 +904,7 @@ class DoomEnv(gym.Env):
         # -----------------------------------------------------
         # These happen BEFORE perform_action(), so they affect the real keypress.
 
-        pre_wall_info = self._wall_direction_info(pre_frame)
+        # pre_wall_info was computed during the sensory override above.
 
         before_goal = action
         action = self.goal_assist_action(
@@ -855,9 +916,27 @@ class DoomEnv(gym.Env):
         if action != before_goal:
             print(f"[override] goal_assist: {before_goal} -> {action}")
 
+        door_priority = (
+            pre_scene_label == "door_or_button"
+            and pre_scene_confidence >= 0.35
+            and self.curriculum_stage >= 2
+        )
+
+        if door_priority and action in ["move_forward", "move_backward", "turn_left", "turn_right"]:
+            before = action
+            action = "use"
+            print(
+                f"[override] door_priority: {before} -> use "
+                f"label={pre_scene_label} conf={pre_scene_confidence:.2f}"
+            )
+
         if (
-            pre_scene_label in ["front_wall", "obstacle"]
-            and pre_scene_confidence >= 0.60
+            pre_scene_label in ["front_wall", "obstacle", "boundary_or_stuck_wall"]
+            and (
+                pre_scene_confidence >= 0.75
+                or self.stuck_counter >= 4
+                or self.wall_contact_steps >= 2
+            )
             and action == "move_forward"
         ):
             before = action
@@ -871,8 +950,22 @@ class DoomEnv(gym.Env):
                     action = "strafe_left"
                 else:
                     action = "strafe_right"
+            elif pre_scene_label == "boundary_or_stuck_wall":
+                # Spawn boundaries and corner loops need a stronger escape cycle.
+                if self._step_count % 6 in [0, 1]:
+                    action = "move_backward"
+                elif self._step_count % 6 in [2, 3]:
+                    action = "turn_right"
+                else:
+                    action = "strafe_right"
             else:
-                action = "move_backward"
+                # Normal front walls should rotate away first, not back up forever.
+                if self._step_count % 3 == 0:
+                    action = "turn_right"
+                elif self._step_count % 3 == 1:
+                    action = "turn_left"
+                else:
+                    action = "move_backward"
 
             print(
                 f"[override] vision_blocker: {before} -> {action} "
@@ -1019,6 +1112,15 @@ class DoomEnv(gym.Env):
         else:
             reward -= 0.01
 
+        decision_trace["final_action"] = action
+        decision_trace["scene_label"] = pre_scene_label
+        decision_trace["scene_confidence"] = pre_scene_confidence
+        decision_trace["x"] = pre_game_state.get("x")
+        decision_trace["y"] = pre_game_state.get("y")
+
+        if self._step_count % 25 == 0:
+            print("[decision_trace]", decision_trace)
+
         # -----------------------------------------------------
         # Execute action
         # -----------------------------------------------------
@@ -1078,6 +1180,17 @@ class DoomEnv(gym.Env):
         scene_confidence = pre_scene_confidence
         scene_probs = pre_scene_probs
 
+        scene_label, scene_confidence = self.sensory_scene_override(
+            scene_label=scene_label,
+            scene_confidence=scene_confidence,
+            scene_probs=scene_probs,
+            game_state=game_state,
+            wall_info=None,
+            distance_moved=distance_moved,
+            motion=motion,
+            action=action,
+        )
+
         game_state["scene_label"] = scene_label
         game_state["scene_confidence"] = scene_confidence
         game_state["scene_probs"] = scene_probs
@@ -1091,6 +1204,83 @@ class DoomEnv(gym.Env):
         corridor_reached = self.detect_corridor_reached(game_state)
         game_state["corridor_reached"] = corridor_reached
 
+        # -----------------------------------------------------
+        # Corridor stay / corridor confidence reward
+        # -----------------------------------------------------
+        # Reaching the corridor is good, but the agent also needs
+        # to learn not to immediately drift back into the spawn wall.
+        if corridor_reached:
+            reward += 2.0
+            self.reward_manager.add("corridor_stay_reward", 2.0)
+
+            if action in ["move_forward", "strafe_left", "strafe_right", "turn_left", "turn_right", "use"]:
+                reward += 0.5
+                self.reward_manager.add("valid_corridor_action", 0.5)
+
+            if action == "move_backward":
+                reward += self.add_penalty("backing_out_of_corridor", -1.5)
+
+        # -----------------------------------------------------
+        # Spawn wall / boundary return penalty
+        # -----------------------------------------------------
+        # This prevents the agent from repeatedly drifting back into
+        # the known spawn-wall trap after it has already made progress.
+
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        spawn_wall_zone = False
+
+        if x is not None and y is not None:
+            x = float(x)
+            y = float(y)
+
+            spawn_wall_zone = (
+                -520.0 <= x <= -430.0
+                and 70.0 <= y <= 450.0
+            )
+
+        game_state["spawn_wall_zone"] = spawn_wall_zone
+
+        if spawn_wall_zone:
+            reward += self.add_penalty("spawn_wall_zone_penalty", -2.0)
+
+            if action == "move_forward":
+                reward += self.add_penalty("forward_in_spawn_wall_zone", -3.0)
+
+            if self.distance_traveled > 500.0:
+                reward += self.add_penalty("returned_to_spawn_wall_after_progress", -5.0)
+
+        # -----------------------------------------------------
+        # Secret / side-route memory milestone
+        # -----------------------------------------------------
+        # The agent has reached this useful area before:
+        # around x=-208, y=144. Reward returning near it so the
+        # route becomes stable instead of accidental.
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        secret_area_reached = False
+
+        if x is not None and y is not None:
+            x = float(x)
+            y = float(y)
+
+            secret_area_reached = (
+                -260.0 <= x <= -160.0
+                and 100.0 <= y <= 200.0
+            )
+
+        game_state["secret_area_reached"] = secret_area_reached
+
+        if secret_area_reached and not getattr(self, "secret_area_reached_this_episode", False):
+            self.secret_area_reached_this_episode = True
+
+            reward += 8.0
+            self.reward_manager.add("secret_area_reached", 8.0)
+
+            print("[milestone] secret/side area reached")
+
         if corridor_reached and not self.corridor_reached_this_episode:
             self.corridor_reached_this_episode = True
             self.corridor_reach_count += 1
@@ -1103,26 +1293,8 @@ class DoomEnv(gym.Env):
                 f"{self.corridor_reach_count}/{self.corridor_reach_target}"
             )
 
-        if self.corner_trap_steps >= 20:
-            before = action
-
-            cycle = self.corner_trap_steps % 12
-
-            if cycle in [0, 1, 2]:
-                action = "move_backward"
-            elif cycle in [3, 4, 5]:
-                action = "turn_right"
-            elif cycle in [6, 7]:
-                action = "strafe_right"
-            elif cycle in [8, 9]:
-                action = "turn_left"
-            else:
-                action = "move_forward"
-
-            print(
-                f"[override] corner_escape: {before} -> {action} "
-                f"corner_steps={self.corner_trap_steps}"
-    )
+        # Corner escape action changes already happen before perform_action().
+        # Do not mutate action here after Doom has already received input.
 
         # -----------------------------------------------------
         # Current state values
@@ -1160,11 +1332,185 @@ class DoomEnv(gym.Env):
         else:
             self.wall_contact_steps = max(0, self.wall_contact_steps - 1)
 
+        
+
+        # -----------------------------------------------------
+        # Strong wall / stuck punishment
+
         wall_info = self._wall_direction_info(raw_frame)
 
         game_state["left_wall_ratio"] = wall_info["left_ratio"]
         game_state["front_wall_ratio"] = wall_info["front_ratio"]
         game_state["right_wall_ratio"] = wall_info["right_ratio"]
+
+        sensory_state = self.sensory_model.evaluate(
+            game_state=game_state,
+            scene_label=scene_label,
+            scene_confidence=scene_confidence,
+            wall_info=wall_info,
+            action=action,
+            distance_moved=distance_moved,
+            motion=motion,
+            stuck_counter=self.stuck_counter,
+            wall_contact_steps=self.wall_contact_steps,
+            corridor_reached=corridor_reached,
+        )
+
+        # -----------------------------------------------------
+        # Sensory emergency override
+        # -----------------------------------------------------
+        # Only override in serious cases. Normal navigation should still
+        # be handled by PPO + existing helpers for now.
+        sensory_recommended_action = sensory_state.get("recommended_action")
+
+        if sensory_recommended_action is not None:
+            serious_sensory_state = sensory_state["situation"] in [
+                "stuck_or_looping",
+                "bad_return_to_spawn_wall",
+                "spawn_wall_zone",
+            ]
+
+            if serious_sensory_state:
+                before = action
+                action = sensory_recommended_action
+
+                if action not in self.get_allowed_actions():
+                    action = "turn_right"
+
+                print(
+                    f"[override] sensory_emergency: {before} -> {action} "
+                    f"situation={sensory_state['situation']}"
+                )
+
+                game_state["action"] = action
+
+        director_state = self.route_director.evaluate(game_state, action)
+
+        game_state["director_target"] = director_state["target"]
+        game_state["director_distance"] = director_state["distance"]
+        game_state["director_dx"] = director_state["dx"]
+        game_state["director_dy"] = director_state["dy"]
+        game_state["director_hint_action"] = director_state["hint_action"]
+
+        reward += director_state["reward_delta"]
+
+        if director_state["reward_delta"] > 0:
+            self.reward_manager.add("director_progress", director_state["reward_delta"])
+        elif director_state["reward_delta"] < 0:
+            self.reward_manager.add("director_wrong_way", director_state["reward_delta"])
+
+        if self._step_count % 25 == 0:
+            print(
+                "[director] "
+                f"target={director_state['target']} "
+                f"dist={director_state['distance']} "
+                f"delta={director_state['distance_delta']:.2f} "
+                f"hint={director_state['hint_action']} "
+                f"reward={director_state['reward_delta']:.2f}"
+            )
+
+        game_state["sensory_situation"] = sensory_state["situation"]
+        game_state["sensory_confidence"] = sensory_state["confidence"]
+        game_state["sensory_tile"] = sensory_state["tile"]
+        game_state["sensory_repeated_tile_count"] = sensory_state["repeated_tile_count"]
+
+        if sensory_state["reward_delta"] != 0.0:
+            reward += sensory_state["reward_delta"]
+
+            if sensory_state["reward_name"] is not None:
+                self.reward_manager.add(
+                    sensory_state["reward_name"],
+                    sensory_state["reward_delta"],
+                )
+
+        if self._step_count % 25 == 0:
+            print(
+                "[sensory] "
+                f"situation={sensory_state['situation']} "
+                f"conf={sensory_state['confidence']:.2f} "
+                f"tile={sensory_state['tile']} "
+                f"repeat={sensory_state['repeated_tile_count']} "
+                f"spawn={sensory_state['spawn_wall_zone']} "
+                f"secret={sensory_state['secret_side_area']} "
+                f"right_route={sensory_state['right_route_area']} "
+                f"rec={sensory_state['recommended_action']}"
+            )
+
+        # -----------------------------------------------------
+        # Strong wall / stuck punishment
+        # -----------------------------------------------------
+        # The agent has a habit of running into walls, wall-hugging,
+        # backing into traps, and getting stuck near boundaries.
+        # These penalties teach that walls are strongly bad unless the
+        # agent is actively escaping them.
+
+        pushing_forward_into_wall = (
+            action == "move_forward"
+            and (
+                wall_contact
+                or wall_info["front_wall"]
+                or wall_info["front_ratio"] >= 0.45
+                or (
+                    scene_label in ["front_wall", "obstacle", "boundary_or_stuck_wall"]
+                    and scene_confidence >= 0.70
+                )
+            )
+        )
+
+        low_movement_attempt = (
+            action in ["move_forward", "move_backward", "strafe_left", "strafe_right"]
+            and distance_moved < 1.0
+            and motion < 1.5
+        )
+
+        trapped_near_boundary = (
+            scene_label == "boundary_or_stuck_wall"
+            and scene_confidence >= 0.70
+        )
+
+        hugging_wall = (
+            wall_info["front_ratio"] >= 0.55
+            or wall_info["left_ratio"] >= 0.80
+            or wall_info["right_ratio"] >= 0.80
+        )
+
+        if wall_contact:
+            reward += self.add_penalty("wall_contact_strong", -3.0)
+
+        if pushing_forward_into_wall:
+            reward += self.add_penalty("push_into_wall_strong", -5.0)
+
+        if low_movement_attempt:
+            reward += self.add_penalty("low_movement_attempt", -1.5)
+
+        if trapped_near_boundary:
+            reward += self.add_penalty("boundary_trap_penalty", -2.5)
+
+        if hugging_wall:
+            reward += self.add_penalty("wall_hugging_strong", -1.0)
+
+        if self.stuck_counter >= 5:
+            reward += self.add_penalty("stuck_5_steps", -2.0)
+
+        if self.stuck_counter >= 10:
+            reward += self.add_penalty("stuck_10_steps", -4.0)
+
+        if self.stuck_counter >= 20:
+            reward += self.add_penalty("stuck_20_steps", -8.0)
+
+
+        # Reward actual escape, but only if movement really improved.
+        if self.stuck_counter >= 5 and distance_moved > 5.0 and motion > 2.0:
+            reward += 3.0
+            self.reward_manager.add("strong_escape_from_stuck", 3.0)
+
+        # If the agent is near a wall but takes a reasonable escape action,
+        # give a small reward so it learns the alternative.
+        if trapped_near_boundary and action in ["turn_left", "turn_right", "strafe_left", "strafe_right", "move_backward"]:
+            reward += 0.6
+            self.reward_manager.add("correct_boundary_escape_action", 0.6)
+
+
         # Reward open-space movement and penalize wall-hugging.
         # This is the part that teaches the agent not to use walls as rails.
         wall_space_reward = self.wall_proximity_penalty(wall_info, action)
@@ -1244,12 +1590,13 @@ class DoomEnv(gym.Env):
         game_state["wall_bubble_level"] = wall_bubble["level"]
         game_state["wall_bubble_direction"] = wall_bubble["direction"]
 
-        before_bubble = action
-        action = self.wall_bubble_action(action, wall_bubble)
+        # Post-action bubble is for reward/debug only. Action overrides must happen
+        # before perform_action(), otherwise the log changes but the keypress does not.
+        suggested_bubble_action = self.wall_bubble_action(action, wall_bubble)
 
-        if action != before_bubble:
+        if suggested_bubble_action != action:
             print(
-                f"[override] wall_bubble: {before_bubble} -> {action} "
+                f"[post_wall_bubble] would prefer {action} -> {suggested_bubble_action} "
                 f"level={wall_bubble['level']} dir={wall_bubble['direction']} "
                 f"L={wall_bubble['left']:.2f} F={wall_bubble['front']:.2f} R={wall_bubble['right']:.2f}"
             )
@@ -1265,13 +1612,13 @@ class DoomEnv(gym.Env):
                 reward += 0.15
                 self.reward_manager.add("green_space_movement", 0.15)
 
-        if scene_label == "obstacle" and scene_confidence >= 0.60:
+        if scene_label in ["obstacle", "boundary_or_stuck_wall"] and scene_confidence >= 0.55:
             if action == "move_forward":
                 reward += self.add_penalty("push_into_obstacle", -1.5)
 
-        elif action in ["move_backward", "strafe_left", "strafe_right", "turn_left", "turn_right"]:
-            reward += 0.35
-            self.reward_manager.add("avoid_obstacle", 0.35)
+            elif action in ["move_backward", "strafe_left", "strafe_right", "turn_left", "turn_right"]:
+                reward += 0.35
+                self.reward_manager.add("avoid_obstacle", 0.35)
         # -----------------------------------------------------
         # Tactical behavior rewards
         # -----------------------------------------------------
@@ -1641,6 +1988,9 @@ class DoomEnv(gym.Env):
 
                         reward += 3.0
                         self.reward_manager.add("new_use_location_discovered", 3.0)
+                    else:
+                        reward += 0.8
+                        self.reward_manager.add("known_use_location_reused", 0.8)
 
                         print(f"[memory] useful use location discovered: {use_tile}")
 
@@ -1654,6 +2004,21 @@ class DoomEnv(gym.Env):
                 reward += self.add_penalty("unneeded_weapon_swap_combat", -0.3)
             elif not enemy_visible and ammo > 5:
                 reward += self.add_penalty("unneeded_weapon_swap", -0.2)
+
+                x = game_state.get("x")
+                y = game_state.get("y")
+
+                if x is not None and y is not None:
+                    current_tile = (int(float(x) // 64), int(float(y) // 64))
+
+                    near_known_use = current_tile in self.secret_use_locations
+
+                    if near_known_use and action == "move_forward" and scene_label in ["front_wall", "door_or_button"]:
+                        reward += self.add_penalty("crashed_into_known_door", -2.0)
+
+                    if near_known_use and action == "use":
+                        reward += 1.0
+                        self.reward_manager.add("used_known_door_location", 1.0)
 
         # -----------------------------------------------------
         # Weapon quality awareness
@@ -2461,6 +2826,115 @@ class DoomEnv(gym.Env):
 
         return error, confidence
     
+    def sensory_scene_override(
+        self,
+        scene_label,
+        scene_confidence,
+        scene_probs=None,
+        game_state=None,
+        wall_info=None,
+        distance_moved=None,
+        motion=None,
+        action=None,
+    ):
+        """
+        Combine the learned scene classifier with body feedback.
+
+        Why this exists:
+        - The classifier sees one image and may call spawn/corner views open_path.
+        - The environment knows whether the agent actually moved.
+        - If x/y repeats, motion is low, or wall ratios are high, we should treat
+          that "open_path" as a boundary/stuck situation.
+
+        This is the first sensory model: vision + position + movement feedback.
+        """
+        label = scene_label or "unclear"
+        confidence = float(scene_confidence or 0.0)
+        game_state = game_state or {}
+        scene_probs = scene_probs or {}
+
+        x = game_state.get("x")
+        y = game_state.get("y")
+        tile = None
+
+        if x is not None and y is not None:
+            try:
+                tile = (int(float(x) // 64), int(float(y) // 64))
+            except Exception:
+                tile = None
+
+        # Update repeated-position memory only after an action when movement data exists.
+        if distance_moved is not None or motion is not None:
+            if tile is not None:
+                self.recent_position_tiles.append(tile)
+                if len(self.recent_position_tiles) > 12:
+                    self.recent_position_tiles.pop(0)
+
+                repeats = self.recent_position_tiles.count(tile)
+                if repeats >= 5:
+                    self.repeated_position_steps += 1
+                else:
+                    self.repeated_position_steps = max(0, self.repeated_position_steps - 1)
+
+        front_ratio = 0.0
+        side_ratio = 0.0
+        if wall_info is not None:
+            front_ratio = float(wall_info.get("front_ratio", 0.0))
+            side_ratio = max(
+                float(wall_info.get("left_ratio", 0.0)),
+                float(wall_info.get("right_ratio", 0.0)),
+            )
+
+        stuck_by_body = (
+            self.stuck_counter >= 5
+            or self.wall_contact_steps >= 2
+            or self.corner_trap_steps >= 12
+            or self.repeated_position_steps >= 3
+        )
+
+        no_translation = (
+            action in ["move_forward", "move_backward", "strafe_left", "strafe_right"]
+            and distance_moved is not None
+            and motion is not None
+            and distance_moved <= 0.5
+            and motion < 1.5
+        )
+
+        # Coordinates from the user's logs repeatedly show spawn/boundary trouble
+        # around x=-496 and y=80. Keep this as a soft rule, not a hard map hack.
+        near_spawn_boundary = False
+        if x is not None and y is not None:
+            try:
+                near_spawn_boundary = float(x) <= -490.0 or float(y) <= 82.0
+            except Exception:
+                near_spawn_boundary = False
+
+        # Correct fake-open predictions.
+        if label == "open_path":
+            if stuck_by_body or no_translation or near_spawn_boundary:
+                label = "boundary_or_stuck_wall"
+                confidence = max(confidence, 0.90)
+            elif front_ratio >= 0.55:
+                label = "front_wall"
+                confidence = max(confidence, 0.75)
+            elif side_ratio >= 0.85:
+                label = "obstacle"
+                confidence = max(confidence, 0.70)
+
+        # Very low-confidence enemy in navigation stages should not hijack movement.
+        # Your current dataset is enemy-heavy, so be conservative outside combat.
+        if self.curriculum_stage < 3 and label == "enemy" and confidence < 0.90:
+            if scene_probs.get("obstacle", 0.0) >= 0.25:
+                label = "obstacle"
+                confidence = max(float(scene_probs.get("obstacle", 0.0)), 0.60)
+            else:
+                label = "unclear"
+                confidence = max(confidence, 0.40)
+
+        self.last_sensory_scene_label = label
+        self.last_sensory_scene_confidence = confidence
+        return label, confidence
+
     def detect_corner_trap(self, game_state):
         """
         Detect when the agent keeps returning to the same small coordinate area.
@@ -2880,11 +3354,23 @@ class DoomEnv(gym.Env):
         This keeps the agent from drifting aimlessly around the map.
         """
 
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        if x is not None and y is not None:
+            x = float(x)
+            y = float(y)
+
+            # If the agent is near the useful secret/side route,
+            # do not let goal steering override every movement choice.
+            if -280.0 <= x <= -140.0 and 80.0 <= y <= 220.0:
+                return action
+
         # Wall, obstacle, and stuck escape must beat goal steering.
         if self.stuck_counter >= 3 or self.wall_contact_steps >= 1 or self.corner_trap_steps >= 10:
             return action
 
-        if game_state.get("scene_label") in ["front_wall", "obstacle"]:
+        if game_state.get("scene_label") in ["front_wall", "obstacle", "boundary_or_stuck_wall"]:
             if game_state.get("scene_confidence", 0.0) >= 0.50:
                 return action
 
@@ -2989,7 +3475,7 @@ class DoomEnv(gym.Env):
 
         enemy_seen = (
             scene_label == "enemy"
-            and scene_confidence >= 0.80
+            and scene_confidence >= 0.88
         )
 
         if not enemy_seen:

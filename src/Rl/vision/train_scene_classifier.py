@@ -9,7 +9,7 @@ from torchvision import datasets, transforms, models
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT_DIR / "vision_dataset" / "classified"
+DATA_DIR = Path(__file__).resolve().parents[1] / "vision_dataset" / "classified_balanced"
 CHECKPOINT_DIR = ROOT_DIR / "checkpoints"
 CHECKPOINT_DIR.mkdir(exist_ok=True)
 

@@ -1,155 +1,112 @@
 from pathlib import Path
-import sys
 import shutil
 import cv2
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT_DIR))
-
-from vision.scene_predictor import ScenePredictor
+from scene_predictor import ScenePredictor
 
 
-SOURCE_DIR = ROOT_DIR / "vision_dataset" / "human_frames"
-OUT_DIR = ROOT_DIR / "vision_dataset" / "classified"
-REVIEW_DIR = ROOT_DIR / "vision_dataset" / "review_needed"
+ROOT = Path(__file__).resolve().parents[1]
 
-SAMPLE_EVERY = 15
+INPUT_DIRS = [
+    ROOT / "vision_dataset" / "human_frames" / "freedoom1",
+    ROOT / "vision_dataset" / "human_frames" / "freedoom2",
+]
 
-# Do not allow front_wall auto-labeling right now.
-# You already have too many wall images.
-BLOCKED_LABELS = {"front_wall"}
+CLASSIFIED_DIR = ROOT / "vision_dataset" / "classified"
+REVIEW_DIR = ROOT / "vision_dataset" / "needs_review"
 
-# Only auto-fill weak classes.
-ALLOWED_LABELS = {
-    "open_path",
-    "obstacle",
-    "door_or_button",
-    "enemy",
-    "unclear",
-    "damage_or_death",
-}
-
-# Per-class confidence thresholds.
-# Lower = more lazy, more noisy.
+# Confidence thresholds.
+# These are intentionally stricter for open_path because bad open_path labels
+# are one reason the agent gets stuck around spawn/boundary areas.
 THRESHOLDS = {
-    "open_path": 0.35,
-    "obstacle": 0.30,
-    "door_or_button": 0.30,
-    "enemy": 0.40,
-    "unclear": 0.35,
-    "damage_or_death": 0.30,
+    "enemy": 0.75,
+    "front_wall": 0.70,
+    "obstacle": 0.65,
+    "door_or_button": 0.60,
+    "pickup": 0.65,
+    "damage_or_death": 0.70,
+    "open_path": 0.78,
+    "unclear": 0.70,
 }
 
-# Stop once each class reaches this many images.
-TARGET_COUNTS = {
-    "open_path": 200,
-    "obstacle": 150,
-    "door_or_button": 120,
-    "enemy": 300,
-    "unclear": 150,
-    "damage_or_death": 40,
-}
-
-VALID_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+VALID_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 
-def count_existing(label):
-    class_dir = OUT_DIR / label
-    if not class_dir.exists():
-        return 0
+def safe_copy(src: Path, dst_dir: Path):
+    dst_dir.mkdir(parents=True, exist_ok=True)
 
-    return sum(
-        1 for p in class_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS
-    )
+    dst = dst_dir / src.name
+    if dst.exists():
+        dst = dst_dir / f"{src.stem}_{src.parent.name}{src.suffix}"
+
+    shutil.copy2(src, dst)
 
 
 def main():
     predictor = ScenePredictor()
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    all_frames = []
+    for input_dir in INPUT_DIRS:
+        if input_dir.exists():
+            all_frames.extend(
+                sorted(
+                    p for p in input_dir.rglob("*")
+                    if p.is_file() and p.suffix.lower() in VALID_EXTS
+                )
+            )
 
-    existing_counts = {
-        label: count_existing(label)
-        for label in TARGET_COUNTS
-    }
-
-    print("Starting counts:")
-    for label, count in sorted(existing_counts.items()):
-        print(f"  {label}: {count}/{TARGET_COUNTS[label]}")
-
-    images = sorted(
-        p for p in SOURCE_DIR.iterdir()
-        if p.suffix.lower() in VALID_EXTENSIONS
-    )
-
-    if not images:
-        print(f"No images found in {SOURCE_DIR}")
+    if not all_frames:
+        print("No frames found.")
+        print("Expected frames in:")
+        for d in INPUT_DIRS:
+            print(f"  - {d}")
         return
 
-    copied = {label: 0 for label in TARGET_COUNTS}
-    skipped_front_wall = 0
-    skipped_low_conf = 0
-    skipped_full = 0
+    print(f"Found {len(all_frames)} frames.")
+    print("Auto-sorting frames...")
 
-    print(f"\nFound {len(images)} human frames.")
-    print(f"Sampling every {SAMPLE_EVERY} frames.")
-    print("Blocked labels:", BLOCKED_LABELS)
+    counts = {}
 
-    for index, img_path in enumerate(images):
-        if index % SAMPLE_EVERY != 0:
-            continue
+    for i, frame_path in enumerate(all_frames, start=1):
+        frame = cv2.imread(str(frame_path))
 
-        frame = cv2.imread(str(img_path))
         if frame is None:
+            safe_copy(frame_path, REVIEW_DIR / "bad_read")
+            counts["bad_read"] = counts.get("bad_read", 0) + 1
             continue
 
         result = predictor.predict(frame)
-        label = result["label"]
-        confidence = float(result["confidence"])
+        label = result.get("label", "unclear")
+        confidence = float(result.get("confidence", 0.0))
 
-        if label in BLOCKED_LABELS:
-            skipped_front_wall += 1
-            continue
+        threshold = THRESHOLDS.get(label, 0.75)
 
-        if label not in ALLOWED_LABELS:
-            continue
+        # Do not auto-accept weak open_path predictions.
+        # Bad open_path labels are dangerous because the agent may walk into
+        # spawn boundaries, corners, and fake-open areas.
+        if confidence >= threshold and label != "unclear":
+            target_dir = CLASSIFIED_DIR / label
+            bucket = label
+        else:
+            target_dir = REVIEW_DIR / f"{label}_conf_{confidence:.2f}"
+            bucket = "needs_review"
 
-        if existing_counts.get(label, 0) >= TARGET_COUNTS[label]:
-            skipped_full += 1
-            continue
+        safe_copy(frame_path, target_dir)
+        counts[bucket] = counts.get(bucket, 0) + 1
 
-        threshold = THRESHOLDS.get(label, 0.40)
+        if i % 100 == 0:
+            print(f"Processed {i}/{len(all_frames)} frames...")
 
-        if confidence < threshold:
-            skipped_low_conf += 1
-            continue
+    print("\nDone.")
+    print("Counts:")
+    for k, v in sorted(counts.items()):
+        print(f"  {k}: {v}")
 
-        destination_dir = OUT_DIR / label
-        destination_dir.mkdir(parents=True, exist_ok=True)
+    print("\nReview these folders manually when your computer can handle it:")
+    print(f"  {REVIEW_DIR}")
 
-        new_index = existing_counts[label]
-        new_name = f"auto_{label}_{new_index:05d}_{img_path.name}"
-        destination = destination_dir / new_name
-
-        shutil.copy2(img_path, destination)
-
-        existing_counts[label] += 1
-        copied[label] += 1
-
-    print("\nAuto-label complete.")
-    print("Copied:")
-    for label, count in sorted(copied.items()):
-        print(f"  {label}: +{count} now {existing_counts[label]}/{TARGET_COUNTS[label]}")
-
-    print("\nSkipped:")
-    print(f"  front_wall blocked: {skipped_front_wall}")
-    print(f"  low confidence: {skipped_low_conf}")
-    print(f"  class already full: {skipped_full}")
-
-    print("\nNext command:")
-    print("python vision/train_scene_classifier.py")
+    print("\nAuto-accepted labels went here:")
+    print(f"  {CLASSIFIED_DIR}")
 
 
 if __name__ == "__main__":
