@@ -52,6 +52,11 @@ except ImportError:
     VisionDetector = None
 
 try:
+    from vision.object_predictor import ObjectPredictor
+except Exception:
+    ObjectPredictor = None
+
+try:
     from combat.combat_tactics import CombatTactics
 except ImportError:
     class CombatTactics:
@@ -314,6 +319,14 @@ class DoomEnv(gym.Env):
             except Exception as e:
                 print(f"[vision] Could not load scene classifier: {e}")
                 self.scene_predictor = None
+
+        if ObjectPredictor is not None:
+            try:
+                self.object_predictor = ObjectPredictor()
+                print("[object_vision] Loaded object_multilabel_classifier.pt")
+            except Exception as e:
+                print(f"[object_vision] Could not load object predictor: {e}")
+                self.object_predictor = None
 
     # ---------------------------------------------------------
     # Setup helpers
@@ -1253,6 +1266,29 @@ class DoomEnv(gym.Env):
 
         # -----------------------------------------------------
         # Secret / side-route memory milestone
+
+        object_result = None
+
+        if self.object_predictor is not None and raw_frame is not None:
+            try:
+                object_result = self.object_predictor.predict(raw_frame)
+
+                print(
+                    "[object_vision] "
+                    f"present={object_result['present']} "
+                    f"enemy={object_result['scores'].get('enemy_visible', 0.0):.2f} "
+                    f"health={object_result['scores'].get('pickup_health', 0.0):.2f} "
+                    f"ammo={object_result['scores'].get('pickup_ammo', 0.0):.2f} "
+                    f"armor={object_result['scores'].get('pickup_armor', 0.0):.2f} "
+                    f"barrel={object_result['scores'].get('explosive_barrel', 0.0):.2f} "
+                    f"none={object_result['scores'].get('no_important_object', 0.0):.2f}"
+                )
+
+                game_state["object_vision"] = object_result
+
+            except Exception as e:
+                print(f"[object_vision] prediction failed: {e}")
+                object_result = None
         # -----------------------------------------------------
         # The agent has reached this useful area before:
         # around x=-208, y=144. Reward returning near it so the
@@ -1383,6 +1419,31 @@ class DoomEnv(gym.Env):
                 )
 
                 game_state["action"] = action
+        enable_sensory_action_override = False
+
+        if enable_sensory_action_override:
+            sensory_recommended_action = sensory_state.get("recommended_action")
+
+            if sensory_recommended_action is not None:
+                serious_sensory_state = sensory_state["situation"] in [
+                    "stuck_or_looping",
+                    "bad_return_to_spawn_wall",
+                    "spawn_wall_zone",
+                ]
+
+                if serious_sensory_state:
+                    before = action
+                    action = sensory_recommended_action
+
+                    if action not in self.get_allowed_actions():
+                        action = "turn_right"
+
+                    print(
+                        f"[override] sensory_emergency: {before} -> {action} "
+                        f"situation={sensory_state['situation']}"
+                    )
+
+                    game_state["action"] = action
 
         director_state = self.route_director.evaluate(game_state, action)
 
