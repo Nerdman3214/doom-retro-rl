@@ -1,0 +1,16 @@
+
+# RL generated files
+checkpoints/
+logs/
+tensorboard_logs/
+clips/
+vision_dataset/
+vision_dataset_v2/
+*.pt
+*.pth
+*.pkl
+*.mp4
+*.avi
+*.zip
+*.wad
+*.lmp
