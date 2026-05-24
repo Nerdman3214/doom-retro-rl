@@ -1,0 +1,17 @@
+[
+  {
+    "step": 0,
+    "action": "move_backward",
+    "scene_label": "boundary_or_stuck_wall",
+    "scene_confidence": 0.9,
+    "x": 1259.1941680908203,
+    "y": -803.1971130371094,
+    "health": 0,
+    "ammo": 66,
+    "motion": 19.554705215419503,
+    "distance_moved": 0.0,
+    "stuck_counter": 0,
+    "wall_contact_steps": 0,
+    "curriculum_stage": 3
+  }
+]

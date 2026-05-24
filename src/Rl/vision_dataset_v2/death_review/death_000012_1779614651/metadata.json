@@ -1,0 +1,17 @@
+[
+  {
+    "step": 0,
+    "action": "move_backward",
+    "scene_label": "enemy",
+    "scene_confidence": 0.9715401530265808,
+    "x": 208.0603790283203,
+    "y": 208.00137329101562,
+    "health": -1,
+    "ammo": 50,
+    "motion": 0.30371315192743764,
+    "distance_moved": 0.0,
+    "stuck_counter": 0,
+    "wall_contact_steps": 0,
+    "curriculum_stage": 3
+  }
+]

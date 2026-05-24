@@ -1,0 +1,17 @@
+[
+  {
+    "step": 0,
+    "action": "move_forward",
+    "scene_label": "unclear",
+    "scene_confidence": 0.8569563627243042,
+    "x": 659.2951354980469,
+    "y": 307.2384796142578,
+    "health": -1,
+    "ammo": 50,
+    "motion": 14.683531746031745,
+    "distance_moved": 0.0,
+    "stuck_counter": 0,
+    "wall_contact_steps": 0,
+    "curriculum_stage": 2
+  }
+]
