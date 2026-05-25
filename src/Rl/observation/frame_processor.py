@@ -226,3 +226,91 @@ class FrameProcessor:
 
         resized = cv2.resize(crop, size, interpolation=cv2.INTER_AREA)
         return resized
+    
+    def _ensure_bgr(self, frame):
+        if frame is None or frame.size == 0:
+            return frame
+
+        if len(frame.shape) == 3 and frame.shape[2] == 4:
+            return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+        return frame
+
+    def gameplay_crop(self, frame, bottom_cut=0.80):
+        """
+        Visible gameplay area without the HUD/status bar.
+        Use this for navigation, enemies, doors, pickups, wall detection.
+        """
+        frame = self._ensure_bgr(frame)
+
+        if frame is None or frame.size == 0:
+            return frame
+
+        h, w = frame.shape[:2]
+        y2 = int(h * bottom_cut)
+        return frame[:y2, :]
+
+    def hud_crop(self, frame, top_start=0.78):
+        """
+        Bottom HUD/status area.
+        Use this for health, ammo, armor, keys, weapon/status.
+        """
+        frame = self._ensure_bgr(frame)
+
+        if frame is None or frame.size == 0:
+            return frame
+
+        h, w = frame.shape[:2]
+        y1 = int(h * top_start)
+        return frame[y1:, :]
+
+    def center_gameplay_crop(self, frame, width_ratio=0.60, height_ratio=0.75):
+        """
+        Center gameplay view for aiming/combat.
+        Excludes most HUD and keeps forward-facing detail.
+        """
+        frame = self._ensure_bgr(frame)
+
+        if frame is None or frame.size == 0:
+            return frame
+
+        gameplay = self.gameplay_crop(frame)
+        h, w = gameplay.shape[:2]
+
+        crop_w = int(w * width_ratio)
+        crop_h = int(h * height_ratio)
+
+        x1 = max(0, (w - crop_w) // 2)
+        y1 = max(0, (h - crop_h) // 2)
+        x2 = min(w, x1 + crop_w)
+        y2 = min(h, y1 + crop_h)
+
+        return gameplay[y1:y2, x1:x2]
+
+    def make_model_frame(self, frame, view_mode="gameplay_wide", size=(160, 100)):
+        """
+        Model-ready RGB/BGR frame crop.
+
+        view_mode options:
+        - gameplay_wide
+        - gameplay_center
+        - hud
+        - full_debug
+        """
+        frame = self._ensure_bgr(frame)
+
+        if frame is None or frame.size == 0:
+            return frame
+
+        if view_mode in ["wide", "gameplay_wide"]:
+            crop = self.gameplay_crop(frame)
+        elif view_mode in ["center", "gameplay_center"]:
+            crop = self.center_gameplay_crop(frame)
+        elif view_mode == "hud":
+            crop = self.hud_crop(frame)
+        elif view_mode in ["full", "full_debug"]:
+            crop = frame
+        else:
+            crop = self.gameplay_crop(frame)
+
+        return cv2.resize(crop, size, interpolation=cv2.INTER_AREA)
