@@ -182,3 +182,32 @@ class CheckpointTracker:
                 info["secret_reached"] = True
 
         return reward, info
+    
+    def update_route_zones(self, position, route_zones, reached_zones):
+        if position is None:
+            return 0.0, None, reached_zones
+
+        x, y = float(position[0]), float(position[1])
+        reward = 0.0
+        reached_name = None
+
+        for idx, zone in enumerate(route_zones, start=1):
+            name = zone["name"]
+
+            if name in reached_zones:
+                continue
+
+            tx = float(zone["x"])
+            ty = float(zone["y"])
+            radius = float(zone["radius"])
+            zone_reward = float(zone.get("reward", 0.0))
+
+            dist = ((x - tx) ** 2 + (y - ty) ** 2) ** 0.5
+
+            if dist <= radius:
+                reached_zones.add(name)
+                reward += zone_reward
+                reached_name = name
+                break
+
+        return reward, reached_name, reached_zones

@@ -180,3 +180,49 @@ class FrameProcessor:
         y2 = min(h, cy + radius)
 
         return frame[y1:y2, x1:x2]
+    
+    def make_wide_model_frame(self, frame, size=(160, 100)):
+        """
+        Full-screen / wide-FOV frame for navigation, doors, route context, and object detection.
+        Keeps more horizontal information than a tight center crop.
+        """
+        if frame is None:
+            return None
+
+        import cv2
+
+        # Convert BGRA/RGBA if needed
+        if len(frame.shape) == 3 and frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+        resized = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
+        return resized
+
+
+    def make_center_combat_frame(self, frame, size=(84, 84)):
+        """
+        Center-focused view for aiming/combat classification.
+        Keeps the crosshair/front view strong.
+        """
+        if frame is None:
+            return None
+
+        import cv2
+
+        h, w = frame.shape[:2]
+
+        crop_w = int(w * 0.60)
+        crop_h = int(h * 0.75)
+
+        x1 = max(0, (w - crop_w) // 2)
+        y1 = max(0, (h - crop_h) // 2)
+        x2 = min(w, x1 + crop_w)
+        y2 = min(h, y1 + crop_h)
+
+        crop = frame[y1:y2, x1:x2]
+
+        if len(crop.shape) == 3 and crop.shape[2] == 4:
+            crop = cv2.cvtColor(crop, cv2.COLOR_BGRA2BGR)
+
+        resized = cv2.resize(crop, size, interpolation=cv2.INTER_AREA)
+        return resized

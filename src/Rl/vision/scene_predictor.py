@@ -79,6 +79,11 @@ class ScenePredictor:
                 "confidence": 0.0,
                 "probs": {},
             }
+        
+        if view_mode == "wide":
+            frame = self.frame_processor.make_wide_model_frame(frame)
+        else:
+            frame = self.frame_processor.make_center_combat_frame(frame)
 
         # OpenCV uses BGR. PIL expects RGB.
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)

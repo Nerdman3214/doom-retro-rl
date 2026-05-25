@@ -103,7 +103,17 @@ class ObjectPredictor:
 
         raise TypeError(f"Unsupported frame type: {type(frame)}")
 
-    def predict(self, frame):
+    def predict(self, frame, view_mode="wide"):
+        if frame is None:
+            return {
+                "present": [],
+                "scores": {},
+            }
+        
+        if view_mode == "wide":
+            frame = self.frame_processor.make_wide_model_frame(frame)
+        else:
+            frame = self.frame_processor.make_center_combat_frame(frame)
         image = self._to_pil(frame)
         x = self.transform(image).unsqueeze(0).to(self.device)
 

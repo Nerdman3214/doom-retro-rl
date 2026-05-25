@@ -654,37 +654,34 @@ class DoomEnv(gym.Env):
 
         # These are starting placeholders based on the coordinates your logs show.
         # Tune them as you collect better route logs.
-        route_zones = [
-            ("spawn_exit", 600, 360, 120, 0.50),
-            ("right_route", 625, 360, 120, 0.80),
-            ("door_area", 700, 420, 140, 1.00),
-            ("combat_corridor", 850, 400, 160, 1.50),
-            ("exit_route", 1000, 500, 180, 2.00),
-        ]
+        route_zones = self.level_guide.get("route_zones", [])
 
-        for idx, (name, tx, ty, radius, zone_reward) in enumerate(route_zones, start=1):
-            if name in self.route_zones_reached:
-                continue
+        position = (x, y)
 
-            dist = ((x - tx) ** 2 + (y - ty) ** 2) ** 0.5
+        zone_reward, reached_name, self.route_zones_reached = (
+            self.checkpoint_tracker.update_route_zones(
+                position=position,
+                route_zones=route_zones,
+                reached_zones=self.route_zones_reached,
+            )
+        )
 
-            if dist <= radius:
-                self.route_zones_reached.add(name)
-                self.route_progress_level = max(self.route_progress_level, idx)
-                self.best_route_progress_level = max(
-                    self.best_route_progress_level,
-                    self.route_progress_level,
-                )
+        if reached_name is not None:
+            self.route_progress_level += 1
+            self.best_route_progress_level = max(
+                self.best_route_progress_level,
+                self.route_progress_level,
+            )
 
-                reward += zone_reward
-                self.reward_manager.add(f"route_progress_{name}", zone_reward)
+            reward += zone_reward
+            self.reward_manager.add(f"route_progress_{reached_name}", zone_reward)
 
-                print(
-                    f"[route_progress] reached={name} "
-                    f"level={self.route_progress_level} "
-                    f"x={x:.1f} y={y:.1f} "
-                    f"reward={zone_reward:.2f}"
-                )
+            print(
+                f"[route_progress] reached={reached_name} "
+                f"level={self.route_progress_level} "
+                f"x={x:.1f} y={y:.1f} "
+                f"reward={zone_reward:.2f}"
+            )
 
         return reward
     
@@ -931,7 +928,7 @@ class DoomEnv(gym.Env):
         pre_scene_probs = {}
 
         if self.scene_predictor is not None:
-            pre_scene_result = self.scene_predictor.predict(pre_frame)
+            pre_scene_result = self.scene_predictor.predict(pre_frame, view_mode="wide")
             pre_scene_label = pre_scene_result["label"]
             pre_scene_confidence = pre_scene_result["confidence"]
             pre_scene_probs = pre_scene_result["probs"]
@@ -1283,21 +1280,13 @@ class DoomEnv(gym.Env):
         sensory_action = None
 
         if self.enable_sensory_action_override:
-            sensory_action = self.sensory_emergency_action(
-                action=action,
-                scene_label=pre_scene_label,
-                scene_confidence=pre_scene_confidence,
-                wall_info=pre_wall_info,
-                stuck_counter=self.stuck_counter,
-                wall_contact_steps=self.wall_contact_steps,
-                motion=None,
-                distance_moved=None,
-            )
+            sensory_action = self.sensory_emergency_action(...)
 
-        if sensory_action is not None and sensory_action in self.get_allowed_actions():
-            before = action
-            action = sensory_action
-            pre_game_state["action"] = action
+            if sensory_action is not None:
+                before = action
+                action = sensory_action
+                print(f"[sensory_pre_action] {before} -> {action}")
+                pre_game_state["action"] = action
 
             print(
                 f"[sensory_pre_action] {before} -> {action} "
