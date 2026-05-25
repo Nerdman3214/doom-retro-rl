@@ -113,6 +113,7 @@ class CheckpointTracker:
 
             info["distance_to_checkpoint"] = dist
             info["checkpoint_name"] = checkpoint.get("name", "checkpoint")
+            
 
             if self.prev_checkpoint_distance is not None:
                 progress = self.prev_checkpoint_distance - dist

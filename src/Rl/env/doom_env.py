@@ -289,6 +289,12 @@ class DoomEnv(gym.Env):
         self.last_wall_escape_step = -100
         self.route_progress_level = 0
 
+        # -----------------------------------------------------
+        # First-level route progress tracking
+        # -----------------------------------------------------
+        self.route_zones_reached = set()
+        self.best_route_progress_level = 0
+
         self.wall_escape_mode = False
         self.wall_escape_step = 0
         self.wall_escape_direction = "right"
@@ -337,6 +343,9 @@ class DoomEnv(gym.Env):
         self.pickup_count = 0
         self.continuous_movement_steps = 0
         self.door_interaction_count = 0
+        self.last_use_step = -100
+        self.last_use_position = None
+        self.pending_use_check = None
         self.key_item_count = 0
         self.enemy_engagement_count = 0
         self.track_enemy_count = 0
@@ -555,6 +564,157 @@ class DoomEnv(gym.Env):
     # Gymnasium API
     # ---------------------------------------------------------
 
+    def door_use_reward(self, action, game_state, scene_label, scene_confidence):
+        """
+        Rewards useful 'use' actions and penalizes use spam.
+
+        Useful use means:
+        - use near a door/button/elevator-looking area
+        - use followed by position/progress change
+        """
+
+        reward = 0.0
+
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        if x is None or y is None:
+            return 0.0
+
+        pos = np.array([float(x), float(y)], dtype=np.float32)
+
+        door_like = (
+            scene_label == "door_or_button"
+            and scene_confidence >= 0.35
+        )
+
+        if action == "use":
+            self.door_interaction_count += 1
+
+            if door_like:
+                reward += 0.30
+                self.reward_manager.add("use_near_door_like_scene", 0.30)
+            else:
+                reward += self.add_penalty("use_not_near_door", -0.05)
+
+            if self.last_use_step >= 0 and self._step_count - self.last_use_step < 10:
+                reward += self.add_penalty("use_spam", -0.10)
+
+            self.last_use_step = self._step_count
+            self.last_use_position = pos.copy()
+            self.pending_use_check = {
+                "step": self._step_count,
+                "position": pos.copy(),
+                "route_progress": self.route_progress_level,
+            }
+
+        if self.pending_use_check is not None:
+            age = self._step_count - self.pending_use_check["step"]
+
+            if 2 <= age <= 20:
+                old_pos = self.pending_use_check["position"]
+                moved = float(np.linalg.norm(pos - old_pos))
+                route_improved = (
+                    self.route_progress_level
+                    > self.pending_use_check["route_progress"]
+                )
+
+                if moved >= 32.0 or route_improved:
+                    reward += 0.80
+                    self.reward_manager.add("use_created_progress", 0.80)
+                    print(
+                        f"[door_use] useful_use moved={moved:.1f} "
+                        f"route_improved={route_improved}"
+                    )
+                    self.pending_use_check = None
+
+            elif age > 20:
+                self.pending_use_check = None
+
+        return reward
+    
+    def route_progress_reward(self, game_state):
+        """
+        First-level route progress reward.
+
+        This gives the agent small, clear milestones for Freedoom E1M1.
+        It is better than only using distance-to-exit because Doom maps are not straight lines.
+        """
+
+        reward = 0.0
+
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        if x is None or y is None:
+            return 0.0
+
+        x = float(x)
+        y = float(y)
+
+        # These are starting placeholders based on the coordinates your logs show.
+        # Tune them as you collect better route logs.
+        route_zones = [
+            ("spawn_exit", 600, 360, 120, 0.50),
+            ("right_route", 625, 360, 120, 0.80),
+            ("door_area", 700, 420, 140, 1.00),
+            ("combat_corridor", 850, 400, 160, 1.50),
+            ("exit_route", 1000, 500, 180, 2.00),
+        ]
+
+        for idx, (name, tx, ty, radius, zone_reward) in enumerate(route_zones, start=1):
+            if name in self.route_zones_reached:
+                continue
+
+            dist = ((x - tx) ** 2 + (y - ty) ** 2) ** 0.5
+
+            if dist <= radius:
+                self.route_zones_reached.add(name)
+                self.route_progress_level = max(self.route_progress_level, idx)
+                self.best_route_progress_level = max(
+                    self.best_route_progress_level,
+                    self.route_progress_level,
+                )
+
+                reward += zone_reward
+                self.reward_manager.add(f"route_progress_{name}", zone_reward)
+
+                print(
+                    f"[route_progress] reached={name} "
+                    f"level={self.route_progress_level} "
+                    f"x={x:.1f} y={y:.1f} "
+                    f"reward={zone_reward:.2f}"
+                )
+
+        return reward
+    
+    def tile_exploration_reward(self, game_state):
+        """
+        Simple exploration reward using player position tiles.
+
+        This is easier to debug than RND and helps stop same-area loops.
+        """
+
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        if x is None or y is None:
+            return 0.0
+
+        tile_size = 64
+        tile = (int(float(x) // tile_size), int(float(y) // tile_size))
+
+        if tile not in self.visited_tiles:
+            self.visited_tiles.add(tile)
+            self.reward_manager.add("new_tile", 0.03)
+            return 0.03
+
+        if self.repeated_position_steps >= 10:
+            self.reward_manager.add("same_tile_loop_penalty", -0.03)
+            return self.add_penalty("same_tile_loop_penalty", -0.03)
+
+        return 0.0
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
@@ -567,6 +727,8 @@ class DoomEnv(gym.Env):
         self.wall_contact_steps = 0
         self.last_wall_escape_step = -100
         self.route_progress_level = 0
+        self.route_zones_reached = set()
+        self.best_route_progress_level = 0
         self.goal_turn_steps = 0
         self.recent_position_tiles = []
         self.repeated_position_steps = 0
@@ -614,6 +776,9 @@ class DoomEnv(gym.Env):
         self.pickup_count = 0
         self.continuous_movement_steps = 0
         self.door_interaction_count = 0
+        self.last_use_step = -100
+        self.last_use_position = None
+        self.pending_use_check = None
         self.key_item_count = 0
         self.enemy_engagement_count = 0
         self.track_enemy_count = 0
@@ -1308,6 +1473,17 @@ class DoomEnv(gym.Env):
         red_ratio = self.frame_processor.red_flash_ratio(raw_frame)
 
         game_state = self.observer.get_game_state()
+
+        reward += self.route_progress_reward(game_state)
+        reward += self.tile_exploration_reward(game_state)
+        reward += self.door_use_reward(
+            action=action,
+            game_state=game_state,
+            scene_label=pre_scene_label,
+            scene_confidence=pre_scene_confidence,
+        )
+
+        
 
         # -----------------------------------------------------
         # Keycard state placeholder
@@ -2495,7 +2671,7 @@ class DoomEnv(gym.Env):
 
         self.prev_enemy_visible = enemy_visible
 
-                # -----------------------------------------------------
+        # -----------------------------------------------------
         # Auxiliary-style object rewards
         # -----------------------------------------------------
         if object_result is not None:
@@ -2621,11 +2797,20 @@ class DoomEnv(gym.Env):
                         f"{self.best_episode_reward:.2f}"
                     )
 
+        info["route_progress_level"] = self.route_progress_level
+        info["best_route_progress_level"] = self.best_route_progress_level
+        info["unique_tiles"] = len(self.visited_tiles)
+        info["doors_used"] = self.door_interaction_count
+        info["stuck_counter"] = self.stuck_counter
+        info["sensory_emergency_active"] = self.sensory_emergency_active
+        
+
         return observation, float(reward), terminated, truncated, info
 
     # ---------------------------------------------------------
     # Action execution
     # ---------------------------------------------------------
+    
     def save_death_review_frames(self, reason="death"):
         """
         Save the last few seconds before death/stuck reset.
@@ -2904,6 +3089,43 @@ class DoomEnv(gym.Env):
             return "2", "low_ammo_pistol"
 
         return None, "keep_current"
+
+    def route_progress_reward(self, game_state):
+        reward = 0.0
+
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        if x is None or y is None:
+            return 0.0
+
+        x = float(x)
+        y = float(y)
+
+        # Example placeholders — tune these from your real logs.
+        route_zones = [
+            ("spawn_exit", 600, 360, 120, 0.5),
+            ("right_route", 625, 360, 120, 0.8),
+            ("door_area", 700, 420, 140, 1.0),
+            ("combat_corridor", 850, 400, 160, 1.5),
+            ("exit_route", 1000, 500, 180, 2.0),
+        ]
+
+        for idx, (name, tx, ty, radius, zone_reward) in enumerate(route_zones, start=1):
+            dist = ((x - tx) ** 2 + (y - ty) ** 2) ** 0.5
+
+            if dist <= radius and self.route_progress_level < idx:
+                self.route_progress_level = idx
+                reward += zone_reward
+                self.reward_manager.add(f"route_progress_{name}", zone_reward)
+
+                print(
+                    f"[route_progress] reached={name} "
+                    f"level={self.route_progress_level} "
+                    f"x={x:.1f} y={y:.1f} reward={zone_reward:.2f}"
+                )
+
+        return reward
 
     def smart_weapon_select(self, game_state, object_result=None, enemy_visible=False, enemy_centered=False):
         """
