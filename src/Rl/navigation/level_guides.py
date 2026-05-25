@@ -31,6 +31,50 @@ DEFAULT_EMPTY_GUIDE = {
 
 LEVEL_GUIDES = {
     "freedoom1_e1m1": {
+        "route_zones": [
+            {
+                "name": "spawn_exit",
+                "x": 600,
+                "y": 360,
+                "radius": 120,
+                "reward": 0.50,
+            },
+            {
+                "name": "right_route",
+                "x": 625,
+                "y": 360,
+                "radius": 120,
+                "reward": 0.80,
+            },
+            {
+                "name": "door_area",
+                "x": 700,
+                "y": 420,
+                "radius": 140,
+                "reward": 1.00,
+            },
+            {
+                "name": "combat_corridor",
+                "x": 850,
+                "y": 400,
+                "radius": 160,
+                "reward": 1.50,
+            },
+            {
+                "name": "exit_route",
+                "x": 1000,
+                "y": 500,
+                "radius": 180,
+                "reward": 2.00,
+            },
+        ],
+        "checkpoints": [],
+        "secrets": [],
+    }
+}
+
+"""LEVEL_GUIDES = {
+    "freedoom1_e1m1": {
         "main_goal": {
             "name": "level_exit",
             "type": "exit",
@@ -203,7 +247,7 @@ LEVEL_GUIDES = {
         "use_points": [],
     },
 }
-
+"""
 
 def get_level_guide(level_name):
     guide = LEVEL_GUIDES.get(level_name)

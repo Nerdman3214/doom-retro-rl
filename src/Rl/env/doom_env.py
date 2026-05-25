@@ -59,6 +59,7 @@ from vision.scene_predictor import ScenePredictor
 from sensory.sensory_model import SensoryModel
 from director.route_director import RouteDirector
 from navigation.retrace_navigator import RetraceNavigator
+from observation.wall_sensor import WallSensor
 
 try:
     from observation.vision_detector import VisionDetector
@@ -69,6 +70,12 @@ try:
     from vision.object_predictor import ObjectPredictor
 except Exception:
     ObjectPredictor = None
+
+try:
+    from vision.hud_predictor import HudPredictor
+except Exception as e:
+    print(f"[hud_vision] HudPredictor disabled: {e}")
+    HudPredictor = None
 
 try:
     from combat.combat_tactics import CombatTactics
@@ -109,6 +116,7 @@ class DoomEnv(gym.Env):
         self.observer = ObservationBuilder()
         self.frame_stack = FrameStack(stack_size=3)
         self.frame_processor = FrameProcessor()
+        self.wall_sensor = WallSensor()
         self.exploration_memory = ExplorationMemory(map_size=512)
         self.reward_manager = RewardManager()
         self.actions = ActionSpace().ACTIONS
@@ -127,7 +135,7 @@ class DoomEnv(gym.Env):
         self.sensory_model = SensoryModel()
         self.route_director = RouteDirector()
         self.retrace_navigator = RetraceNavigator()
-        self.enable_retrace_navigator = True
+        self.enable_retrace_navigator = False
         
         # -----------------------------------------------------
         # Helper control switches
@@ -135,7 +143,7 @@ class DoomEnv(gym.Env):
         # Keep these False while PPO is learning.
         # These systems should guide with reward/logging, not hijack actions.
         self.enable_sensory_action_override = True
-        self.enable_goal_assist_action_override = True
+        self.enable_goal_assist_action_override = False
 
         # Keep wall safety on, but only for true front-wall emergencies.
         self.enable_vision_blocker_override = True
@@ -386,6 +394,16 @@ class DoomEnv(gym.Env):
                 print(f"[object_vision] Could not load object predictor: {e}")
                 self.object_predictor = None
 
+        if HudPredictor is not None:
+            try:
+                self.hud_predictor = HudPredictor()
+                print("[hud_vision] Loaded lightweight HUD predictor")
+            except Exception as e:
+                print(f"[hud_vision] Could not initialize HUD predictor: {e}")
+                self.hud_predictor = None
+        else:
+            self.hud_predictor = None
+
     # ---------------------------------------------------------
     # Setup helpers
     # ---------------------------------------------------------
@@ -563,6 +581,35 @@ class DoomEnv(gym.Env):
     # ---------------------------------------------------------
     # Gymnasium API
     # ---------------------------------------------------------
+    def hud_status_reward(self, hud_result, action):
+        """
+        Small HUD-aware reward shaping.
+
+        This teaches the agent that low health and low ammo are important,
+        without letting HUD logic directly control the action.
+        """
+
+        if not hud_result:
+            return 0.0
+
+        reward = 0.0
+
+        low_health = hud_result.get("low_health", False)
+        low_ammo = hud_result.get("low_ammo", False)
+        damage_flash = hud_result.get("damage_flash", False)
+
+        if low_health:
+            reward += self.add_penalty("hud_low_health", -0.05)
+
+        if low_ammo and action == "shoot":
+            reward += self.add_penalty("hud_low_ammo_shoot", -0.05)
+
+        if damage_flash:
+            reward += self.add_penalty("hud_damage_flash", -0.03)
+
+        reward += self.hud_status_reward(hud_result, action)
+
+        return reward
 
     def door_use_reward(self, action, game_state, scene_label, scene_confidence):
         """
@@ -654,37 +701,34 @@ class DoomEnv(gym.Env):
 
         # These are starting placeholders based on the coordinates your logs show.
         # Tune them as you collect better route logs.
-        route_zones = [
-            ("spawn_exit", 600, 360, 120, 0.50),
-            ("right_route", 625, 360, 120, 0.80),
-            ("door_area", 700, 420, 140, 1.00),
-            ("combat_corridor", 850, 400, 160, 1.50),
-            ("exit_route", 1000, 500, 180, 2.00),
-        ]
+        route_zones = self.level_guide.get("route_zones", [])
 
-        for idx, (name, tx, ty, radius, zone_reward) in enumerate(route_zones, start=1):
-            if name in self.route_zones_reached:
-                continue
+        position = (x, y)
 
-            dist = ((x - tx) ** 2 + (y - ty) ** 2) ** 0.5
+        zone_reward, reached_name, self.route_zones_reached = (
+            self.checkpoint_tracker.update_route_zones(
+                position=position,
+                route_zones=route_zones,
+                reached_zones=self.route_zones_reached,
+            )
+        )
 
-            if dist <= radius:
-                self.route_zones_reached.add(name)
-                self.route_progress_level = max(self.route_progress_level, idx)
-                self.best_route_progress_level = max(
-                    self.best_route_progress_level,
-                    self.route_progress_level,
-                )
+        if reached_name is not None:
+            self.route_progress_level += 1
+            self.best_route_progress_level = max(
+                self.best_route_progress_level,
+                self.route_progress_level,
+            )
 
-                reward += zone_reward
-                self.reward_manager.add(f"route_progress_{name}", zone_reward)
+            reward += zone_reward
+            self.reward_manager.add(f"route_progress_{reached_name}", zone_reward)
 
-                print(
-                    f"[route_progress] reached={name} "
-                    f"level={self.route_progress_level} "
-                    f"x={x:.1f} y={y:.1f} "
-                    f"reward={zone_reward:.2f}"
-                )
+            print(
+                f"[route_progress] reached={reached_name} "
+                f"level={self.route_progress_level} "
+                f"x={x:.1f} y={y:.1f} "
+                f"reward={zone_reward:.2f}"
+            )
 
         return reward
     
@@ -894,8 +938,35 @@ class DoomEnv(gym.Env):
         # -----------------------------------------------------
 
         pre_frame = self.observer.get_frame()
+
+        pre_gameplay_frame = self.frame_processor.make_model_frame(
+            pre_frame,
+            view_mode="gameplay_wide",
+            size=(160, 100),
+        )
+
+        pre_center_frame = self.frame_processor.make_model_frame(
+            pre_frame,
+            view_mode="gameplay_center",
+            size=(84, 84),
+        )
+
+        pre_hud_frame = self.frame_processor.make_model_frame(
+            pre_frame,
+            view_mode="hud",
+            size=(160, 32),
+        )
+
         pre_game_state = self.observer.get_game_state()
         pre_vision = self.detect_vision(pre_frame)
+
+        wall_sensor_state = self.wall_sensor.analyze(pre_frame)
+
+        pre_game_state["wall_sensor"] = wall_sensor_state
+        pre_game_state["left_wall_ratio"] = wall_sensor_state["left_ratio"]
+        pre_game_state["front_wall_ratio"] = wall_sensor_state["front_ratio"]
+        pre_game_state["right_wall_ratio"] = wall_sensor_state["right_ratio"]
+        pre_game_state["front_blocked"] = wall_sensor_state["front_blocked"]
 
         # -----------------------------------------------------
         # Pre-action object vision
@@ -920,6 +991,16 @@ class DoomEnv(gym.Env):
                 print(f"[pre_object_vision] prediction failed: {e}")
                 pre_object_result = None
 
+        pre_scene_result = self.scene_predictor.predict(
+        pre_gameplay_frame,
+        view_mode="gameplay_wide",
+        )
+
+        pre_object_result = self.object_predictor.predict(
+            pre_gameplay_frame,
+            view_mode="gameplay_wide",
+        )
+
         # -----------------------------------------------------
         # Pre-action learned scene prediction
         # -----------------------------------------------------
@@ -931,7 +1012,7 @@ class DoomEnv(gym.Env):
         pre_scene_probs = {}
 
         if self.scene_predictor is not None:
-            pre_scene_result = self.scene_predictor.predict(pre_frame)
+            pre_scene_result = self.scene_predictor.predict(pre_frame, view_mode="wide")
             pre_scene_label = pre_scene_result["label"]
             pre_scene_confidence = pre_scene_result["confidence"]
             pre_scene_probs = pre_scene_result["probs"]
@@ -1008,6 +1089,23 @@ class DoomEnv(gym.Env):
             distance_moved=None,
             motion=None,
             action=action,
+        )
+
+        pre_wall_info["left_ratio"] = max(
+            pre_wall_info.get("left_ratio", 0.0),
+            wall_sensor_state["left_ratio"],
+        )
+        pre_wall_info["front_ratio"] = max(
+            pre_wall_info.get("front_ratio", 0.0),
+            wall_sensor_state["front_ratio"],
+        )
+        pre_wall_info["right_ratio"] = max(
+            pre_wall_info.get("right_ratio", 0.0),
+            wall_sensor_state["right_ratio"],
+        )
+        pre_wall_info["front_wall"] = (
+            pre_wall_info.get("front_wall", False)
+            or wall_sensor_state["front_blocked"]
         )
 
         pre_game_state["scene_label"] = pre_scene_label
@@ -1160,6 +1258,13 @@ class DoomEnv(gym.Env):
         # These happen BEFORE perform_action(), so they affect the real keypress.
 
         # pre_wall_info was computed during the sensory override above.
+        if self.curriculum_stage < 3:
+            if pre_object_result is not None:
+                pre_object_result["present"] = [
+                    label for label in pre_object_result.get("present", [])
+                    if label != "enemy_visible"
+                ]
+                pre_object_result["scores"]["enemy_visible"] = 0.0
 
         # -----------------------------------------------------
         # Goal assist should NOT hijack PPO actions.
@@ -1294,19 +1399,19 @@ class DoomEnv(gym.Env):
                 distance_moved=None,
             )
 
-        if sensory_action is not None and sensory_action in self.get_allowed_actions():
-            before = action
-            action = sensory_action
-            pre_game_state["action"] = action
+            if sensory_action is not None and sensory_action in self.get_allowed_actions():
+                before = action
+                action = sensory_action
+                pre_game_state["action"] = action
 
-            print(
-                f"[sensory_pre_action] {before} -> {action} "
-                f"steps={self.sensory_emergency_steps} "
-                f"L={pre_wall_info.get('left_ratio', 0.0):.2f} "
-                f"F={pre_wall_info.get('front_ratio', 0.0):.2f} "
-                f"R={pre_wall_info.get('right_ratio', 0.0):.2f} "
-                f"scene={pre_scene_label} conf={pre_scene_confidence:.2f}"
-            )
+                print(
+                    f"[sensory_pre_action] {before} -> {action} "
+                    f"steps={self.sensory_emergency_steps} "
+                    f"L={pre_wall_info.get('left_ratio', 0.0):.2f} "
+                    f"F={pre_wall_info.get('front_ratio', 0.0):.2f} "
+                    f"R={pre_wall_info.get('right_ratio', 0.0):.2f} "
+                    f"scene={pre_scene_label} conf={pre_scene_confidence:.2f}"
+                )
 
 
         # -----------------------------------------------------
@@ -1510,6 +1615,13 @@ class DoomEnv(gym.Env):
             action=action,
         )
 
+        reward += self.wall_sensor_reward(
+            wall_sensor_state=wall_sensor_state,
+            action=action,
+            distance_moved=distance_moved,
+            motion=motion,
+        )
+
         game_state["distance_moved"] = distance_moved
         corner_trapped = self.detect_corner_trap(game_state)
         game_state["corner_trapped"] = corner_trapped
@@ -1701,12 +1813,6 @@ class DoomEnv(gym.Env):
         # -----------------------------------------------------
 
         current_weapon = str(game_state.get("weapon", "")).lower()
-        # If current weapon is already a strong general combat weapon,
-        # do not swap just because an enemy is visible.
-        good_general_weapon = current_weapon in ["shotgun", "chaingun", "plasma"]
-
-        if good_general_weapon and enemy_visible:
-            return None, f"keep_{current_weapon}_enemy_visible"
         ammo = game_state.get("ammo", 0)
         ammo_delta = game_state.get("ammo_delta", 0)
         weapon_delta = game_state.get("weapon_delta", 0)
@@ -1814,29 +1920,12 @@ class DoomEnv(gym.Env):
             self.reward_manager.add("successful_retrace_escape", 0.8)
 
         # -----------------------------------------------------
-        # Sensory emergency override
-        # -----------------------------------------------------
-        # Only override in serious cases. Normal navigation should still
-        # be handled by PPO + existing helpers for now.
-        # -----------------------------------------------------
         # Sensory emergency logging only
         # -----------------------------------------------------
-        # SensoryModel can detect stuck/wall/spawn traps, but it should not
-        # hijack PPO actions while we are trying to train a stable policy.
-
-        if self.enable_sensory_action_override:
-            sensory_recommended_action = sensory_state.get("recommended_action")
-            action = sensory_recommended_action
-
-            if action not in self.get_allowed_actions():
-                action = "turn_right"
-
-                print(
-                    f"[override] sensory_emergency: {before} -> {action} "
-                    f"situation={sensory_state['situation']}"
-                )
-
-            game_state["action"] = action
+        # Do not mutate action here. Doom already received the keypress.
+        # Real sensory emergency control happens pre-action.
+        sensory_recommended_action = sensory_state.get("recommended_action")
+        game_state["sensory_recommended_action"] = sensory_recommended_action
 
         director_state = self.route_director.evaluate(
             game_state=game_state,
@@ -2346,6 +2435,13 @@ class DoomEnv(gym.Env):
         # -----------------------------------------------------
         # Stage 3 combat progression
         # -----------------------------------------------------
+
+        if self.curriculum_stage < 3 and object_result is not None:
+            object_result["present"] = [
+                label for label in object_result.get("present", [])
+                if label != "enemy_visible"
+            ]
+            object_result["scores"]["enemy_visible"] = 0.0
 
         if self.curriculum_stage == 3:
             movement_actions = [
@@ -2970,6 +3066,8 @@ class DoomEnv(gym.Env):
     # ---------------------------------------------------------
     # Tracking / recording helpers
     # ---------------------------------------------------------
+
+    
     def normalize_weapon_name(self, weapon_name):
         weapon = str(weapon_name or "").lower()
 
@@ -3816,11 +3914,11 @@ class DoomEnv(gym.Env):
 
         front_blocked = (
             wall_info.get("front_wall", False)
-            or front_ratio >= 0.58
+            or front_ratio >= 0.62
             or (
                 scene_label in ["front_wall", "obstacle", "boundary_or_stuck_wall"]
                 and scene_confidence >= 0.85
-                and front_ratio >= 0.35
+                and front_ratio >= 0.45
             )
         )
 
@@ -4475,6 +4573,55 @@ class DoomEnv(gym.Env):
             return "move_backward"
 
         return action
+    
+    def wall_sensor_reward(self, wall_sensor_state, action, distance_moved, motion):
+        """
+        Reward shaping for visible wall/obstacle avoidance.
+
+        This does not force actions. It teaches the policy that pushing into
+        blocked geometry is bad and escaping from pressure is good.
+        """
+
+        if not wall_sensor_state:
+            return 0.0
+
+        reward = 0.0
+
+        front_blocked = wall_sensor_state.get("front_blocked", False)
+        near_wall = wall_sensor_state.get("near_wall", False)
+        obstacle_pressure = wall_sensor_state.get("obstacle_pressure", 0.0)
+        safest = wall_sensor_state.get("safest_escape_direction")
+
+        movement_action = action in [
+            "move_forward",
+            "move_backward",
+            "strafe_left",
+            "strafe_right",
+        ]
+
+        if action == "move_forward" and front_blocked and distance_moved < 1.0:
+            reward += self.add_penalty("wall_sensor_forward_blocked", -1.5)
+
+        if movement_action and near_wall and distance_moved < 0.5 and motion < 1.0:
+            reward += self.add_penalty("wall_sensor_no_progress_near_wall", -1.0)
+
+        if near_wall and action in ["move_backward", "turn_left", "turn_right", "strafe_left", "strafe_right"]:
+            reward += 0.15
+            self.reward_manager.add("wall_sensor_escape_action", 0.15)
+
+        if safest == "right" and action in ["turn_right", "strafe_right"]:
+            reward += 0.08
+            self.reward_manager.add("wall_sensor_escape_right", 0.08)
+
+        if safest == "left" and action in ["turn_left", "strafe_left"]:
+            reward += 0.08
+            self.reward_manager.add("wall_sensor_escape_left", 0.08)
+
+        if obstacle_pressure < 0.25 and action == "move_forward" and distance_moved > 3.0:
+            reward += 0.05
+            self.reward_manager.add("wall_sensor_open_forward", 0.05)
+
+        return reward
 
 
     def sanitize_action(self, action, game_state, enemy_visible):

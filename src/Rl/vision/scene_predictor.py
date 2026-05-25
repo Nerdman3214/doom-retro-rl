@@ -63,16 +63,17 @@ class ScenePredictor:
         model.classifier[-1] = nn.Linear(in_features, num_classes)
         return model
 
-    def predict(self, frame):
+    def predict(self, frame, view_mode="center"):
         """
-        Predict the scene class from a BGR OpenCV frame.
-        Returns:
-            {
-                "label": str,
-                "confidence": float,
-                "probs": dict
-            }
+        Predict the scene class from a frame.
+
+        view_mode is accepted so DoomEnv can call:
+            predict(frame, view_mode="wide")
+
+        For now, this method does NOT require FrameProcessor.
+        The trained classifier still uses the normal torchvision resize transform.
         """
+
         if frame is None or frame.size == 0:
             return {
                 "label": "unclear",
@@ -80,10 +81,14 @@ class ScenePredictor:
                 "probs": {},
             }
 
-        # OpenCV uses BGR. PIL expects RGB.
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(rgb)
+        # Some screenshot paths may return BGRA instead of BGR/RGB.
+        if hasattr(frame, "shape") and len(frame.shape) == 3 and frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
+        # Existing project convention: env frames are OpenCV-style BGR.
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        img = Image.fromarray(rgb)
         x = self.transform(img).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
@@ -91,7 +96,6 @@ class ScenePredictor:
             probs_tensor = torch.softmax(logits, dim=1)[0]
 
         top_prob, top_idx = probs_tensor.max(dim=0)
-
         label = self.classes[top_idx.item()]
         confidence = float(top_prob.item())
 

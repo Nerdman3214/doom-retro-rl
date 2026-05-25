@@ -2,6 +2,8 @@ import sys
 import os
 import time
 
+from env.vizdoom_env import VizDoomEnv
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sb3_contrib import RecurrentPPO
@@ -43,10 +45,12 @@ def make_env(launch_doom=True, record=True):
         record=record,
     )
 
+    
     time.sleep(2)
 
     env = NormalizeObservationWrapper(env)
     env = Monitor(env, filename=os.path.join(LOG_DIR, "monitor.csv"))
+    
 
     return env
 

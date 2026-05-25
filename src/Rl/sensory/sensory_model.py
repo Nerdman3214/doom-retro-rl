@@ -279,3 +279,23 @@ class SensoryModel:
         self.situation_history.append(situation)
 
         return result
+    
+    def should_override_action(self, situation, recommended_action, wall_info, stuck_counter, wall_contact_steps):
+        if recommended_action is None:
+            return False
+
+        if situation in ["normal_navigation", "right_route_area", "secret_side_area"]:
+            return False
+
+        front_ratio = float(wall_info.get("front_ratio", 0.0))
+        left_ratio = float(wall_info.get("left_ratio", 0.0))
+        right_ratio = float(wall_info.get("right_ratio", 0.0))
+
+        real_wall_problem = (
+            front_ratio >= 0.55
+            or stuck_counter >= 8
+            or wall_contact_steps >= 3
+            or (front_ratio >= 0.45 and left_ratio >= 0.45 and right_ratio >= 0.45)
+        )
+
+        return real_wall_problem

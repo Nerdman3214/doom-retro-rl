@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from torchvision import transforms, models
 from PIL import Image
+from observation.frame_processor import FrameProcessor
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +56,7 @@ class ObjectPredictor:
 
         self.device = torch.device(device)
         self.thresholds = thresholds or OBJECT_THRESHOLDS
+        self.frame_processor = FrameProcessor()
 
         with open(self.class_path, "r") as f:
             class_data = json.load(f)
@@ -103,7 +105,26 @@ class ObjectPredictor:
 
         raise TypeError(f"Unsupported frame type: {type(frame)}")
 
-    def predict(self, frame):
+    def predict(self, frame, view_mode="wide"):
+        """
+        Multi-label object prediction.
+
+        view_mode is accepted for DoomEnv compatibility.
+        For now, do not require FrameProcessor here.
+        The model still uses its normal torchvision resize transform.
+        """
+
+        if frame is None:
+            return {
+                "labels": {},
+                "scores": {},
+                "present": [],
+            }
+
+        # Handle BGRA screenshots safely.
+        if hasattr(frame, "shape") and len(frame.shape) == 3 and frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
+
         image = self._to_pil(frame)
         x = self.transform(image).unsqueeze(0).to(self.device)
 
@@ -124,7 +145,10 @@ class ObjectPredictor:
         return {
             "labels": labels,
             "scores": scores,
-            "present": [label for label, value in labels.items() if value],
+            "present": [
+                label for label, value in labels.items()
+                if value
+            ],
         }
 
     def predict_bgr(self, frame_bgr):
