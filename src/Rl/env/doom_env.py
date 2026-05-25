@@ -127,7 +127,7 @@ class DoomEnv(gym.Env):
         self.sensory_model = SensoryModel()
         self.route_director = RouteDirector()
         self.retrace_navigator = RetraceNavigator()
-        self.enable_retrace_navigator = True
+        self.enable_retrace_navigator = False
         
         # -----------------------------------------------------
         # Helper control switches
@@ -135,7 +135,7 @@ class DoomEnv(gym.Env):
         # Keep these False while PPO is learning.
         # These systems should guide with reward/logging, not hijack actions.
         self.enable_sensory_action_override = True
-        self.enable_goal_assist_action_override = True
+        self.enable_goal_assist_action_override = False
 
         # Keep wall safety on, but only for true front-wall emergencies.
         self.enable_vision_blocker_override = True
@@ -1157,6 +1157,13 @@ class DoomEnv(gym.Env):
         # These happen BEFORE perform_action(), so they affect the real keypress.
 
         # pre_wall_info was computed during the sensory override above.
+        if self.curriculum_stage < 3:
+            if pre_object_result is not None:
+                pre_object_result["present"] = [
+                    label for label in pre_object_result.get("present", [])
+                    if label != "enemy_visible"
+                ]
+                pre_object_result["scores"]["enemy_visible"] = 0.0
 
         # -----------------------------------------------------
         # Goal assist should NOT hijack PPO actions.
@@ -1280,22 +1287,30 @@ class DoomEnv(gym.Env):
         sensory_action = None
 
         if self.enable_sensory_action_override:
-            sensory_action = self.sensory_emergency_action(...)
+            sensory_action = self.sensory_emergency_action(
+                action=action,
+                scene_label=pre_scene_label,
+                scene_confidence=pre_scene_confidence,
+                wall_info=pre_wall_info,
+                stuck_counter=self.stuck_counter,
+                wall_contact_steps=self.wall_contact_steps,
+                motion=None,
+                distance_moved=None,
+            )
 
-            if sensory_action is not None:
+            if sensory_action is not None and sensory_action in self.get_allowed_actions():
                 before = action
                 action = sensory_action
-                print(f"[sensory_pre_action] {before} -> {action}")
                 pre_game_state["action"] = action
 
-            print(
-                f"[sensory_pre_action] {before} -> {action} "
-                f"steps={self.sensory_emergency_steps} "
-                f"L={pre_wall_info.get('left_ratio', 0.0):.2f} "
-                f"F={pre_wall_info.get('front_ratio', 0.0):.2f} "
-                f"R={pre_wall_info.get('right_ratio', 0.0):.2f} "
-                f"scene={pre_scene_label} conf={pre_scene_confidence:.2f}"
-            )
+                print(
+                    f"[sensory_pre_action] {before} -> {action} "
+                    f"steps={self.sensory_emergency_steps} "
+                    f"L={pre_wall_info.get('left_ratio', 0.0):.2f} "
+                    f"F={pre_wall_info.get('front_ratio', 0.0):.2f} "
+                    f"R={pre_wall_info.get('right_ratio', 0.0):.2f} "
+                    f"scene={pre_scene_label} conf={pre_scene_confidence:.2f}"
+                )
 
 
         # -----------------------------------------------------
@@ -1690,12 +1705,6 @@ class DoomEnv(gym.Env):
         # -----------------------------------------------------
 
         current_weapon = str(game_state.get("weapon", "")).lower()
-        # If current weapon is already a strong general combat weapon,
-        # do not swap just because an enemy is visible.
-        good_general_weapon = current_weapon in ["shotgun", "chaingun", "plasma"]
-
-        if good_general_weapon and enemy_visible:
-            return None, f"keep_{current_weapon}_enemy_visible"
         ammo = game_state.get("ammo", 0)
         ammo_delta = game_state.get("ammo_delta", 0)
         weapon_delta = game_state.get("weapon_delta", 0)
@@ -1803,29 +1812,12 @@ class DoomEnv(gym.Env):
             self.reward_manager.add("successful_retrace_escape", 0.8)
 
         # -----------------------------------------------------
-        # Sensory emergency override
-        # -----------------------------------------------------
-        # Only override in serious cases. Normal navigation should still
-        # be handled by PPO + existing helpers for now.
-        # -----------------------------------------------------
         # Sensory emergency logging only
         # -----------------------------------------------------
-        # SensoryModel can detect stuck/wall/spawn traps, but it should not
-        # hijack PPO actions while we are trying to train a stable policy.
-
-        if self.enable_sensory_action_override:
-            sensory_recommended_action = sensory_state.get("recommended_action")
-            action = sensory_recommended_action
-
-            if action not in self.get_allowed_actions():
-                action = "turn_right"
-
-                print(
-                    f"[override] sensory_emergency: {before} -> {action} "
-                    f"situation={sensory_state['situation']}"
-                )
-
-            game_state["action"] = action
+        # Do not mutate action here. Doom already received the keypress.
+        # Real sensory emergency control happens pre-action.
+        sensory_recommended_action = sensory_state.get("recommended_action")
+        game_state["sensory_recommended_action"] = sensory_recommended_action
 
         director_state = self.route_director.evaluate(
             game_state=game_state,
@@ -2335,6 +2327,13 @@ class DoomEnv(gym.Env):
         # -----------------------------------------------------
         # Stage 3 combat progression
         # -----------------------------------------------------
+
+        if self.curriculum_stage < 3 and object_result is not None:
+            object_result["present"] = [
+                label for label in object_result.get("present", [])
+                if label != "enemy_visible"
+            ]
+            object_result["scores"]["enemy_visible"] = 0.0
 
         if self.curriculum_stage == 3:
             movement_actions = [
@@ -3805,11 +3804,11 @@ class DoomEnv(gym.Env):
 
         front_blocked = (
             wall_info.get("front_wall", False)
-            or front_ratio >= 0.58
+            or front_ratio >= 0.62
             or (
                 scene_label in ["front_wall", "obstacle", "boundary_or_stuck_wall"]
                 and scene_confidence >= 0.85
-                and front_ratio >= 0.35
+                and front_ratio >= 0.45
             )
         )
 
