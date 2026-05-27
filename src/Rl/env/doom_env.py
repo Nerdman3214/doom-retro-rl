@@ -1064,6 +1064,25 @@ class DoomEnv(gym.Env):
 
         wall_sensor_state = self.wall_sensor.analyze(pre_frame)
 
+        pre_wall_info = self._wall_direction_info(pre_frame)
+
+        pre_wall_info["left_ratio"] = max(
+            pre_wall_info.get("left_ratio", 0.0),
+            wall_sensor_state["left_ratio"],
+        )
+        pre_wall_info["front_ratio"] = max(
+            pre_wall_info.get("front_ratio", 0.0),
+            wall_sensor_state["front_ratio"],
+        )
+        pre_wall_info["right_ratio"] = max(
+            pre_wall_info.get("right_ratio", 0.0),
+            wall_sensor_state["right_ratio"],
+        )
+        pre_wall_info["front_wall"] = (
+            pre_wall_info.get("front_wall", False)
+            or wall_sensor_state["front_blocked"]
+        )
+
         pre_game_state["wall_sensor"] = wall_sensor_state
         pre_game_state["left_wall_ratio"] = wall_sensor_state["left_ratio"]
         pre_game_state["front_wall_ratio"] = wall_sensor_state["front_ratio"]
@@ -1093,15 +1112,21 @@ class DoomEnv(gym.Env):
                 print(f"[pre_object_vision] prediction failed: {e}")
                 pre_object_result = None
 
-        pre_scene_result = self.scene_predictor.predict(
-            pre_gameplay_frame,
-            view_mode="gameplay_wide",
-        )
+        pre_scene_result = None
 
-        pre_object_result = self.object_predictor.predict(
-            pre_gameplay_frame,
-            view_mode="gameplay_wide",
-        )
+        if self.scene_predictor is not None:
+            pre_scene_result = self.scene_predictor.predict(
+                pre_gameplay_frame,
+                view_mode="gameplay_wide",
+            )
+
+        pre_object_result = None
+
+        if self.object_predictor is not None:
+            pre_object_result = self.object_predictor.predict(
+                pre_gameplay_frame,
+                view_mode="gameplay_wide",
+            )
 
         # -----------------------------------------------------
         # Pre-action learned scene prediction
@@ -1205,6 +1230,48 @@ class DoomEnv(gym.Env):
             before = action
             action = pending
             pre_game_state["action"] = action
+
+            # -----------------------------------------------------
+            # Pending retrace action
+            # -----------------------------------------------------
+            # Retrace is computed after the previous action, so we apply it
+            # at the beginning of the next step before exploration can override it.
+            if (
+                self.pending_retrace_action is not None
+                and self.pending_retrace_action in self.get_allowed_actions()
+            ):
+                pending = self.pending_retrace_action
+
+                front_blocked = (
+                    pre_wall_info.get("front_wall", False)
+                    or pre_wall_info.get("front_ratio", 0.0) >= 0.55
+                )
+
+                if pending == "move_forward" and front_blocked:
+                    before_pending = pending
+
+                    if pre_wall_info.get("left_ratio", 0.0) < pre_wall_info.get("right_ratio", 0.0):
+                        pending = "turn_left"
+                    else:
+                        pending = "turn_right"
+
+                    print(
+                        f"[override] pending_retrace_safety: "
+                        f"{before_pending} -> {pending} "
+                        f"front={pre_wall_info.get('front_ratio', 0.0):.2f}"
+                    )
+
+            before = action
+            action = pending
+            pre_game_state["action"] = action
+            self.pending_retrace_action = None
+            self.retrace_lock_steps = max(self.retrace_lock_steps, 6)
+            can_use_exploration_override = False
+
+            print(
+                f"[override] pending_retrace: {before} -> {action} "
+                f"lock={self.retrace_lock_steps}"
+            )
             self.pending_retrace_action = None
             self.retrace_lock_steps = max(self.retrace_lock_steps, 6)
             can_use_exploration_override = False
@@ -1223,7 +1290,7 @@ class DoomEnv(gym.Env):
         # -----------------------------------------------------
         # The neural classifier can call spawn-boundary/corner views open_path.
         # The sensory layer corrects that using position memory and wall ratios.
-        pre_wall_info = self._wall_direction_info(pre_frame)
+        
         pre_scene_label, pre_scene_confidence = self.sensory_scene_override(
             scene_label=pre_scene_label,
             scene_confidence=pre_scene_confidence,
