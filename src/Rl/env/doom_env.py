@@ -402,6 +402,9 @@ class DoomEnv(gym.Env):
         self.dead_target_ignore_steps = 0
         self.last_aim_assist_step = -100
         self.last_shot_step = -100
+        self.current_weapon_name = "pistol"
+        self.has_berserk = False
+        self.berserk_steps_remaining = 0
 
         self.consecutive_melee_steps = 0
         self.last_melee_step = -100
@@ -1774,6 +1777,23 @@ class DoomEnv(gym.Env):
         # -----------------------------------------------------
         # Execute action
         # -----------------------------------------------------
+        enemy_distance_tiles = pre_game_state.get("enemy_distance_tiles")
+        enemy_count = pre_game_state.get("enemy_count", 1)
+        current_weapon = str(pre_game_state.get("weapon", self.current_weapon_name)).lower()
+
+        before_weapon = action
+        action = self.tactical_weapon_action(
+            action=action,
+            enemy_visible=pre_enemy_visible,
+            enemy_centered=pre_enemy_centered,
+            enemy_distance_tiles=enemy_distance_tiles,
+            enemy_count=enemy_count,
+            ammo=pre_game_state.get("ammo", 0),
+            current_weapon=current_weapon,
+        )
+
+        if action != before_weapon:
+            print(f"[override] tactical_weapon: {before_weapon} -> {action}")
 
         action_prior_reward, action_prior_result = self.action_prior_advice_reward(
             frame=pre_frame,
@@ -5258,6 +5278,56 @@ class DoomEnv(gym.Env):
             self.reward_manager.add("wall_sensor_open_forward", 0.05)
 
         return reward
+    
+
+    def tactical_weapon_action(
+        self,
+        action,
+        enemy_visible,
+        enemy_centered,
+        enemy_distance_tiles,
+        enemy_count,
+        ammo,
+        current_weapon,
+    ):
+        """
+        Situational weapon logic.
+
+        This does not blindly swap weapons. It only requests a weapon change
+        when combat context makes the current weapon bad.
+        """
+
+        if not enemy_visible:
+            return action
+
+        if self._step_count - self.last_weapon_swap_step < 20:
+            return action
+
+        # Berserk/fist logic: only use fists when very close.
+        if self.has_berserk and enemy_distance_tiles is not None:
+            if enemy_distance_tiles <= 1.5:
+                if current_weapon not in ["fist", "chainsaw", "riptor"]:
+                    self.last_weapon_swap_step = self._step_count
+                    return "swap_weapon"
+            elif current_weapon in ["fist", "chainsaw", "riptor"]:
+                self.last_weapon_swap_step = self._step_count
+                return "swap_weapon"
+
+        # Rocket launcher: good for groups, dangerous up close.
+        if enemy_count >= 2 and enemy_distance_tiles is not None:
+            if enemy_distance_tiles >= 4:
+                if current_weapon not in ["rocket", "rocket_launcher", "rpg"]:
+                    self.last_weapon_swap_step = self._step_count
+                    return "swap_weapon"
+
+        # Pistol/shotgun/chaingun/plasma logic.
+        if enemy_distance_tiles is not None:
+            if enemy_distance_tiles >= 8:
+                if current_weapon in ["fist", "chainsaw", "riptor"]:
+                    self.last_weapon_swap_step = self._step_count
+                    return "swap_weapon"
+
+        return action
 
 
     def sanitize_action(self, action, game_state, enemy_visible):
@@ -5334,6 +5404,29 @@ class DoomEnv(gym.Env):
             return action
 
         return action
+    
+    def update_powerup_state(self, game_state, object_result=None):
+        """
+        Track temporary or semi-temporary powerups.
+
+        Berserk should not mean always use fists. It means fists become viable
+        when enemies are close.
+        """
+
+        if object_result:
+            present = object_result.get("present", [])
+
+            if "powerup_berserk" in present or "berserk_pack" in present:
+                self.has_berserk = True
+                self.berserk_steps_remaining = 2500
+
+        if self.berserk_steps_remaining > 0:
+            self.berserk_steps_remaining -= 1
+        else:
+            self.has_berserk = False
+
+        game_state["has_berserk"] = self.has_berserk
+        game_state["berserk_steps_remaining"] = self.berserk_steps_remaining
 
     def _reset_stage_counters(self):
         self.movement_count = 0
