@@ -60,6 +60,9 @@ from sensory.sensory_model import SensoryModel
 from director.route_director import RouteDirector
 from navigation.retrace_navigator import RetraceNavigator
 from observation.wall_sensor import WallSensor
+from env.shared_doom_logic import SharedDoomLogic
+from perception.prediction_adapter import build_doomretro_game_state
+from imitation.action_prior_advisor import ActionPriorAdvisor
 
 try:
     from observation.vision_detector import VisionDetector
@@ -92,7 +95,7 @@ DOOM_IWAD = "/usr/share/games/doom/freedoom1.wad"
 class DoomEnv(gym.Env):
     metadata = {"render_modes": []}
 
-    def __init__(self, launch_doom=True, record=True):
+    def __init__(self, launch_doom=True, record=False, training_mode=True):
         super().__init__()
 
         self.game_process = None
@@ -135,7 +138,41 @@ class DoomEnv(gym.Env):
         self.sensory_model = SensoryModel()
         self.route_director = RouteDirector()
         self.retrace_navigator = RetraceNavigator()
-        self.enable_retrace_navigator = False
+        self.enable_retrace_navigator = True
+        self.shared_logic = SharedDoomLogic()
+        self.previous_shared_game_state = None
+        self.last_shared_debug = {}
+        self.use_shared_logic_reward = True
+        self.use_shared_logic_reward_blend = True
+        self.shared_logic_reward_scale = 0.10
+        self.shared_logic_reward_clip = 0.25
+        self.use_shared_movement_reward = True
+        self.shared_movement_reward_scale = 1.0
+        self.use_shared_wall_reward = True
+        self.shared_wall_reward_scale = 1.0
+        self.use_shared_route_curriculum_reward = True
+        self.shared_route_curriculum_reward_scale = 1.0
+        self.use_shared_object_scene_reward = True
+        self.shared_object_scene_reward_scale = 1.0
+        self.retrace_lock_steps = 0
+        self.pending_retrace_action = None
+        self.secret_area_reached_this_episode = False
+        self.secrets_found_this_episode = set()
+        self.training_mode = training_mode
+
+        # Full replacement mode exists, but keep it OFF until tests pass.
+        self.use_full_shared_reward_mode = True
+        self.full_shared_reward_scale = 1.0
+        self.full_shared_reward_clip = 5.0
+
+        self.old_route_reward_scale = 0.25
+        self.old_curriculum_reward_scale = 0.25
+
+        self.old_wall_reward_scale = 0.25
+        self.old_stuck_reward_scale = 0.25
+        self.old_object_reward_scale = 0.25
+        self.old_scene_reward_scale = 0.25
+        self.old_combat_reward_scale = 0.25
         
         # -----------------------------------------------------
         # Helper control switches
@@ -143,7 +180,7 @@ class DoomEnv(gym.Env):
         # Keep these False while PPO is learning.
         # These systems should guide with reward/logging, not hijack actions.
         self.enable_sensory_action_override = True
-        self.enable_goal_assist_action_override = False
+        self.enable_goal_assist_action_override = True
 
         # Keep wall safety on, but only for true front-wall emergencies.
         self.enable_vision_blocker_override = True
@@ -254,8 +291,43 @@ class DoomEnv(gym.Env):
         # -----------------------------------------------------
         # RL spaces
         # -----------------------------------------------------
+        if self.training_mode:
+            self.collect_vision_frames = False
+            self.enable_smart_clips = False
+            self.enable_death_review_capture = False
+        else:
+            self.enable_smart_clips = True
+            self.enable_death_review_capture = True
 
         self.action_space = spaces.Discrete(len(self.actions))
+        self.use_action_prior_advice = True
+        self.action_prior_reward_scale = 0.005
+        self.action_prior_min_confidence = 0.70
+
+        action_prior_path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "checkpoints",
+            "action_prior_from_teacher_balanced.pt",
+        )
+
+        try:
+            self.action_prior_advisor = ActionPriorAdvisor(
+                checkpoint_path=action_prior_path,
+                action_names=[
+                    "move_forward",
+                    "turn_left",
+                    "turn_right",
+                    "strafe_left",
+                    "strafe_right",
+                    "move_backward",
+                    "shoot",
+                    "use",
+                ],
+            )
+        except Exception as e:
+            print(f"[action_prior] disabled: {e}")
+            self.action_prior_advisor = None
         self.observation_space = spaces.Box(
             low=0,
             high=255,
@@ -607,7 +679,6 @@ class DoomEnv(gym.Env):
         if damage_flash:
             reward += self.add_penalty("hud_damage_flash", -0.03)
 
-        reward += self.hud_status_reward(hud_result, action)
 
         return reward
 
@@ -785,6 +856,8 @@ class DoomEnv(gym.Env):
         self.sensory_model.reset()
         self.route_director.reset()
         self.retrace_navigator.reset()
+        self.retrace_lock_steps = 0
+        self.pending_retrace_action = None
 
         self.wall_escape_mode = False
         self.wall_escape_step = 0
@@ -839,6 +912,9 @@ class DoomEnv(gym.Env):
         self.combat_survival_steps = 0
         self.dodge_when_damaged_count = 0
         self.retreat_from_close_enemy_count = 0
+        self.shared_logic.reset_episode()
+        self.previous_shared_game_state = None
+        self.last_shared_debug = {}
 
         self.reward_manager.reset()
         self.checkpoint_tracker.reset()
@@ -849,7 +925,7 @@ class DoomEnv(gym.Env):
 
         # Do not clear self.secret_use_locations every episode.
         # This memory should persist across episodes.
-        pass
+    
 
         if hasattr(self.observer, "reset_tracking"):
             self.observer.reset_tracking()
@@ -909,7 +985,18 @@ class DoomEnv(gym.Env):
         reward = 0.0
         terminated = False
         truncated = False
-        info = {}
+
+        scene_label = "unclear"
+        scene_confidence = 0.0
+        scene_probs = {}
+
+        object_result = None
+        hud_result = None
+        pre_hud_result = None
+        info = {
+            "shared_logic_debug": self.last_shared_debug,
+            "use_shared_logic_reward": self.use_shared_logic_reward,
+            }
 
         safe_frame = self.observer.build()
         safe_observation = self.frame_stack.add_frame(safe_frame)
@@ -920,6 +1007,21 @@ class DoomEnv(gym.Env):
             return safe_observation, float(reward), terminated, truncated, info
 
         action = self.actions[action_index]
+
+        if self.retrace_lock_steps > 0:
+            self.retrace_lock_steps -= 1
+
+        can_use_exploration_override = (
+            self.retrace_lock_steps <= 0
+            and self.stuck_counter < 4
+            and self.wall_contact_steps < 2
+            and not getattr(self.retrace_navigator, "active", False)
+            and not self.sensory_emergency_active
+        )
+
+        object_result = None
+        hud_result = None
+
         decision_trace = {
             "ppo_action": action,
             "final_action": None,
@@ -992,8 +1094,8 @@ class DoomEnv(gym.Env):
                 pre_object_result = None
 
         pre_scene_result = self.scene_predictor.predict(
-        pre_gameplay_frame,
-        view_mode="gameplay_wide",
+            pre_gameplay_frame,
+            view_mode="gameplay_wide",
         )
 
         pre_object_result = self.object_predictor.predict(
@@ -1074,6 +1176,48 @@ class DoomEnv(gym.Env):
         pre_game_state["scene_probs"] = pre_scene_probs
         pre_game_state["action"] = action
 
+        if (
+            self.pending_retrace_action is not None
+            and self.pending_retrace_action in self.get_allowed_actions()
+        ):
+            before = action
+            pending = self.pending_retrace_action
+
+            front_blocked = (
+                pre_wall_info.get("front_wall", False)
+                or pre_wall_info.get("front_ratio", 0.0) >= 0.55
+            )
+
+            if pending == "move_forward" and front_blocked:
+                before_pending = pending
+
+                if pre_wall_info.get("left_ratio", 0.0) < pre_wall_info.get("right_ratio", 0.0):
+                    pending = "turn_left"
+                else:
+                    pending = "turn_right"
+
+                print(
+                    f"[override] pending_retrace_safety: "
+                    f"{before_pending} -> {pending} "
+                    f"front={pre_wall_info.get('front_ratio', 0.0):.2f}"
+                )
+
+            before = action
+            action = pending
+            pre_game_state["action"] = action
+            self.pending_retrace_action = None
+            self.retrace_lock_steps = max(self.retrace_lock_steps, 6)
+            can_use_exploration_override = False
+            pre_game_state["action"] = action
+            self.pending_retrace_action = None
+            self.retrace_lock_steps = max(self.retrace_lock_steps, 6)
+            can_use_exploration_override = False
+
+            print(
+                f"[override] pending_retrace: {before} -> {action} "
+                f"lock={self.retrace_lock_steps}"
+            )
+
         # -----------------------------------------------------
         # Pre-action sensory override
         # -----------------------------------------------------
@@ -1127,17 +1271,26 @@ class DoomEnv(gym.Env):
         # 2) Stage 0/1/2 are movement/door learning only.
         # Combat helpers must not hijack these stages.
         if self.curriculum_stage < 3:
-            before = action
-            action = self.exploration_assist_action(
-                action=action,
-                enemy_visible=False,
-                distance_moved=None,
-                motion=None,
-            )
-            if action != before:
-                print(f"[override] exploration: {before} -> {action}")
-
-                decision_trace["changes"].append(("exploration", before, action))
+            if can_use_exploration_override:
+                before = action
+                action = self.exploration_assist_action(
+                    action=action,
+                    enemy_visible=False,
+                    distance_moved=None,
+                    motion=None,
+                )
+                if action != before:
+                    print(f"[override] exploration: {before} -> {action}")
+                    decision_trace["changes"].append(("exploration", before, action))
+            else:
+                if self.retrace_lock_steps > 0 or getattr(self.retrace_navigator, "active", False):
+                    print(
+                        f"[override_blocked] exploration blocked "
+                        f"lock={self.retrace_lock_steps} "
+                        f"retrace_active={getattr(self.retrace_navigator, 'active', False)} "
+                        f"stuck={self.stuck_counter} "
+                        f"wall={self.wall_contact_steps}"
+                    )
 
             before = action
             action = self.wall_assist_action(
@@ -1183,7 +1336,7 @@ class DoomEnv(gym.Env):
             if not aimed_this_step:
                 before = action
                 pre_game_state["action"] = action
-                tactical_action = None #self.combat_tactics.choose_combat_action(pre_game_state)
+                tactical_action = None   #self.combat_tactics.choose_combat_action(pre_game_state)
 
                 if tactical_action is not None:
                     # If route stages have made no progress, do not replace
@@ -1219,15 +1372,25 @@ class DoomEnv(gym.Env):
                     if action != before:
                         print(f"[override] aim_assist: {before} -> {action}")
 
-            before = action
-            action = self.exploration_assist_action(
-                action=action,
-                enemy_visible=pre_enemy_visible,
-                distance_moved=None,
-                motion=None,
-            )
-            if action != before:
-                print(f"[override] exploration: {before} -> {action}")
+            if can_use_exploration_override:
+                before = action
+                action = self.exploration_assist_action(
+                    action=action,
+                    enemy_visible=pre_enemy_visible,
+                    distance_moved=None,
+                    motion=None,
+                )
+                if action != before:
+                    print(f"[override] exploration: {before} -> {action}")
+            else:
+                if self.retrace_lock_steps > 0 or getattr(self.retrace_navigator, "active", False):
+                    print(
+                        f"[override_blocked] exploration blocked "
+                        f"lock={self.retrace_lock_steps} "
+                        f"retrace_active={getattr(self.retrace_navigator, 'active', False)} "
+                        f"stuck={self.stuck_counter} "
+                        f"wall={self.wall_contact_steps}"
+                    )
 
             before = action
             action = self.wall_assist_action(
@@ -1413,6 +1576,8 @@ class DoomEnv(gym.Env):
                     f"scene={pre_scene_label} conf={pre_scene_confidence:.2f}"
                 )
 
+        
+
 
         # -----------------------------------------------------
         # Pre-action wall bubble safety
@@ -1430,12 +1595,19 @@ class DoomEnv(gym.Env):
 
         before_wall_bubble = action
 
-        if not self.sensory_emergency_active:
+        if (
+            not self.sensory_emergency_active
+            and self.retrace_lock_steps <= 0
+            and not getattr(self.retrace_navigator, "active", False)
+        ):
             action = self.wall_bubble_action(action, pre_wall_bubble)
         else:
-            # Sensory emergency is already choosing the escape plan.
-            # Do not let wall bubble fight it.
-            action = action
+            if self.retrace_lock_steps > 0 or getattr(self.retrace_navigator, "active", False):
+                print(
+                    f"[override_blocked] wall_bubble blocked "
+                    f"lock={self.retrace_lock_steps} "
+                    f"retrace_ctive={getattr(self.retrace_navigator, 'active', False)}"
+                )
 
         if action != before_wall_bubble:
             print(
@@ -1536,6 +1708,18 @@ class DoomEnv(gym.Env):
         # Execute action
         # -----------------------------------------------------
 
+        action_prior_reward, action_prior_result = self.action_prior_advice_reward(
+            frame=pre_frame,
+            action=action,
+        )
+
+        reward += action_prior_reward
+
+        if action_prior_result is not None:
+            info["action_prior"] = action_prior_result
+            self.last_shared_debug["action_prior"] = action_prior_result
+            self.last_shared_debug["action_prior_reward"] = action_prior_reward
+
         if action == "swap_weapon":
             selected = self.smart_weapon_select(
                 game_state=pre_game_state,
@@ -1578,6 +1762,34 @@ class DoomEnv(gym.Env):
         red_ratio = self.frame_processor.red_flash_ratio(raw_frame)
 
         game_state = self.observer.get_game_state()
+
+        try:
+            shared_game_state = self._build_shared_game_state(
+                base_game_state=game_state,
+                object_result=object_result or pre_object_result,
+                scene_result={
+                    "label": scene_label,
+                    "confidence": scene_confidence,
+                },
+                hud_result=locals().get("hud_result") or locals().get("pre_hud_result"),
+            )
+
+            shared_reward, shared_debug = self.shared_logic.compute_reward(
+                previous_state=self.previous_shared_game_state,
+                current_state=shared_game_state,
+                action_name=str(action),
+                depth_obs=None,
+            )
+
+            self.previous_shared_game_state = shared_game_state
+            self.last_shared_debug = shared_debug
+            self.last_shared_debug["shared_reward_preview"] = shared_reward
+
+        except Exception as e:
+            self.last_shared_debug = {
+                "shared_logic_error": str(e),
+            }
+
 
         reward += self.route_progress_reward(game_state)
         reward += self.tile_exploration_reward(game_state)
@@ -1744,6 +1956,11 @@ class DoomEnv(gym.Env):
         secret_name = None
         secret_reward = 0.0
 
+        if not self.doom_has_focus():
+            print("[doom_env] Doom lost focus. Truncating episode.")
+            truncated = True
+            info["doom_focus_lost"] = True
+            self.last_shared_debug["doom_focus_lost"] = True
 
         try:
             checkpoint_result = self.checkpoint_tracker.update(game_state)
@@ -1898,14 +2115,21 @@ class DoomEnv(gym.Env):
 
         if retrace_action is not None and retrace_action in self.get_allowed_actions():
             before = action
-            action = retrace_action
-            game_state["action"] = action
+
+            # Do not mutate action here for control purposes.
+            # Doom already received the keypress earlier in this step.
+            # Store it for the next pre-action step instead.
+            self.pending_retrace_action = retrace_action
+            self.retrace_lock_steps = max(self.retrace_lock_steps, 8)
+
+            game_state["retrace_recommended_action"] = retrace_action
 
             print(
-                f"[retrace] {before} -> {action} "
+                f"[retrace] queued {before} -> {retrace_action} "
                 f"phase={self.retrace_navigator.phase} "
                 f"step={self.retrace_navigator.phase_step} "
-                f"side={self.retrace_navigator.preferred_side}"
+                f"side={self.retrace_navigator.preferred_side} "
+                f"lock={self.retrace_lock_steps}"
             )
 
         if self.retrace_navigator.active:
@@ -2337,18 +2561,18 @@ class DoomEnv(gym.Env):
                 f"front={wall_info['front_ratio']:.2f} "
                 f"right={wall_info['right_ratio']:.2f}"
             )
-
+    
         if self._step_count % 25 == 0:
             print(
                 f"[coords] "
-                f"x={game_state.get('x'):.1f} "
-                f"y={game_state.get('y'):.1f}"
-            )
+                f"x={self._fmt_num(game_state.get('x'))} "
+                f"y={self._fmt_num(game_state.get('y'))} "
+                )
 
         if self._step_count % 100 == 0:
             print(
-                f"[pos] x={game_state.get('x')} "
-                f"y={game_state.get('y')} "
+                f"[pos] x={self._fmt_num(game_state.get('x'))} "
+                f"y={self._fmt_num(game_state.get('y'))} "
                 f"shared={game_state.get('shared_state_available')}"
             )
 
@@ -2881,6 +3105,9 @@ class DoomEnv(gym.Env):
                 f"death={info.get('death', False)} "
                 f"stuck_reset={info.get('stuck_reset', False)}"
             )
+        
+        if self.use_shared_logic_reward:
+            reward = float(self.last_shared_debug.get("shared_reward_preview", reward))
 
         self.episode_reward_total += float(reward)
 
@@ -2899,7 +3126,58 @@ class DoomEnv(gym.Env):
         info["doors_used"] = self.door_interaction_count
         info["stuck_counter"] = self.stuck_counter
         info["sensory_emergency_active"] = self.sensory_emergency_active
-        
+
+        shared_move_explore = self._shared_movement_reward_only()
+        reward += shared_move_explore
+
+        self.last_shared_debug["reward_after_shared_movement_exploration"] = float(reward)
+
+        shared_wall = self._shared_wall_reward_only()
+        reward += shared_wall
+
+        self.last_shared_debug["reward_after_shared_wall"] = float(reward)
+
+        shared_object_scene = self._shared_object_scene_reward_only()
+        reward += shared_object_scene
+
+        self.last_shared_debug["reward_after_shared_object_scene"] = float(reward)
+
+        shared_route_curriculum = self._shared_route_curriculum_reward_only()
+        reward += shared_route_curriculum
+
+        self.last_shared_debug["reward_after_shared_route_curriculum"] = float(reward)
+
+        # Small preview blend remains useful while full replacement is off.
+        reward = self._blend_shared_reward(reward)
+
+        self.last_shared_debug["reward_after_shared_blend_before_full_mode"] = float(reward)
+
+        # Full shared reward mode is available but OFF by default.
+        reward = self._full_shared_reward_replacement(reward)
+
+        if death_like_screen:
+            reward -= 25.0
+            self.reward_manager.add("death_penalty", -25.0)
+            terminated = True
+            info["death"] = True
+            self.episode_had_death = True
+
+        if not self.training_mode:
+            self.save_death_review_frames(reason="death")
+
+        if self.stuck_counter >= 35:
+            reward -= 2.0
+            terminated = True
+            info["stuck_reset"] = True
+            self.episode_had_stuck_reset = True
+
+        if not self.training_mode:
+            self.save_death_review_frames(reason="stuck_reset")
+
+        self.last_shared_debug["final_reward_output"] = float(reward)
+        self.last_shared_debug["old_route_reward_scale"] = self.old_route_reward_scale
+        self.last_shared_debug["old_curriculum_reward_scale"] = self.old_curriculum_reward_scale
+        self.last_shared_debug["use_full_shared_reward_mode"] = self.use_full_shared_reward_mode
 
         return observation, float(reward), terminated, truncated, info
 
@@ -3067,7 +3345,34 @@ class DoomEnv(gym.Env):
     # Tracking / recording helpers
     # ---------------------------------------------------------
 
-    
+    def _build_shared_game_state(
+        self,
+        base_game_state,
+        object_result=None,
+        scene_result=None,
+        hud_result=None,
+    ):
+        """
+        Convert Doom Retro state + learned predictions into the same format
+        used by ViZDoom and SharedDoomLogic.
+
+        This does not control the game by itself.
+        It only prepares normalized debug/reward data.
+        """
+
+        if base_game_state is None:
+            base_game_state = {}
+
+        shared_game_state = build_doomretro_game_state(
+            base_game_state=base_game_state,
+            object_prediction=object_result,
+            scene_prediction=scene_result,
+            hud_prediction=hud_result,
+        )
+
+        return shared_game_state
+
+   
     def normalize_weapon_name(self, weapon_name):
         weapon = str(weapon_name or "").lower()
 
@@ -3093,6 +3398,188 @@ class DoomEnv(gym.Env):
             return "bfg"
 
         return weapon or "unknown"
+    
+    def _fmt_num(self, value, digits=1):
+        try:
+            if value is None:
+                return "None"
+            return f"{float(value):.{digits}f}"
+        except Exception:
+            return "None"
+        
+    def _shared_object_scene_reward_only(self):
+        """
+        Extract only object/scene shaping from SharedDoomLogic debug.
+
+        This uses Doom Retro ObjectPredictor / ScenePredictor indirectly
+        through perception.prediction_adapter.build_doomretro_game_state().
+        """
+
+        if not self.use_shared_object_scene_reward:
+            return 0.0
+
+        debug = self.last_shared_debug or {}
+
+        object_scene = debug.get("object_scene_reward", 0.0)
+        combat = debug.get("combat_reward", 0.0)
+        use_reward = debug.get("use_reward", 0.0)
+
+        try:
+            object_scene = float(object_scene)
+        except Exception:
+            object_scene = 0.0
+
+        try:
+            combat = float(combat)
+        except Exception:
+            combat = 0.0
+
+        try:
+            use_reward = float(use_reward)
+        except Exception:
+            use_reward = 0.0
+
+        total = (object_scene + combat + use_reward) * self.shared_object_scene_reward_scale
+
+        debug["shared_object_scene_component"] = object_scene
+        debug["shared_combat_component"] = combat
+        debug["shared_use_component"] = use_reward
+        debug["shared_object_scene_total"] = total
+
+        self.last_shared_debug = debug
+
+        return float(total)
+        
+    def _shared_wall_reward_only(self):
+        """
+        Extract only wall/stuck/depth-style reward from SharedDoomLogic debug.
+
+        For Doom Retro, depth_obs is usually None, but SharedDoomLogic can still
+        use scene/object/wall-style signals from the normalized game_state.
+        """
+
+        if not self.use_shared_wall_reward:
+            return 0.0
+
+        debug = self.last_shared_debug or {}
+
+        wall = debug.get("wall_reward", 0.0)
+
+        try:
+            wall = float(wall)
+        except Exception:
+            wall = 0.0
+
+        total = wall * self.shared_wall_reward_scale
+
+        debug["shared_wall_component"] = wall
+        debug["shared_wall_total"] = total
+
+        self.last_shared_debug = debug
+
+        return float(total)
+        
+    def _shared_movement_reward_only(self):
+        """
+        Extract only movement/exploration reward from SharedDoomLogic debug.
+
+        This lets Doom Retro gradually migrate reward components without
+        replacing the entire reward function at once.
+        """
+
+        if not self.use_shared_movement_reward:
+            return 0.0
+
+        debug = self.last_shared_debug or {}
+
+        movement = debug.get("movement_reward", 0.0)
+        exploration = debug.get("exploration_reward", 0.0)
+
+        try:
+            movement = float(movement)
+        except Exception:
+            movement = 0.0
+
+        try:
+            exploration = float(exploration)
+        except Exception:
+            exploration = 0.0
+
+        total = (movement + exploration) * self.shared_movement_reward_scale
+
+        debug["shared_movement_component"] = movement
+        debug["shared_exploration_component"] = exploration
+        debug["shared_movement_exploration_total"] = total
+
+        self.last_shared_debug = debug
+
+        return float(total)
+    
+    def _shared_route_curriculum_reward_only(self):
+        """
+        Extract route/curriculum shaping from SharedDoomLogic debug.
+
+        route_reward comes from SharedDoomLogic route zones.
+        curriculum_stage is debug/status, not usually a direct reward by itself.
+        """
+
+        if not self.use_shared_route_curriculum_reward:
+            return 0.0
+
+        debug = self.last_shared_debug or {}
+
+        route = debug.get("route_reward", 0.0)
+
+        try:
+            route = float(route)
+        except Exception:
+            route = 0.0
+
+        total = route * self.shared_route_curriculum_reward_scale
+
+        debug["shared_route_component"] = route
+        debug["shared_route_curriculum_total"] = total
+        debug["shared_curriculum_stage"] = debug.get("curriculum_stage")
+        debug["shared_curriculum_weights"] = debug.get("curriculum_weights")
+
+        self.last_shared_debug = debug
+
+        return float(total)
+    
+    def _full_shared_reward_replacement(self, base_reward):
+        """
+        Optional full replacement mode.
+
+        This replaces Doom Retro's reward with SharedDoomLogic's reward preview.
+        It is OFF by default because it is the riskiest migration step.
+        """
+
+        if not self.use_full_shared_reward_mode:
+            return float(base_reward)
+
+        debug = self.last_shared_debug or {}
+        shared_reward = debug.get("shared_reward_preview")
+
+        try:
+            shared_reward = float(shared_reward)
+        except Exception:
+            return float(base_reward)
+
+        scaled = shared_reward * self.full_shared_reward_scale
+
+        clipped = max(
+            -self.full_shared_reward_clip,
+            min(self.full_shared_reward_clip, scaled),
+        )
+
+        debug["full_shared_reward_raw"] = shared_reward
+        debug["full_shared_reward_scaled"] = scaled
+        debug["full_shared_reward_clipped"] = clipped
+        debug["base_reward_replaced_by_full_shared"] = float(base_reward)
+
+        self.last_shared_debug = debug
+
+        return float(clipped)
 
     def choose_weapon_key(self, game_state, object_result=None, enemy_visible=False, enemy_centered=False):
         """
@@ -3161,7 +3648,7 @@ class DoomEnv(gym.Env):
             if current_weapon == "rpg" and (barrel_visible or enemy_close or health < 45):
                 return "3", "avoid_rpg_self_damage"
             return "3", "safe_shotgun"
-        
+   
         # Only keep RPG for safer long-range situations.
         if current_weapon == "rpg":
             if enemy_seen and not enemy_close and not barrel_visible and health >= 60:
@@ -3187,6 +3674,38 @@ class DoomEnv(gym.Env):
             return "2", "low_ammo_pistol"
 
         return None, "keep_current"
+    
+    def action_prior_advice_reward(self, frame, action):
+        """
+        Advice-only reward from the ViZDoom teacher-trained action prior.
+
+        This does NOT override PPO. It only gives a tiny reward when PPO's
+        action agrees with the teacher-student action prior.
+        """
+
+        if not self.use_action_prior_advice:
+            return 0.0, None
+
+        if self.action_prior_advisor is None:
+            return 0.0, None
+
+        result = self.action_prior_advisor.predict(frame)
+
+        if not result.get("enabled", False):
+            return 0.0, result
+
+        advised_action = result.get("action_name")
+        confidence = float(result.get("confidence", 0.0))
+
+        reward = 0.0
+
+        if confidence >= self.action_prior_min_confidence:
+            if advised_action == action:
+                reward += self.action_prior_reward_scale
+            else:
+                reward -= self.action_prior_reward_scale * 0.25
+
+        return float(reward), result
 
     def route_progress_reward(self, game_state):
         reward = 0.0
@@ -3224,6 +3743,24 @@ class DoomEnv(gym.Env):
                 )
 
         return reward
+    
+    def doom_has_focus(self):
+        try:
+            expected = str(getattr(self.controller, "window_id", "")).strip()
+
+            if not expected:
+                return False
+
+            active = subprocess.check_output(
+                ["xdotool", "getactivewindow"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+
+            return active == expected
+
+        except Exception:
+            return True
 
     def smart_weapon_select(self, game_state, object_result=None, enemy_visible=False, enemy_centered=False):
         """
@@ -3264,6 +3801,38 @@ class DoomEnv(gym.Env):
         quantized = small // 32
 
         return hash(quantized.tobytes())
+    
+    def _blend_shared_reward(self, base_reward):
+        """
+        Blend a small amount of SharedDoomLogic reward into the existing
+        Doom Retro reward.
+
+        This is safer than fully replacing the reward.
+        """
+
+        if not self.use_shared_logic_reward_blend:
+            return float(base_reward)
+
+        shared_reward = self.last_shared_debug.get("shared_reward_preview")
+
+        try:
+            shared_reward = float(shared_reward)
+        except Exception:
+            return float(base_reward)
+
+        scaled = shared_reward * self.shared_logic_reward_scale
+
+        clipped = max(
+            -self.shared_logic_reward_clip,
+            min(self.shared_logic_reward_clip, scaled),
+        )
+
+        self.last_shared_debug["shared_reward_scaled"] = scaled
+        self.last_shared_debug["shared_reward_clipped"] = clipped
+        self.last_shared_debug["base_reward_before_shared_blend"] = float(base_reward)
+        self.last_shared_debug["final_reward_after_shared_blend"] = float(base_reward + clipped)
+
+        return float(base_reward + clipped)
 
     def _update_position_tracking(self, game_state, frame=None, motion=0.0, action=None):
         distance_moved = 0.0

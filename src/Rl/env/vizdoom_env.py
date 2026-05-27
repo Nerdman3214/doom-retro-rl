@@ -6,6 +6,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 from observation.native_frame_packer import NativeFramePacker
+from env.shared_doom_logic import SharedDoomLogic
 
 try:
     import vizdoom as vzd
@@ -85,6 +86,9 @@ class VizDoomEnv(gym.Env):
         self.screen_size = screen_size
         self.observation_mode = observation_mode
         self.native_packer = NativeFramePacker(out_size=screen_size)
+        self.shared_logic = SharedDoomLogic()
+        self.previous_game_state = None
+        self.last_reward_debug = {}
 
         self.game = None
         self.step_count = 0
@@ -139,12 +143,31 @@ class VizDoomEnv(gym.Env):
 
         if self.scenario_path:
             game.load_config(str(self.scenario_path))
+        else:
+            if self.iwad_path and os.path.exists(self.iwad_path):
+                game.set_doom_game_path(self.iwad_path)
+            else:
+                raise FileNotFoundError(f"IWAD not found: {self.iwad_path}")
 
-        if self.iwad_path and os.path.exists(self.iwad_path):
-            game.set_doom_game_path(self.iwad_path)
+            # Important: force the game into an actual playable map.
+            game.set_doom_map("E1M1")
 
         game.set_window_visible(self.visible)
         game.set_mode(vzd.Mode.PLAYER)
+
+        # Headless/stability settings.
+        if hasattr(game, "set_sound_enabled"):
+            game.set_sound_enabled(False)
+
+        if hasattr(game, "set_console_enabled"):
+            game.set_console_enabled(False)
+
+        # Start after map spawn settles.
+        if hasattr(game, "set_episode_start_time"):
+            game.set_episode_start_time(10)
+
+        if hasattr(game, "set_episode_timeout"):
+            game.set_episode_timeout(self.max_episode_steps * self.frame_skip)
 
         game.set_screen_resolution(vzd.ScreenResolution.RES_320X240)
         game.set_screen_format(vzd.ScreenFormat.RGB24)
@@ -155,7 +178,6 @@ class VizDoomEnv(gym.Env):
         game.set_sectors_info_enabled(True)
         game.set_automap_buffer_enabled(self.use_automap)
 
-        # Make automap more useful as a geometry signal.
         if self.use_automap:
             game.set_automap_mode(vzd.AutomapMode.OBJECTS)
             game.set_automap_rotate(False)
@@ -178,7 +200,7 @@ class VizDoomEnv(gym.Env):
             [
                 vzd.GameVariable.HEALTH,
                 vzd.GameVariable.ARMOR,
-                vzd.GameVariable.AMMO2,
+                vzd.GameVariable.AMMO1,
                 vzd.GameVariable.SELECTED_WEAPON,
                 vzd.GameVariable.KILLCOUNT,
                 vzd.GameVariable.ITEMCOUNT,
@@ -189,8 +211,25 @@ class VizDoomEnv(gym.Env):
             ]
         )
 
+        print(
+            "[vizdoom_env] init "
+            f"iwad={self.iwad_path} "
+            f"map=E1M1 "
+            f"visible={self.visible} "
+            f"depth={self.use_depth} "
+            f"labels={self.use_labels} "
+            f"automap={self.use_automap} "
+            f"mode={self.observation_mode}"
+        )
+
         game.init()
         self.game = game
+
+    def _action_name_to_index(self, action_name):
+        if action_name in self.ACTIONS:
+            return self.ACTIONS.index(action_name)
+
+        return 0
 
     def _action_to_buttons(self, action_index):
         action_name = self.ACTIONS[int(action_index)]
@@ -301,9 +340,83 @@ class VizDoomEnv(gym.Env):
             values[name] = float(value)
 
         return values
+    
+    def _state_to_game_state(self, state):
+        """
+        Convert ViZDoom GameState into the normalized shared game_state format.
+        """
+
+        values = self._get_game_vars(state)
+
+        objects = []
+        sectors = []
+
+        if state is not None and getattr(state, "objects", None) is not None:
+            for obj in state.objects:
+                obj_data = {}
+
+                for attr in [
+                    "id",
+                    "name",
+                    "position_x",
+                    "position_y",
+                    "position_z",
+                    "angle",
+                    "velocity_x",
+                    "velocity_y",
+                    "velocity_z",
+                    "width",
+                    "height",
+                ]:
+                    if hasattr(obj, attr):
+                        try:
+                            value = getattr(obj, attr)
+                            if isinstance(value, (int, float, str, bool)):
+                                obj_data[attr] = value
+                            else:
+                                obj_data[attr] = float(value)
+                        except Exception:
+                            obj_data[attr] = str(getattr(obj, attr))
+
+                objects.append(obj_data)
+
+        if state is not None and getattr(state, "sectors", None) is not None:
+            for sec in state.sectors:
+                sec_data = {}
+
+                for attr in [
+                    "floor_height",
+                    "ceiling_height",
+                    "line_count",
+                ]:
+                    if hasattr(sec, attr):
+                        try:
+                            sec_data[attr] = float(getattr(sec, attr))
+                        except Exception:
+                            sec_data[attr] = str(getattr(sec, attr))
+
+                sectors.append(sec_data)
+
+        return {
+            "health": values.get("health"),
+            "armor": values.get("armor"),
+            "ammo": values.get("ammo"),
+            "selected_weapon": values.get("selected_weapon"),
+            "kill_count": values.get("kill_count"),
+            "item_count": values.get("item_count"),
+            "x": values.get("x"),
+            "y": values.get("y"),
+            "z": values.get("z"),
+            "angle": values.get("angle"),
+            "objects": objects,
+            "sectors": sectors,
+        }
 
     def _make_obs(self):
-        state = self.game.get_state()
+        try:
+            state = self.game.get_state()
+        except Exception:
+            state = None
 
         if state is None:
             if self.observation_mode == "compact":
@@ -344,36 +457,35 @@ class VizDoomEnv(gym.Env):
         }
 
     def _compute_reward(self, action_name, state):
-        reward = 0.0
+        """
+        Shared reward wrapper for ViZDoom.
 
-        vars_now = self._get_game_vars(state)
+        This converts ViZDoom state into our backend-independent game_state,
+        extracts the depth buffer, and lets SharedDoomLogic compute reward.
+        """
 
-        health = vars_now.get("health")
-        ammo = vars_now.get("ammo")
-        kills = vars_now.get("kill_count", 0)
-        items = vars_now.get("item_count", 0)
+        current_game_state = self._state_to_game_state(state)
 
-        # Small living cost to discourage doing nothing forever.
-        reward -= 0.001
+        depth_obs = None
 
-        if self.last_health is not None and health is not None:
-            health_delta = health - self.last_health
-            if health_delta < 0:
-                reward += health_delta * 0.02
+        if state is not None:
+            depth_raw = getattr(state, "depth_buffer", None)
 
-        if kills > self.last_kill_count:
-            reward += 1.0 * (kills - self.last_kill_count)
+            if depth_raw is not None:
+                try:
+                    depth_obs = self.native_packer.pack_depth(depth_raw)
+                except Exception:
+                    depth_obs = None
 
-        if items > self.last_item_count:
-            reward += 0.25 * (items - self.last_item_count)
+        reward, debug = self.shared_logic.compute_reward(
+            previous_state=self.previous_game_state,
+            current_state=current_game_state,
+            action_name=action_name,
+            depth_obs=depth_obs,
+        )
 
-        if action_name == "move_forward":
-            reward += 0.002
-
-        self.last_health = health
-        self.last_ammo = ammo
-        self.last_kill_count = kills
-        self.last_item_count = items
+        self.previous_game_state = current_game_state
+        self.last_reward_debug = debug
 
         return float(reward)
 
@@ -385,8 +497,11 @@ class VizDoomEnv(gym.Env):
 
         self.game.new_episode()
         self.step_count = 0
+        self.shared_logic.reset_episode()
 
         state = self.game.get_state()
+        self.previous_game_state = self._state_to_game_state(state)
+        self.last_reward_debug = {}
         vars_now = self._get_game_vars(state)
 
         self.last_health = vars_now.get("health")
@@ -404,9 +519,65 @@ class VizDoomEnv(gym.Env):
         return obs, info
 
     def step(self, action_index):
-        buttons, action_name = self._action_to_buttons(action_index)
+        original_action_index = int(action_index)
+        buttons, action_name = self._action_to_buttons(original_action_index)
 
-        self.game.make_action(buttons, self.frame_skip)
+        pre_state = self.game.get_state()
+        pre_game_state = self._state_to_game_state(pre_state)
+
+        depth_obs = None
+
+        if pre_state is not None:
+            depth_raw = getattr(pre_state, "depth_buffer", None)
+
+            if depth_raw is not None:
+                try:
+                    depth_obs = self.native_packer.pack_depth(depth_raw)
+                except Exception:
+                    depth_obs = None
+
+        advised_action, action_advice_reason, action_advice_debug = self.shared_logic.advise_action(
+            action_name=action_name,
+            depth_obs=depth_obs,
+            previous_state=self.previous_game_state,
+            current_state=pre_game_state,
+            allow_override=True,
+        )
+
+        if advised_action != action_name:
+            action_name = advised_action
+            action_index = self._action_name_to_index(action_name)
+            buttons, action_name = self._action_to_buttons(action_index)
+
+        try:
+            self.game.make_action(buttons, self.frame_skip)
+
+        except Exception as e:
+            print(f"[vizdoom_env] make_action failed: {e}")
+            traceback.print_exc()
+
+            obs = self._restart_game_after_crash()
+
+            info = {
+                "backend": "vizdoom",
+                "action_name": action_name,
+                "original_action_index": original_action_index,
+                "advised_action": action_name,
+                "action_advice_reason": "vizdoom_restart_after_crash",
+                "action_advice_debug": action_advice_debug,
+                "buttons": buttons,
+                "last_action": None,
+                "episode_time": 0,
+                "game_vars": {},
+                "reward_debug": {
+                    "crash_recovery": True,
+                },
+            }
+
+            # Return truncated=True so SB3 treats this like an episode boundary,
+            # not a fatal process error.
+            return obs, -1.0, False, True, info
+
         self.step_count += 1
 
         done = self.game.is_episode_finished()
@@ -420,13 +591,52 @@ class VizDoomEnv(gym.Env):
         info = {
             "backend": "vizdoom",
             "action_name": action_name,
+            "original_action_index": original_action_index,
+            "advised_action": action_name,
+            "action_advice_reason": action_advice_reason,
+            "action_advice_debug": action_advice_debug,
+            "buttons": buttons,
+            "last_action": self.game.get_last_action(),
+            "episode_time": self.game.get_episode_time(),
             "game_vars": self._get_game_vars(state),
+            "reward_debug": self.last_reward_debug,
         }
+
 
         if done:
             reward += float(self.game.get_total_reward())
 
         return obs, float(reward), bool(done), bool(truncated), info
+    
+    def _restart_game_after_crash(self):
+        """
+        Restart ViZDoom after an unexpected engine exit.
+
+        This prevents one ViZDoom crash from killing the entire PPO run.
+        """
+
+        print("[vizdoom_env] ViZDoom exited unexpectedly. Restarting game...")
+
+        try:
+            if self.game is not None:
+                self.game.close()
+        except Exception:
+            pass
+
+        self.game = None
+        self.step_count = 0
+
+        self._init_game()
+        self.game.new_episode()
+
+        state = self.game.get_state()
+        self.previous_game_state = self._state_to_game_state(state)
+        self.shared_logic.reset_episode()
+        self.last_reward_debug = {
+            "crash_recovery": True,
+        }
+
+        return self._make_obs()
 
     def render(self):
         state = self.game.get_state()

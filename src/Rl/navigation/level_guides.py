@@ -37,14 +37,14 @@ LEVEL_GUIDES = {
                 "x": 600,
                 "y": 360,
                 "radius": 120,
-                "reward": 0.50,
+                "reward": 0.25,
             },
             {
                 "name": "right_route",
                 "x": 625,
                 "y": 360,
                 "radius": 120,
-                "reward": 0.80,
+                "reward": 0.40,
             },
             {
                 "name": "door_area",
@@ -248,9 +248,27 @@ LEVEL_GUIDES = {
     },
 }
 """
+GENERIC_EXPLORATION_ROUTE_ZONES = []
 
-def get_level_guide(level_name):
-    guide = LEVEL_GUIDES.get(level_name)
+
+def normalize_level_name(level_name=None):
+    normalized = str(level_name or "freedoom1_e1m1").lower()
+
+    aliases = {
+        "freedoom_e1m1": "freedoom1_e1m1",
+        "freedoom1_e1m1": "freedoom1_e1m1",
+        "e1m1": "freedoom1_e1m1",
+        "doom_e1m1": "freedoom1_e1m1",
+        "generic": "generic",
+    }
+
+    return aliases.get(normalized, normalized)
+
+
+def get_level_guide(level_name=None):
+    normalized = normalize_level_name(level_name)
+
+    guide = LEVEL_GUIDES.get(normalized)
 
     if guide is None:
         return DEFAULT_EMPTY_GUIDE.copy()
@@ -258,3 +276,39 @@ def get_level_guide(level_name):
     fixed = DEFAULT_EMPTY_GUIDE.copy()
     fixed.update(guide)
     return fixed
+
+
+def get_route_zones(level_name=None):
+    """
+    Return route zones for a known level.
+
+    Supports both dictionary route zones and tuple route zones.
+    SharedDoomLogic expects route zones as:
+        (name, x, y, radius, reward)
+    """
+
+    normalized = normalize_level_name(level_name)
+
+    if normalized == "generic":
+        return list(GENERIC_EXPLORATION_ROUTE_ZONES)
+
+    guide = get_level_guide(normalized)
+    route_zones = guide.get("route_zones", [])
+
+    converted = []
+
+    for zone in route_zones:
+        if isinstance(zone, dict):
+            converted.append(
+                (
+                    zone.get("name", "unnamed_zone"),
+                    zone.get("x", 0),
+                    zone.get("y", 0),
+                    zone.get("radius", 128),
+                    zone.get("reward", 0.0),
+                )
+            )
+        else:
+            converted.append(zone)
+
+    return converted
