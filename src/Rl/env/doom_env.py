@@ -159,6 +159,9 @@ class DoomEnv(gym.Env):
         self.secret_area_reached_this_episode = False
         self.secrets_found_this_episode = set()
         self.training_mode = training_mode
+        # in __init__
+        self.recent_loop_tile = None
+        self.recent_loop_steps = 0
 
         # Full replacement mode exists, but keep it OFF until tests pass.
         self.use_full_shared_reward_mode = True
@@ -339,7 +342,7 @@ class DoomEnv(gym.Env):
         # Curriculum
         # -----------------------------------------------------
 
-        self.curriculum_stage = 1
+        self.curriculum_stage = 2
         self.max_stage = 3
         self.curriculum_rewards = []
         self.curriculum_log_interval = 50
@@ -405,6 +408,9 @@ class DoomEnv(gym.Env):
         self.current_weapon_name = "pistol"
         self.has_berserk = False
         self.berserk_steps_remaining = 0
+        self.last_weapon_swap_step = -100
+        self.last_forced_weapon_reason = None
+        self.weapon_swap_cooldown = 25
 
         self.consecutive_melee_steps = 0
         self.last_melee_step = -100
@@ -713,8 +719,8 @@ class DoomEnv(gym.Env):
             self.door_interaction_count += 1
 
             if door_like:
-                reward += 0.30
-                self.reward_manager.add("use_near_door_like_scene", 0.30)
+                reward += 0.10
+                self.reward_manager.add("use_near_door_like_scene", 0.10)
             else:
                 reward += self.add_penalty("use_not_near_door", -0.05)
 
@@ -741,16 +747,20 @@ class DoomEnv(gym.Env):
                 )
 
                 if moved >= 32.0 or route_improved:
-                    reward += 0.80
-                    self.reward_manager.add("use_created_progress", 0.80)
-                    print(
-                        f"[door_use] useful_use moved={moved:.1f} "
-                        f"route_improved={route_improved}"
+                    door_or_route_context = (
+                        route_improved
+                        or scene_label in ["door_or_button", "door", "switch", "elevator", "lift"]
+                        or game_state.get("sensory_situation") in ["door_possible", "right_route_area"]
                     )
-                    self.pending_use_check = None
 
-            elif age > 20:
-                self.pending_use_check = None
+                    if door_or_route_context and (moved >= 32.0 or route_improved):
+                        reward += 0.40
+                        self.reward_manager.add("use_created_progress", 0.40)
+                        print(
+                            f"[door_use] useful_use moved={moved:.1f} "
+                            f"route_improved={route_improved}"
+                        )
+                        self.pending_use_check = None
 
         return reward
     
@@ -832,6 +842,185 @@ class DoomEnv(gym.Env):
             return self.add_penalty("same_tile_loop_penalty", -0.03)
 
         return 0.0
+    
+    def update_powerup_state(self, game_state, object_result=None):
+        """
+        Track powerups using object labels and game-state hints.
+
+        Berserk in Doom/Freedoom may appear as a black/dark medkit-like pickup.
+        We intentionally use aliases because Freedoom sprite/model labels may differ.
+        """
+
+        berserk_aliases = {
+            "berserk",
+            "berserk_pack",
+            "berserker",
+            "black_medkit",
+            "dark_medkit",
+            "powerup_berserk",
+            "strength_powerup",
+        }
+
+        labels = set()
+
+        if object_result:
+            labels.update(object_result.get("present", []))
+
+            scores = object_result.get("scores", {})
+            for label, score in scores.items():
+                try:
+                    if float(score) >= 0.50:
+                        labels.add(label)
+                except Exception:
+                    pass
+
+        if labels.intersection(berserk_aliases):
+            self.has_berserk = True
+            # Treat as level-long for training, but keep a debug counter.
+            self.berserk_steps_remaining = max(self.berserk_steps_remaining, 5000)
+            self.last_forced_weapon_reason = "berserk_pickup"
+
+        if self.berserk_steps_remaining > 0:
+            self.berserk_steps_remaining -= 1
+
+        game_state["has_berserk"] = self.has_berserk
+        game_state["berserk_steps_remaining"] = self.berserk_steps_remaining
+
+        return game_state
+
+
+    def infer_enemy_distance_tiles(self, game_state, object_result=None):
+        """
+        Estimate enemy distance in tiles.
+
+        This is intentionally conservative. If no distance source exists,
+        return None instead of guessing.
+        """
+
+        if game_state.get("enemy_distance_tiles") is not None:
+            return game_state.get("enemy_distance_tiles")
+
+        if game_state.get("enemy_distance") is not None:
+            try:
+                return float(game_state["enemy_distance"]) / 64.0
+            except Exception:
+                return None
+
+        if object_result:
+            if object_result.get("enemy_distance_tiles") is not None:
+                return object_result.get("enemy_distance_tiles")
+
+            if object_result.get("enemy_distance") is not None:
+                try:
+                    return float(object_result["enemy_distance"]) / 64.0
+                except Exception:
+                    return None
+
+        return None
+
+
+    def infer_enemy_count(self, game_state, object_result=None):
+        """
+        Estimate visible enemy count.
+
+        If the object model cannot count enemies yet, fall back to 1 when enemy_visible is true.
+        """
+
+        if game_state.get("enemy_count") is not None:
+            try:
+                return int(game_state["enemy_count"])
+            except Exception:
+                pass
+
+        if object_result:
+            if object_result.get("enemy_count") is not None:
+                try:
+                    return int(object_result["enemy_count"])
+                except Exception:
+                    pass
+
+            present = object_result.get("present", [])
+            if "enemy_visible" in present:
+                return 1
+
+        if game_state.get("enemy_visible", False):
+            return 1
+
+        return 0
+
+
+    def tactical_weapon_action(
+        self,
+        action,
+        game_state,
+        object_result=None,
+        wall_info=None,
+    ):
+        """
+        Situational weapon swapping.
+
+        This prevents blind swap_weapon spam while still allowing:
+        - berserk/fist for very close enemies
+        - guns for medium/far enemies
+        - rockets only for groups at safe distance
+        """
+
+        if self.curriculum_stage < 3:
+            if action == "swap_weapon":
+                self.last_forced_weapon_reason = "swap_blocked_before_combat_stage"
+                return "move_forward"
+            return action
+
+        if action != "swap_weapon":
+            return action
+
+        if self._step_count - self.last_weapon_swap_step < self.weapon_swap_cooldown:
+            self.last_forced_weapon_reason = "swap_cooldown"
+            return "move_backward"
+
+        enemy_visible = bool(game_state.get("enemy_visible", False))
+        enemy_centered = bool(game_state.get("enemy_centered", False))
+        enemy_distance_tiles = self.infer_enemy_distance_tiles(game_state, object_result)
+        enemy_count = self.infer_enemy_count(game_state, object_result)
+
+        current_weapon = str(
+            game_state.get("weapon", self.current_weapon_name)
+        ).lower()
+
+        front_ratio = 0.0
+        if wall_info:
+            front_ratio = float(wall_info.get("front_ratio", 0.0))
+
+        rocket_unsafe = (
+            front_ratio >= 0.45
+            or (
+                enemy_distance_tiles is not None
+                and enemy_distance_tiles < 4.0
+            )
+        )
+
+        if not enemy_visible:
+            self.last_forced_weapon_reason = "swap_blocked_no_enemy"
+            return "move_forward"
+
+        if self.has_berserk and enemy_distance_tiles is not None:
+            if enemy_distance_tiles <= 1.5 and enemy_centered:
+                self.last_weapon_swap_step = self._step_count
+                self.last_forced_weapon_reason = "berserk_close_enemy"
+                return "swap_weapon"
+
+            if current_weapon in ["fist", "chainsaw", "riptor"] and enemy_distance_tiles > 2.0:
+                self.last_weapon_swap_step = self._step_count
+                self.last_forced_weapon_reason = "leave_melee_range"
+                return "swap_weapon"
+
+        if enemy_count >= 2 and not rocket_unsafe:
+            self.last_weapon_swap_step = self._step_count
+            self.last_forced_weapon_reason = "group_enemy_safe_rocket"
+            return "swap_weapon"
+
+        self.last_forced_weapon_reason = "swap_not_contextual"
+        return "shoot" if enemy_centered else "move_backward"
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -861,6 +1050,8 @@ class DoomEnv(gym.Env):
         self.retrace_navigator.reset()
         self.retrace_lock_steps = 0
         self.pending_retrace_action = None
+        self.recent_loop_tile = None
+        self.recent_loop_steps = 0
 
         self.wall_escape_mode = False
         self.wall_escape_step = 0
@@ -890,6 +1081,11 @@ class DoomEnv(gym.Env):
         self.last_melee_step = -100
         self.consecutive_swap_steps = 0
         self.last_swap_step = -100
+        self.current_weapon_name = "pistol"
+        self.has_berserk = False
+        self.berserk_steps_remaining = 0
+        self.last_weapon_swap_step = -100
+        self.last_forced_weapon_reason = None
 
         self.movement_count = 0
         self.exploration_count = 0
@@ -1204,11 +1400,16 @@ class DoomEnv(gym.Env):
         pre_game_state["scene_probs"] = pre_scene_probs
         pre_game_state["action"] = action
 
+
+        # -----------------------------------------------------
+        # Pending retrace action
+        # -----------------------------------------------------
+        # Retrace is computed after the previous action, so we apply it
+        # at the beginning of the next step before exploration can override it.
         if (
             self.pending_retrace_action is not None
             and self.pending_retrace_action in self.get_allowed_actions()
         ):
-            before = action
             pending = self.pending_retrace_action
 
             front_blocked = (
@@ -1233,40 +1434,6 @@ class DoomEnv(gym.Env):
             before = action
             action = pending
             pre_game_state["action"] = action
-
-            # -----------------------------------------------------
-            # Pending retrace action
-            # -----------------------------------------------------
-            # Retrace is computed after the previous action, so we apply it
-            # at the beginning of the next step before exploration can override it.
-            if (
-                self.pending_retrace_action is not None
-                and self.pending_retrace_action in self.get_allowed_actions()
-            ):
-                pending = self.pending_retrace_action
-
-                front_blocked = (
-                    pre_wall_info.get("front_wall", False)
-                    or pre_wall_info.get("front_ratio", 0.0) >= 0.55
-                )
-
-                if pending == "move_forward" and front_blocked:
-                    before_pending = pending
-
-                    if pre_wall_info.get("left_ratio", 0.0) < pre_wall_info.get("right_ratio", 0.0):
-                        pending = "turn_left"
-                    else:
-                        pending = "turn_right"
-
-                    print(
-                        f"[override] pending_retrace_safety: "
-                        f"{before_pending} -> {pending} "
-                        f"front={pre_wall_info.get('front_ratio', 0.0):.2f}"
-                    )
-
-            before = action
-            action = pending
-            pre_game_state["action"] = action
             self.pending_retrace_action = None
             self.retrace_lock_steps = max(self.retrace_lock_steps, 6)
             can_use_exploration_override = False
@@ -1275,18 +1442,11 @@ class DoomEnv(gym.Env):
                 f"[override] pending_retrace: {before} -> {action} "
                 f"lock={self.retrace_lock_steps}"
             )
-            self.pending_retrace_action = None
-            self.retrace_lock_steps = max(self.retrace_lock_steps, 6)
-            can_use_exploration_override = False
-            pre_game_state["action"] = action
-            self.pending_retrace_action = None
-            self.retrace_lock_steps = max(self.retrace_lock_steps, 6)
-            can_use_exploration_override = False
 
-            print(
-                f"[override] pending_retrace: {before} -> {action} "
-                f"lock={self.retrace_lock_steps}"
-            )
+        pre_game_state = self.update_powerup_state(
+            game_state=pre_game_state,
+            object_result=pre_object_result,
+        )
 
         # -----------------------------------------------------
         # Pre-action sensory override
@@ -1389,8 +1549,15 @@ class DoomEnv(gym.Env):
         else:
             aimed_this_step = False
 
-            # Aim alignment gets priority over shooting/swap logic.
-            if pre_enemy_visible and not pre_enemy_centered:
+            allow_aim_priority = (
+                pre_enemy_visible
+                and not pre_enemy_centered
+                and self.retrace_lock_steps <= 0
+                and not getattr(self.retrace_navigator, "active", False)
+                and self.stuck_counter < 4
+            )
+
+            if allow_aim_priority:
                 if pre_game_state.get("enemy_left", False):
                     before = action
                     action = "turn_left"
@@ -1402,6 +1569,26 @@ class DoomEnv(gym.Env):
                     action = "turn_right"
                     aimed_this_step = True
                     print(f"[override] aim_priority: {before} -> {action}")
+            else:
+                if pre_enemy_visible and not pre_enemy_centered and self._step_count % 25 == 0:
+                    print(
+                        f"[override_blocked] aim_priority blocked "
+                        f"lock={self.retrace_lock_steps} "
+                        f"retrace_active={getattr(self.retrace_navigator, 'active', False)} "
+                        f"stuck={self.stuck_counter}"
+                    )
+
+            if pre_game_state.get("enemy_left", False):
+                before = action
+                action = "turn_left"
+                aimed_this_step = True
+                print(f"[override] aim_priority: {before} -> {action}")
+
+            elif pre_game_state.get("enemy_right", False):
+                before = action
+                action = "turn_right"
+                aimed_this_step = True
+                print(f"[override] aim_priority: {before} -> {action}")
 
             if not aimed_this_step:
                 before = action
@@ -1431,16 +1618,37 @@ class DoomEnv(gym.Env):
                         print(f"[override] combat_tactics: {before} -> {action}")
 
                 else:
-                    before = action
-                    action = self.aim_assist_action(
-                        action=action,
-                        frame=pre_frame,
-                        enemy_visible=pre_enemy_visible,
-                        enemy_centered=pre_enemy_centered,
-                        ammo=pre_game_state.get("ammo", 0),
+                    ammo = int(pre_game_state.get("ammo", 0) or 0)
+
+                    allow_aim_assist = (
+                        pre_enemy_visible
+                        and not pre_enemy_centered
+                        and ammo > 0
+                        and self.retrace_lock_steps <= 0
+                        and not getattr(self.retrace_navigator, "active", False)
+                        and self.stuck_counter < 4
                     )
-                    if action != before:
-                        print(f"[override] aim_assist: {before} -> {action}")
+
+                    if allow_aim_assist:
+                        before = action
+                        action = self.aim_assist_action(
+                            action=action,
+                            frame=pre_frame,
+                            enemy_visible=pre_enemy_visible,
+                            enemy_centered=pre_enemy_centered,
+                            ammo=ammo,
+                        )
+                        if action != before:
+                            print(f"[override] aim_assist: {before} -> {action}")
+                    else:
+                        if pre_enemy_visible and self._step_count % 25 == 0:
+                            print(
+                                f"[override_blocked] aim_assist blocked "
+                                f"centered={pre_enemy_centered} ammo={ammo} "
+                                f"lock={self.retrace_lock_steps} "
+                                f"retrace_active={getattr(self.retrace_navigator, 'active', False)} "
+                                f"stuck={self.stuck_counter}"
+                            )
 
             if can_use_exploration_override:
                 before = action
@@ -1777,23 +1985,21 @@ class DoomEnv(gym.Env):
         # -----------------------------------------------------
         # Execute action
         # -----------------------------------------------------
-        enemy_distance_tiles = pre_game_state.get("enemy_distance_tiles")
-        enemy_count = pre_game_state.get("enemy_count", 1)
-        current_weapon = str(pre_game_state.get("weapon", self.current_weapon_name)).lower()
 
-        before_weapon = action
+        before_weapon_guard = action
         action = self.tactical_weapon_action(
             action=action,
-            enemy_visible=pre_enemy_visible,
-            enemy_centered=pre_enemy_centered,
-            enemy_distance_tiles=enemy_distance_tiles,
-            enemy_count=enemy_count,
-            ammo=pre_game_state.get("ammo", 0),
-            current_weapon=current_weapon,
+            game_state=pre_game_state,
+            object_result=pre_object_result,
+            wall_info=pre_wall_info,
         )
 
-        if action != before_weapon:
-            print(f"[override] tactical_weapon: {before_weapon} -> {action}")
+        if action != before_weapon_guard:
+            print(
+                f"[override] tactical_weapon: {before_weapon_guard} -> {action} "
+                f"reason={self.last_forced_weapon_reason} "
+                f"berserk={self.has_berserk}"
+            )
 
         action_prior_reward, action_prior_result = self.action_prior_advice_reward(
             frame=pre_frame,
@@ -2045,9 +2251,26 @@ class DoomEnv(gym.Env):
 
         if not self.doom_has_focus():
             print("[doom_env] Doom lost focus. Truncating episode.")
+
             truncated = True
             info["doom_focus_lost"] = True
             self.last_shared_debug["doom_focus_lost"] = True
+
+            self.controller.release_all()
+
+            frame_cache.invalidate()
+            safe_frame = self.observer.build()
+            safe_observation = self.frame_stack.add_frame(safe_frame)
+
+            self.episode_reward_total += float(reward)
+
+            return (
+                safe_observation,
+                float(reward),
+                terminated,
+                truncated,
+                info,
+            )
 
         try:
             checkpoint_result = self.checkpoint_tracker.update(game_state)
@@ -2107,6 +2330,41 @@ class DoomEnv(gym.Env):
             checkpoint_info = {}
 
             print(f"[tracker] checkpoint/secret tracker failed: {e}")
+
+        # -----------------------------------------------------
+        # Route loop escape shaping
+        # -----------------------------------------------------
+        tile_size = 64
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        sensory_situation = game_state.get("sensory_situation")
+        repeat = int(game_state.get("sensory_repeat", 0) or 0)
+
+        if x is not None and y is not None:
+            current_tile = (int(float(x) // tile_size), int(float(y) // tile_size))
+
+            if sensory_situation == "stuck_or_looping":
+                self.recent_loop_tile = current_tile
+                self.recent_loop_steps = 20
+
+                if repeat >= 10:
+                    reward += self.add_penalty("slow_loop_escape", -0.02)
+                    self.reward_manager.add("slow_loop_escape", -0.02)
+
+            elif self.recent_loop_steps > 0:
+                self.recent_loop_steps -= 1
+
+                if self.recent_loop_tile is not None and current_tile != self.recent_loop_tile:
+                    reward += 0.15
+                    self.reward_manager.add("escaped_loop_tile", 0.15)
+                    print(
+                        f"[route_escape] escaped loop tile "
+                        f"{self.recent_loop_tile} -> {current_tile}"
+                    )
+
+                    self.recent_loop_tile = None
+                    self.recent_loop_steps = 0
 
 
         # Corner escape action changes already happen before perform_action().
@@ -2836,6 +3094,28 @@ class DoomEnv(gym.Env):
                     if ammo <= 5:
                         reward += self.add_penalty("low_ammo_shot_pressure", -0.5)
 
+
+        # -----------------------------------------------------
+        # Ammo discipline reward shaping
+        # -----------------------------------------------------
+        ammo_discipline_reward = 0.0
+
+        if action == "shoot":
+            ammo = int(game_state.get("ammo", 0) or 0)
+
+            if not enemy_visible:
+                ammo_discipline_reward -= 0.03
+                self.reward_manager.add("shoot_no_enemy", -0.03)
+
+            elif enemy_visible and not enemy_centered:
+                ammo_discipline_reward -= 0.02
+                self.reward_manager.add("shoot_not_centered", -0.02)
+
+            elif enemy_visible and enemy_centered:
+                ammo_discipline_reward += 0.02
+                self.reward_manager.add("shoot_centered_enemy", 0.02)
+
+        reward += ammo_discipline_reward
         # -----------------------------------------------------
         # Melee/use/swap rewards
         # -----------------------------------------------------
@@ -3124,7 +3404,14 @@ class DoomEnv(gym.Env):
         # Termination
         # -----------------------------------------------------
 
-        health = game_state.get("health", 100)
+        if kill_delta > 0:
+            print(
+                f"[combat_success] kill gained "
+                f"kill_delta={kill_delta} "
+                f"total_kills={self.enemy_kill_count} "
+                f"ammo={ammo} "
+                f"health={health}"
+            )
 
         # Emergency combat override:
         # Freedoom has enemies very early. If the agent is still in Stage 2 but
@@ -5283,52 +5570,75 @@ class DoomEnv(gym.Env):
     def tactical_weapon_action(
         self,
         action,
-        enemy_visible,
-        enemy_centered,
-        enemy_distance_tiles,
-        enemy_count,
-        ammo,
-        current_weapon,
+        game_state,
+        object_result=None,
+        wall_info=None,
     ):
         """
-        Situational weapon logic.
+        Situational weapon swapping.
 
-        This does not blindly swap weapons. It only requests a weapon change
-        when combat context makes the current weapon bad.
+        This prevents blind swap_weapon spam while still allowing:
+        - berserk/fist for very close enemies
+        - guns for medium/far enemies
+        - rockets only for groups at safe distance
         """
 
+        if self.curriculum_stage < 3:
+            if action == "swap_weapon":
+                self.last_forced_weapon_reason = "swap_blocked_before_combat_stage"
+                return "move_forward"
+            return action
+
+        if action != "swap_weapon":
+            return action
+
+        if self._step_count - self.last_weapon_swap_step < self.weapon_swap_cooldown:
+            self.last_forced_weapon_reason = "swap_cooldown"
+            return "move_backward"
+
+        enemy_visible = bool(game_state.get("enemy_visible", False))
+        enemy_centered = bool(game_state.get("enemy_centered", False))
+        enemy_distance_tiles = self.infer_enemy_distance_tiles(game_state, object_result)
+        enemy_count = self.infer_enemy_count(game_state, object_result)
+
+        current_weapon = str(
+            game_state.get("weapon", self.current_weapon_name)
+        ).lower()
+
+        front_ratio = 0.0
+        if wall_info:
+            front_ratio = float(wall_info.get("front_ratio", 0.0))
+
+        rocket_unsafe = (
+            front_ratio >= 0.45
+            or (
+                enemy_distance_tiles is not None
+                and enemy_distance_tiles < 4.0
+            )
+        )
+
         if not enemy_visible:
-            return action
+            self.last_forced_weapon_reason = "swap_blocked_no_enemy"
+            return "move_forward"
 
-        if self._step_count - self.last_weapon_swap_step < 20:
-            return action
-
-        # Berserk/fist logic: only use fists when very close.
         if self.has_berserk and enemy_distance_tiles is not None:
-            if enemy_distance_tiles <= 1.5:
-                if current_weapon not in ["fist", "chainsaw", "riptor"]:
-                    self.last_weapon_swap_step = self._step_count
-                    return "swap_weapon"
-            elif current_weapon in ["fist", "chainsaw", "riptor"]:
+            if enemy_distance_tiles <= 1.5 and enemy_centered:
                 self.last_weapon_swap_step = self._step_count
+                self.last_forced_weapon_reason = "berserk_close_enemy"
                 return "swap_weapon"
 
-        # Rocket launcher: good for groups, dangerous up close.
-        if enemy_count >= 2 and enemy_distance_tiles is not None:
-            if enemy_distance_tiles >= 4:
-                if current_weapon not in ["rocket", "rocket_launcher", "rpg"]:
-                    self.last_weapon_swap_step = self._step_count
-                    return "swap_weapon"
+            if current_weapon in ["fist", "chainsaw", "riptor"] and enemy_distance_tiles > 2.0:
+                self.last_weapon_swap_step = self._step_count
+                self.last_forced_weapon_reason = "leave_melee_range"
+                return "swap_weapon"
 
-        # Pistol/shotgun/chaingun/plasma logic.
-        if enemy_distance_tiles is not None:
-            if enemy_distance_tiles >= 8:
-                if current_weapon in ["fist", "chainsaw", "riptor"]:
-                    self.last_weapon_swap_step = self._step_count
-                    return "swap_weapon"
+        if enemy_count >= 2 and not rocket_unsafe:
+            self.last_weapon_swap_step = self._step_count
+            self.last_forced_weapon_reason = "group_enemy_safe_rocket"
+            return "swap_weapon"
 
-        return action
-
+        self.last_forced_weapon_reason = "swap_not_contextual"
+        return "shoot" if enemy_centered else "move_backward"
 
     def sanitize_action(self, action, game_state, enemy_visible):
         """
@@ -5341,6 +5651,19 @@ class DoomEnv(gym.Env):
         config = self.get_stage_config()
 
         ammo = int(game_state.get("ammo", 0) or 0)
+
+        if ammo <= 0 and action == "shoot":
+            before = action
+
+            if self.stuck_counter >= 3:
+                action = "move_backward"
+            elif self._step_count % 2 == 0:
+                action = "strafe_left"
+            else:
+                action = "strafe_right"
+
+            print(f"[override] no_ammo: {before} -> {action}")
+
         current_weapon = str(game_state.get("weapon", "")).lower()
 
         is_melee_weapon = (
@@ -5404,29 +5727,6 @@ class DoomEnv(gym.Env):
             return action
 
         return action
-    
-    def update_powerup_state(self, game_state, object_result=None):
-        """
-        Track temporary or semi-temporary powerups.
-
-        Berserk should not mean always use fists. It means fists become viable
-        when enemies are close.
-        """
-
-        if object_result:
-            present = object_result.get("present", [])
-
-            if "powerup_berserk" in present or "berserk_pack" in present:
-                self.has_berserk = True
-                self.berserk_steps_remaining = 2500
-
-        if self.berserk_steps_remaining > 0:
-            self.berserk_steps_remaining -= 1
-        else:
-            self.has_berserk = False
-
-        game_state["has_berserk"] = self.has_berserk
-        game_state["berserk_steps_remaining"] = self.berserk_steps_remaining
 
     def _reset_stage_counters(self):
         self.movement_count = 0
