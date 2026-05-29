@@ -134,10 +134,14 @@ class RetraceNavigator:
             self.phase_step = 0
 
         if self.phase == "turn_to_opening":
-            if self.phase_step <= 4:
-                action = "turn_left" if self.preferred_side == "left" else "turn_right"
-                self.last_escape_action = action
-                return action
+            turn_steps = 8  # stronger turn, closer to a 90-degree rotation
+
+            if self.phase_step < turn_steps:
+                self.phase_step += 1
+                return "turn_left" if self.side == "left" else "turn_right"
+
+            self.phase = "test_forward"
+            self.phase_step = 0
 
             self.phase = "test_forward"
             self.phase_step = 0

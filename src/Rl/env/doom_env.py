@@ -342,8 +342,8 @@ class DoomEnv(gym.Env):
         # Curriculum
         # -----------------------------------------------------
 
-        self.curriculum_stage = 2
-        self.max_stage = 3
+        self.curriculum_stage = 0
+        self.max_stage = 7
         self.curriculum_rewards = []
         self.curriculum_log_interval = 50
 
@@ -536,7 +536,7 @@ class DoomEnv(gym.Env):
                 "allow_use": True,
             },
             3: {
-                "name": "shoot_visible_enemies",
+                "name": "complete_level_basic",
                 "allow_shoot": True,
                 "allow_melee": False,
                 "require_enemy_visible_to_shoot": True,
@@ -614,7 +614,7 @@ class DoomEnv(gym.Env):
                 "strafe_right",
                 "use",
             ]
-
+        
         if stage == 3:
             return [
                 "move_forward",
@@ -625,7 +625,6 @@ class DoomEnv(gym.Env):
                 "strafe_right",
                 "use",
                 "shoot",
-                "swap_weapon",
             ]
 
         if stage == 4:

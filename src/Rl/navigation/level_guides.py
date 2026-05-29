@@ -17,237 +17,130 @@ The important architecture change is:
 RouteDirector should read goals from here instead of hardcoding one map path.
 """
 
-
 DEFAULT_EMPTY_GUIDE = {
+    "name": "generic",
     "main_goal": None,
+    "route_nodes": [],
+    "route_zones": [],
     "checkpoints": [],
     "secrets": [],
     "keys": [],
     "locked_doors": [],
     "switches": [],
     "use_points": [],
+    "strategies": [],
 }
 
 
 LEVEL_GUIDES = {
     "freedoom1_e1m1": {
-        "route_zones": [
+        "name": "freedoom1_e1m1",
+
+        "route_nodes": [
             {
                 "name": "spawn_exit",
-                "x": 600,
-                "y": 360,
-                "radius": 120,
-                "reward": 0.25,
+                "x": 530,
+                "y": 300,
+                "radius": 96,
+                "type": "milestone",
+                "next": ["right_route", "central_route"],
+                "reward": 0.5,
             },
             {
                 "name": "right_route",
-                "x": 625,
-                "y": 360,
-                "radius": 120,
-                "reward": 0.40,
+                "x": 570,
+                "y": 304,
+                "radius": 128,
+                "type": "route",
+                "next": ["door_area"],
+                "reward": 0.8,
             },
             {
                 "name": "door_area",
-                "x": 700,
-                "y": 420,
-                "radius": 140,
-                "reward": 1.00,
+                "x": 636,
+                "y": 304,
+                "radius": 128,
+                "type": "use_area",
+                "hint_action": "use",
+                "next": ["combat_corridor"],
+                "reward": 1.0,
             },
             {
                 "name": "combat_corridor",
-                "x": 850,
-                "y": 400,
-                "radius": 160,
-                "reward": 1.50,
+                "x": 720,
+                "y": 316,
+                "radius": 144,
+                "type": "combat_route",
+                "next": ["exit_route", "resource_recovery"],
+                "reward": 1.5,
             },
             {
                 "name": "exit_route",
-                "x": 1000,
+                "x": 930,
+                "y": 464,
+                "radius": 160,
+                "type": "exit_path",
+                "next": ["level_exit"],
+                "reward": 2.0,
+            },
+            {
+                "name": "blue_key_route",
+                "type": "key_route",
+                "x": 400,
+                "y": 300,
+                "radius": 160,
+                "provides_key": "blue",
+                "next": ["blue_door"],
+                "reward": 2.0,
+            },
+            {
+                "name": "non_blue_left_route",
+                "type": "alternate_route",
+                "x": 300,
                 "y": 500,
-                "radius": 180,
-                "reward": 2.00,
+                "radius": 160,
+                "next": ["exit_route"],
+                "reward": 1.5,
+            },
+            {
+                "name": "blue_door",
+                "type": "locked_door",
+                "requires_key": "blue",
+                "x": 900,
+                "y": 460,
+                "radius": 128,
+                "next": ["exit_route"],
+                "reward": 2.0,
             },
         ],
+
+        "route_zones": [],
+
+        "main_goal": {
+            "name": "level_exit",
+            "type": "exit",
+            "x": 1200,
+            "y": 464,
+            "radius": 160,
+            "reward": 10.0,
+        },
+
         "checkpoints": [],
         "secrets": [],
+        "keys": [],
+        "locked_doors": [],
+        "switches": [],
+        "use_points": [],
+
+        "strategies": [
+            "safe_main_route",
+            "combat_clear_then_exit",
+            "resource_recovery",
+            "explore_if_lost",
+        ],
     }
 }
 
-"""LEVEL_GUIDES = {
-    "freedoom1_e1m1": {
-        "main_goal": {
-            "name": "level_exit",
-            "type": "exit",
-            "x": 1200.0,
-            "y": -100.0,
-            "radius": 160.0,
-            "reward": 10.0,
-        },
-
-        "checkpoints": [
-            {
-                "name": "start_exit_path",
-                "type": "route",
-                "x": 300.0,
-                "y": 200.0,
-                "radius": 128.0,
-                "reward": 3.0,
-            },
-        ],
-
-        "secrets": [
-            {
-                "name": "secret_1",
-                "type": "secret",
-                "x": -208.0,
-                "y": 144.0,
-                "radius": 128.0,
-                "reward": 6.0,
-            },
-            {
-                "name": "secret_2",
-                "type": "secret",
-                "x": 400.0,
-                "y": 300.0,
-                "radius": 128.0,
-                "reward": 6.0,
-            },
-        ],
-
-        "keys": [
-            # Fill these with real coordinates when you find keycards.
-            # Example:
-            # {
-            #     "name": "blue_keycard",
-            #     "type": "key",
-            #     "key": "blue",
-            #     "x": 500.0,
-            #     "y": 300.0,
-            #     "radius": 96.0,
-            #     "reward": 8.0,
-            # },
-        ],
-
-        "locked_doors": [
-            # Example:
-            # {
-            #     "name": "blue_exit_door",
-            #     "type": "locked_door",
-            #     "requires_key": "blue",
-            #     "x": 900.0,
-            #     "y": 100.0,
-            #     "radius": 128.0,
-            #     "leads_to": "level_exit",
-            # },
-        ],
-
-        "switches": [
-            # Example:
-            # {
-            #     "name": "bridge_switch",
-            #     "type": "switch",
-            #     "x": 700.0,
-            #     "y": 250.0,
-            #     "radius": 96.0,
-            #     "unlocks": "bridge_door",
-            #     "reward": 5.0,
-            # },
-        ],
-
-        "use_points": [
-            # Doors/elevators/buttons that should teach the agent to press use.
-            # Replace placeholders with real x/y values from logs.
-            {
-                "name": "possible_first_door_or_elevator",
-                "type": "use_point",
-                "x": 300.0,
-                "y": 200.0,
-                "radius": 128.0,
-                "reward": 3.0,
-            },
-        ],
-    },
-
-    "freedoom1_e1m2": {
-        "main_goal": {
-            "name": "level_exit",
-            "type": "exit",
-            "x": 0.0,
-            "y": 0.0,
-            "radius": 160.0,
-            "reward": 10.0,
-        },
-        "checkpoints": [],
-        "secrets": [],
-        "keys": [],
-        "locked_doors": [],
-        "switches": [],
-        "use_points": [],
-    },
-
-    "freedoom2_default": {
-        "main_goal": {
-            "name": "exit_area",
-            "type": "exit",
-            "x": 1024.0,
-            "y": 512.0,
-            "radius": 192.0,
-            "reward": 10.0,
-        },
-
-        "checkpoints": [
-            {
-                "name": "leave_start_area",
-                "type": "route",
-                "x": 0.0,
-                "y": 0.0,
-                "radius": 128.0,
-                "reward": 4.0,
-            },
-            {
-                "name": "first_combat_area",
-                "type": "route",
-                "x": 256.0,
-                "y": 128.0,
-                "radius": 128.0,
-                "reward": 5.0,
-            },
-            {
-                "name": "first_door_or_opening",
-                "type": "route",
-                "x": 512.0,
-                "y": 256.0,
-                "radius": 128.0,
-                "reward": 6.0,
-            },
-            {
-                "name": "main_route_midpoint",
-                "type": "route",
-                "x": 768.0,
-                "y": 384.0,
-                "radius": 160.0,
-                "reward": 8.0,
-            },
-        ],
-
-        "secrets": [
-            {
-                "name": "secret_1_placeholder",
-                "type": "secret",
-                "x": 384.0,
-                "y": -256.0,
-                "radius": 96.0,
-                "reward": 6.0,
-            },
-        ],
-
-        "keys": [],
-        "locked_doors": [],
-        "switches": [],
-        "use_points": [],
-    },
-}
-"""
 GENERIC_EXPLORATION_ROUTE_ZONES = []
 
 

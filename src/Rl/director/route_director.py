@@ -30,12 +30,37 @@ class RouteDirector:
         self.last_distance = None
         self.best_distance = None
         self.last_objective_name = None
+        self.current_strategy = "safe_main_route"
+        self.reached_nodes = set()
+        self.failed_target_steps = 0
+        self.strategy_attempts = {}
 
     def reset(self):
         self.active_target = "explore"
         self.last_distance = None
         self.best_distance = None
         self.last_objective_name = None
+        self.current_strategy = "safe_main_route"
+        self.reached_nodes = set()
+        self.failed_target_steps = 0
+        self.strategy_attempts = {}
+
+    def choose_strategy(self, game_state):
+        health = int(game_state.get("health", 100) or 100)
+        ammo = int(game_state.get("ammo", 0) or 0)
+        enemy_visible = bool(game_state.get("enemy_visible", False))
+        stuck = game_state.get("sensory_situation") == "stuck_or_looping"
+
+        if health <= 25:
+            return "resource_recovery"
+
+        if enemy_visible and ammo > 0:
+            return "combat_clear_then_exit"
+
+        if stuck:
+            return "explore_if_lost"
+
+        return "safe_main_route"
 
     def find_key_target(self, level_guide, key_name):
         for key_target in level_guide.get("keys", []):
@@ -182,6 +207,9 @@ class RouteDirector:
         }
 
     def evaluate(self, game_state, action, level_guide=None):
+        self.current_strategy = self.choose_strategy(game_state)
+        objective = self.choose_objective(game_state, level_guide)
+
         if level_guide is None:
             level_guide = {}
 
@@ -256,6 +284,7 @@ class RouteDirector:
         return {
             "target": objective_name,
             "objective": objective,
+            "strategy": self.current_strategy,
             "reason": objective.get("reason"),
             "distance": distance,
             "distance_delta": distance_delta,
@@ -263,4 +292,8 @@ class RouteDirector:
             "hint_action": hint_action,
             "dx": norm_dx,
             "dy": norm_dy,
+            "route_stage": objective.get("route_stage"),
+            "next_nodes": objective.get("next", []),
+            "needs_resource": self.current_strategy == "resource_recovery",
+            "lost_or_stuck": self.current_strategy == "explore_if_lost",
         }
