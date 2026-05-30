@@ -2,6 +2,7 @@ import sys
 import os
 import cv2
 import json
+import math
 from pathlib import Path
 from collections import deque
 
@@ -346,7 +347,7 @@ class DoomEnv(gym.Env):
         # Curriculum
         # -----------------------------------------------------
 
-        self.curriculum_stage = 3
+        self.curriculum_stage = 0
         self.max_stage = 7
         self.curriculum_rewards = []
         self.curriculum_log_interval = 50
@@ -1046,6 +1047,9 @@ class DoomEnv(gym.Env):
         self.route_progress_level = 0
         self.route_zones_reached = set()
         self.best_route_progress_level = 0
+        self.goal_bubble_best_dist = {}
+        self.goal_bubble_last_dist = {}
+        self.goal_bubble_stall_steps = {}
         self.goal_turn_steps = 0
         self.recent_position_tiles = []
         self.repeated_position_steps = 0
@@ -1066,6 +1070,8 @@ class DoomEnv(gym.Env):
         self.no_position_change_steps = 0
         self.last_distance_to_goal = None
         self.no_distance_progress_steps = 0
+        self.last_exit_distance = None
+        self.best_exit_distance = None
 
         self.wall_escape_mode = False
         self.wall_escape_step = 0
@@ -2919,6 +2925,7 @@ class DoomEnv(gym.Env):
 
         game_state["near_use_point"] = near_use_point
         game_state["nearest_use_name"] = nearest_use_name
+        reward += self.exit_distance_progress_reward(game_state)
 
         if near_use_point:
             if action == "use":
@@ -3498,6 +3505,9 @@ class DoomEnv(gym.Env):
 
         self._step_count += 1
         truncated = self._step_count >= self._max_episode_steps
+        reward += self.route_progress_reward(game_state)
+        reward += self.goal_attraction_bubble_reward(game_state)
+        #self.update_curriculum_from_progress(game_state)
 
         if terminated or truncated:
             self.controller.release_all()
@@ -3791,31 +3801,78 @@ class DoomEnv(gym.Env):
     # ---------------------------------------------------------
 
     def _build_shared_game_state(
-        self,
-        base_game_state,
-        object_result=None,
-        scene_result=None,
-        hud_result=None,
-    ):
-        """
-        Convert Doom Retro state + learned predictions into the same format
-        used by ViZDoom and SharedDoomLogic.
+            self,
+            base_game_state,
+            object_result=None,
+            scene_result=None,
+            hud_result=None,
+        ):
+            """
+            Convert Doom Retro state + learned predictions into the same format
+            used by ViZDoom and SharedDoomLogic.
 
-        This does not control the game by itself.
-        It only prepares normalized debug/reward data.
-        """
+            This does not control the game by itself.
+            It only prepares normalized debug/reward data.
+            """
 
-        if base_game_state is None:
-            base_game_state = {}
+            if base_game_state is None:
+                base_game_state = {}
 
-        shared_game_state = build_doomretro_game_state(
-            base_game_state=base_game_state,
-            object_prediction=object_result,
-            scene_prediction=scene_result,
-            hud_prediction=hud_result,
-        )
+            shared_game_state = build_doomretro_game_state(
+                base_game_state=base_game_state,
+                object_prediction=object_result,
+                scene_prediction=scene_result,
+                hud_prediction=hud_result,
+            )
 
-        return shared_game_state
+            return shared_game_state
+        
+    def exit_distance_progress_reward(self, game_state):
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        if x is None or y is None:
+            return 0.0
+
+        main_goal = self.level_guide.get("main_goal")
+        if not main_goal:
+            return 0.0
+
+        x = float(x)
+        y = float(y)
+        gx = float(main_goal["x"])
+        gy = float(main_goal["y"])
+
+        dist = ((x - gx) ** 2 + (y - gy) ** 2) ** 0.5
+
+        if not hasattr(self, "last_exit_distance"):
+            self.last_exit_distance = None
+
+        if not hasattr(self, "best_exit_distance"):
+            self.best_exit_distance = None
+
+        reward = 0.0
+
+        if self.last_exit_distance is not None:
+            improvement = self.last_exit_distance - dist
+
+            if improvement > 1.0:
+                reward += min(0.08, improvement / 128.0)
+                self.reward_manager.add("exit_distance_closer", reward)
+
+            elif improvement < -4.0:
+                penalty = min(0.10, abs(improvement) / 128.0)
+                reward -= penalty
+                self.reward_manager.add("exit_distance_farther", -penalty)
+
+        if self.best_exit_distance is None or dist < self.best_exit_distance - 8.0:
+            self.best_exit_distance = dist
+            reward += 0.10
+            self.reward_manager.add("new_best_exit_distance", 0.10)
+
+        self.last_exit_distance = dist
+
+        return reward
 
    
     def normalize_weapon_name(self, weapon_name):
@@ -3944,6 +4001,40 @@ class DoomEnv(gym.Env):
         self.last_shared_debug = debug
 
         return float(total)
+    
+    def goal_heading_reward(self, game_state):
+        x = game_state.get("x")
+        y = game_state.get("y")
+        angle = game_state.get("angle")
+
+        if x is None or y is None or angle is None:
+            return 0.0
+
+        target = self.get_active_goal_bubble_target(game_state)
+
+        if target is None:
+            return 0.0
+
+        x = float(x)
+        y = float(y)
+        angle = float(angle)
+
+        tx = float(target["x"])
+        ty = float(target["y"])
+
+        target_angle = math.degrees(math.atan2(ty - y, tx - x))
+        diff = abs((target_angle - angle + 180.0) % 360.0 - 180.0)
+
+        reward = 0.0
+
+        if diff <= 15:
+            reward += 0.05
+            self.reward_manager.add("facing_goal", 0.05)
+        elif diff >= 90:
+            reward -= 0.05
+            self.reward_manager.add("facing_away_from_goal", -0.05)
+
+        return reward
         
     def _shared_wall_reward_only(self):
         """
@@ -4489,6 +4580,154 @@ class DoomEnv(gym.Env):
             self.reward_manager.add("wall_recovery_action", 0.10)
 
         return reward
+    
+    def goal_attraction_bubble_reward(self, game_state):
+        """
+        Reverse wall-bubble reward.
+
+        The agent gets:
+        - small reward for being in the outer target bubble
+        - bigger reward for entering closer rings
+        - progress reward for reducing distance
+        - penalty for moving away after entering the bubble
+        - penalty for spinning/stalling inside the bubble
+        """
+
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        if x is None or y is None:
+            return 0.0
+
+        x = float(x)
+        y = float(y)
+
+        target = self.get_active_goal_bubble_target(game_state)
+
+        if target is None:
+            return 0.0
+
+        tx = float(target["x"])
+        ty = float(target["y"])
+        target_name = target.get("name", "unknown_goal")
+
+        dx = x - tx
+        dy = y - ty
+        dist = (dx * dx + dy * dy) ** 0.5
+
+        reward = 0.0
+
+        # Track best distance to this target.
+        if not hasattr(self, "goal_bubble_best_dist"):
+            self.goal_bubble_best_dist = {}
+
+        if not hasattr(self, "goal_bubble_last_dist"):
+            self.goal_bubble_last_dist = {}
+
+        if not hasattr(self, "goal_bubble_stall_steps"):
+            self.goal_bubble_stall_steps = {}
+
+        best_dist = self.goal_bubble_best_dist.get(target_name)
+        last_dist = self.goal_bubble_last_dist.get(target_name)
+
+        if best_dist is None:
+            best_dist = dist
+            self.goal_bubble_best_dist[target_name] = dist
+
+        if last_dist is None:
+            last_dist = dist
+
+        improvement = last_dist - dist
+
+        # -----------------------------
+        # Ring reward: closer = bigger
+        # -----------------------------
+        if dist <= 1024:
+            reward += 0.01
+            self.reward_manager.add("goal_outer_bubble", 0.01)
+
+        if dist <= 768:
+            reward += 0.02
+            self.reward_manager.add("goal_mid_outer_bubble", 0.02)
+
+        if dist <= 512:
+            reward += 0.04
+            self.reward_manager.add("goal_mid_bubble", 0.04)
+
+        if dist <= 256:
+            reward += 0.08
+            self.reward_manager.add("goal_inner_bubble", 0.08)
+
+        if dist <= 128:
+            reward += 0.15
+            self.reward_manager.add("goal_core_bubble", 0.15)
+
+        # -----------------------------
+        # Delta reward: moving closer
+        # -----------------------------
+        if improvement > 2.0:
+            progress_reward = min(0.12, improvement / 128.0)
+            reward += progress_reward
+            self.reward_manager.add("goal_bubble_closer", progress_reward)
+
+            self.goal_bubble_stall_steps[target_name] = 0
+
+        elif improvement < -4.0:
+            penalty = min(0.20, abs(improvement) / 96.0)
+            reward -= penalty
+            self.reward_manager.add("goal_bubble_leaving", -penalty)
+
+        else:
+            self.goal_bubble_stall_steps[target_name] = (
+                self.goal_bubble_stall_steps.get(target_name, 0) + 1
+            )
+
+        # -----------------------------
+        # Best-distance reward
+        # -----------------------------
+        if dist < best_dist - 8.0:
+            self.goal_bubble_best_dist[target_name] = dist
+            reward += 0.10
+            self.reward_manager.add("goal_bubble_new_best", 0.10)
+
+        # -----------------------------
+        # Anti-spin inside bubble
+        # -----------------------------
+        stall_steps = self.goal_bubble_stall_steps.get(target_name, 0)
+
+        if dist <= 512 and stall_steps >= 8:
+            penalty = min(0.30, 0.03 * stall_steps)
+            reward -= penalty
+            self.reward_manager.add("goal_bubble_spin_stall", -penalty)
+
+        self.goal_bubble_last_dist[target_name] = dist
+
+        return reward
+    
+    def get_active_goal_bubble_target(self, game_state):
+        """
+        Pick the next unreached route target.
+
+        This prevents the agent from camping the corridor.
+        Once a zone is reached, the active bubble moves forward.
+        """
+
+        route_zones = self.level_guide.get("route_zones", [])
+
+        reached = getattr(self, "route_zones_reached", set())
+
+        for zone in route_zones:
+            name = zone.get("name")
+
+            if name not in reached:
+                return zone
+
+        main_goal = self.level_guide.get("main_goal")
+
+        if main_goal is not None:
+            return main_goal
+
+        return None
 
     def _update_position_tracking(self, game_state, frame=None, motion=0.0, action=None):
         distance_moved = 0.0

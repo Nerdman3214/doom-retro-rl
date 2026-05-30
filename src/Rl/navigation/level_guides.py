@@ -47,34 +47,6 @@ LEVEL_GUIDES = {
                 "reward": 0.5,
             },
             {
-                "name": "right_route",
-                "x": 570,
-                "y": 304,
-                "radius": 128,
-                "type": "route",
-                "next": ["door_area"],
-                "reward": 0.8,
-            },
-            {
-                "name": "door_area",
-                "x": 636,
-                "y": 304,
-                "radius": 128,
-                "type": "use_area",
-                "hint_action": "use",
-                "next": ["combat_corridor"],
-                "reward": 1.0,
-            },
-            {
-                "name": "combat_corridor",
-                "x": 720,
-                "y": 316,
-                "radius": 144,
-                "type": "combat_route",
-                "next": ["exit_route", "resource_recovery"],
-                "reward": 1.5,
-            },
-            {
                 "name": "exit_route",
                 "x": 930,
                 "y": 464,
@@ -114,7 +86,10 @@ LEVEL_GUIDES = {
             },
         ],
 
-        "route_zones": [],
+        "route_zones": [
+            {"name": "spawn_exit", "x": 600, "y": 360, "radius": 120, "reward": 0.50},
+            {"name": "exit_route", "x": 1150, "y": 500, "radius": 180, "reward": 2.00},
+        ],
 
         "main_goal": {
             "name": "level_exit",
