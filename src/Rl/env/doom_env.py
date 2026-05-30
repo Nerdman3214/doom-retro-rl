@@ -159,6 +159,10 @@ class DoomEnv(gym.Env):
         self.secret_area_reached_this_episode = False
         self.secrets_found_this_episode = set()
         self.training_mode = training_mode
+        self.last_progress_position = None
+        self.no_position_change_steps = 0
+        self.last_distance_to_goal = None
+        self.no_distance_progress_steps = 0
         # in __init__
         self.recent_loop_tile = None
         self.recent_loop_steps = 0
@@ -590,6 +594,7 @@ class DoomEnv(gym.Env):
         if stage == 0:
             return [
                 "move_forward",
+                "move_backward",
                 "turn_left",
                 "turn_right",
             ]
@@ -1051,6 +1056,10 @@ class DoomEnv(gym.Env):
         self.pending_retrace_action = None
         self.recent_loop_tile = None
         self.recent_loop_steps = 0
+        self.last_progress_position = None
+        self.no_position_change_steps = 0
+        self.last_distance_to_goal = None
+        self.no_distance_progress_steps = 0
 
         self.wall_escape_mode = False
         self.wall_escape_step = 0
@@ -1480,6 +1489,14 @@ class DoomEnv(gym.Env):
             pre_wall_info.get("front_wall", False)
             or wall_sensor_state["front_blocked"]
         )
+
+        wall_penalty = self.strong_wall_penalty(
+            action=action,
+            wall_info=pre_wall_info,
+            game_state=pre_game_state,
+        )
+
+        reward += wall_penalty
 
         pre_game_state["scene_label"] = pre_scene_label
         pre_game_state["scene_confidence"] = pre_scene_confidence
@@ -1953,16 +1970,29 @@ class DoomEnv(gym.Env):
             print(f"[override] final_sanitize: {final_before} -> {action}")
 
         if action not in self.get_allowed_actions():
-            # Safer fallback than always moving forward.
-            if pre_wall_info.get("front_wall", False) or pre_wall_info.get("front_ratio", 0.0) > 0.45:
+            allowed = self.get_allowed_actions()
+
+            if "move_backward" in allowed and (
+                pre_wall_info.get("front_wall", False)
+                or pre_wall_info.get("front_ratio", 0.0) > 0.35
+                or self.stuck_counter >= 2
+                or self.wall_contact_steps >= 2
+            ):
                 fixed_action = "move_backward"
+
+            elif "turn_left" in allowed and "turn_right" in allowed:
+                left_ratio = float(pre_wall_info.get("left_ratio", 0.0) or 0.0)
+                right_ratio = float(pre_wall_info.get("right_ratio", 0.0) or 0.0)
+                fixed_action = "turn_left" if left_ratio <= right_ratio else "turn_right"
+
             else:
-                fixed_action = "move_forward"
+                fixed_action = allowed[0]
 
             print(
                 f"[override] final_safety: {action} -> {fixed_action} "
-                f"because stage={self.curriculum_stage} allowed={self.get_allowed_actions()}"
+                f"because stage={self.curriculum_stage} allowed={allowed}"
             )
+
             action = fixed_action
 
         helper_action = self.helper.get_action(pre_game_state)
@@ -2129,6 +2159,17 @@ class DoomEnv(gym.Env):
         game_state["distance_moved"] = distance_moved
         corner_trapped = self.detect_corner_trap(game_state)
         game_state["corner_trapped"] = corner_trapped
+
+        director_result = self.route_director.evaluate(
+            game_state=game_state,
+            action=action,
+            level_guide=self.level_guide,
+        )
+
+        reward += self.stagnation_penalty(
+            game_state=game_state,
+            director_result=director_result,
+        )
 
         # -----------------------------------------------------
         # Post-action scene state
@@ -2411,6 +2452,12 @@ class DoomEnv(gym.Env):
         # Strong wall / stuck punishment
 
         wall_info = self._wall_direction_info(raw_frame)
+
+        reward += self.strong_wall_penalty(
+            action=action,
+            wall_info=wall_info,
+            game_state=game_state,
+        )
 
         game_state["left_wall_ratio"] = wall_info["left_ratio"]
         game_state["front_wall_ratio"] = wall_info["front_ratio"]
@@ -3493,6 +3540,31 @@ class DoomEnv(gym.Env):
                         f"{self.best_episode_reward:.2f}"
                     )
 
+        front_ratio = float(pre_wall_info.get("front_ratio", 0.0) or 0.0)
+        left_ratio = float(pre_wall_info.get("left_ratio", 0.0) or 0.0)
+        right_ratio = float(pre_wall_info.get("right_ratio", 0.0) or 0.0)
+
+        front_safe = front_ratio < 0.28
+        sides_safe = left_ratio < 0.38 and right_ratio < 0.38
+
+        can_use_exploration_override = (
+            self.retrace_lock_steps <= 0
+            and not getattr(self.retrace_navigator, "active", False)
+            and self.stuck_counter == 0
+            and self.wall_contact_steps == 0
+            and front_safe
+            and sides_safe
+        )
+
+        if self.wall_contact_steps > 0 and action in ["move_backward", "turn_left", "turn_right", "strafe_left", "strafe_right"]:
+            reward += 0.10
+        self.reward_manager.add("wall_escape_attempt", 0.10)
+
+        if front_ratio < 0.25 and left_ratio < 0.35 and right_ratio < 0.35:
+            if self.wall_contact_steps > 0 or self.stuck_counter > 0:
+                reward += 0.25
+        self.reward_manager.add("cleared_wall_pressure", 0.25)
+
         info["route_progress_level"] = self.route_progress_level
         info["best_route_progress_level"] = self.best_route_progress_level
         info["unique_tiles"] = len(self.visited_tiles)
@@ -4206,6 +4278,66 @@ class DoomEnv(gym.Env):
         self.last_shared_debug["final_reward_after_shared_blend"] = float(base_reward + clipped)
 
         return float(base_reward + clipped)
+    
+    def strong_wall_penalty(self, action, wall_info, game_state):
+        """
+        Strong temporary wall penalty.
+
+        Purpose:
+        - punish moving into walls
+        - punish staying glued to walls
+        - punish repeated wall contact
+        - still allow turning/backing up as recovery
+        """
+
+        if not wall_info:
+            return 0.0
+
+        reward = 0.0
+
+        left_ratio = float(wall_info.get("left_ratio", 0.0) or 0.0)
+        front_ratio = float(wall_info.get("front_ratio", 0.0) or 0.0)
+        right_ratio = float(wall_info.get("right_ratio", 0.0) or 0.0)
+
+        front_wall = bool(wall_info.get("front_wall", False)) or front_ratio >= 0.35
+        side_wall = left_ratio >= 0.35 or right_ratio >= 0.35
+        heavy_wall_pressure = front_ratio >= 0.45 or left_ratio >= 0.50 or right_ratio >= 0.50
+
+        sensory_situation = game_state.get("sensory_situation")
+        stuck_or_looping = sensory_situation == "stuck_or_looping"
+
+        # 1. Biggest mistake: moving forward into a front wall.
+        if action == "move_forward" and front_wall:
+            reward -= 1.00
+            self.reward_manager.add("strong_forward_into_wall", -1.00)
+
+        # 2. Strong wall pressure near any side.
+        if heavy_wall_pressure:
+            reward -= 0.50
+            self.reward_manager.add("strong_wall_pressure", -0.50)
+
+        # 3. Side scraping is bad, but less bad than front collision.
+        elif side_wall:
+            reward -= 0.25
+            self.reward_manager.add("side_wall_scrape", -0.25)
+
+        # 4. Repeated wall contact gets worse over time.
+        if self.wall_contact_steps >= 2:
+            penalty = min(1.50, 0.20 * self.wall_contact_steps)
+            reward -= penalty
+            self.reward_manager.add("repeated_wall_contact", -penalty)
+
+        # 5. Wall + stuck loop is the worst case.
+        if stuck_or_looping and (front_wall or side_wall):
+            reward -= 1.00
+            self.reward_manager.add("stuck_against_wall", -1.00)
+
+        # 6. Do not punish recovery actions as hard.
+        if action in ["move_backward", "turn_left", "turn_right", "strafe_left", "strafe_right"]:
+            reward += 0.10
+            self.reward_manager.add("wall_recovery_action", 0.10)
+
+        return reward
 
     def _update_position_tracking(self, game_state, frame=None, motion=0.0, action=None):
         distance_moved = 0.0
@@ -4289,6 +4421,73 @@ class DoomEnv(gym.Env):
             score = self.preference_model(frame_tensor)
 
         return float(score.item())
+    
+    def stagnation_penalty(self, game_state, director_result=None):
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        if x is None or y is None:
+            return 0.0
+
+        x = float(x)
+        y = float(y)
+
+        reward = 0.0
+
+        if self.last_progress_position is not None:
+            old_x, old_y = self.last_progress_position
+            moved = ((x - old_x) ** 2 + (y - old_y) ** 2) ** 0.5
+
+            if moved < 2.0:
+                self.no_position_change_steps += 1
+            else:
+                self.no_position_change_steps = 0
+
+            if self.no_position_change_steps >= 4:
+                penalty = min(1.0, 0.10 * self.no_position_change_steps)
+                reward -= penalty
+                self.reward_manager.add("no_position_change", -penalty)
+
+                if self.no_position_change_steps % 5 == 0:
+                    print(
+                        f"[stagnation] no_position_change "
+                        f"steps={self.no_position_change_steps} "
+                        f"moved={moved:.2f} "
+                        f"penalty={penalty:.2f}"
+                    )
+
+        self.last_progress_position = (x, y)
+
+        if director_result is not None:
+            distance = director_result.get("distance")
+
+            if distance is not None:
+                distance = float(distance)
+
+                if self.last_distance_to_goal is not None:
+                    improvement = self.last_distance_to_goal - distance
+
+                    if improvement < 1.0:
+                        self.no_distance_progress_steps += 1
+                    else:
+                        self.no_distance_progress_steps = 0
+
+                    if self.no_distance_progress_steps >= 8:
+                        penalty = min(0.75, 0.05 * self.no_distance_progress_steps)
+                        reward -= penalty
+                        self.reward_manager.add("no_goal_distance_progress", -penalty)
+
+                        if self.no_distance_progress_steps % 5 == 0:
+                            print(
+                                f"[stagnation] no_goal_distance_progress "
+                                f"steps={self.no_distance_progress_steps} "
+                                f"improvement={improvement:.2f} "
+                                f"penalty={penalty:.2f}"
+                            )
+
+                self.last_distance_to_goal = distance
+
+        return reward
 
     def _record_step(self, frame, action, reward, game_state):
         if self.reward_overlay is not None:
