@@ -5,6 +5,12 @@ import cv2
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
+import math
+import traceback
+
+from rewards.reward_manager import RewardManager
+from director.route_director import RouteDirector
+from navigation.level_guides import get_level_guide
 from observation.native_frame_packer import NativeFramePacker
 from env.shared_doom_logic import SharedDoomLogic
 
@@ -87,6 +93,26 @@ class VizDoomEnv(gym.Env):
         self.observation_mode = observation_mode
         self.native_packer = NativeFramePacker(out_size=screen_size)
         self.shared_logic = SharedDoomLogic()
+        self.reward_manager = RewardManager()
+        self.route_director = RouteDirector()
+
+        self.current_level_name = "freedoom1_e1m1"
+        self.level_guide = get_level_guide(self.current_level_name)
+
+
+        self.last_progress_position = None
+        self.no_position_change_steps = 0
+        self.last_distance_to_goal = None
+        self.no_distance_progress_steps = 0
+
+        self.previous_position = None
+        self.previous_health = None
+        self.previous_ammo = None
+        self.previous_kill_count = 0
+        self.previous_item_count = 0
+
+        self.route_progress_level = 0
+        self.visited_tiles = set()
         self.previous_game_state = None
         self.last_reward_debug = {}
 
@@ -96,6 +122,17 @@ class VizDoomEnv(gym.Env):
         self.last_ammo = None
         self.last_kill_count = 0
         self.last_item_count = 0
+        self.route_zones_reached = set()
+        self.route_progress_level = 0
+        self.curriculum_stage = 0
+        self.max_stage = 4
+        self.stage_success_counts = {
+            0: 0,
+            1: 0,
+            2: 0,
+            3: 0,
+            4: 0,
+        }
 
         self.action_space = spaces.Discrete(len(self.ACTIONS))
 
@@ -225,6 +262,438 @@ class VizDoomEnv(gym.Env):
         game.init()
         self.game = game
 
+    def get_stage_config(self):
+        configs = {
+            0: {
+                "name": "movement_basic",
+                "allow_shoot": False,
+                "allow_use": False,
+            },
+            1: {
+                "name": "movement_escape",
+                "allow_shoot": False,
+                "allow_use": False,
+            },
+            2: {
+                "name": "doors_and_use",
+                "allow_shoot": False,
+                "allow_use": True,
+            },
+            3: {
+                "name": "complete_level_basic",
+                "allow_shoot": True,
+                "allow_use": True,
+            },
+        }
+
+        return configs.get(self.curriculum_stage, configs[3])
+
+
+    def get_allowed_actions(self):
+        stage = self.curriculum_stage
+
+        if stage == 0:
+            return [
+                "move_forward",
+                "move_backward",
+                "turn_left",
+                "turn_right",
+            ]
+
+        if stage == 1:
+            return [
+                "move_forward",
+                "move_backward",
+                "turn_left",
+                "turn_right",
+                "strafe_left",
+                "strafe_right",
+            ]
+
+        if stage == 2:
+            return [
+                "move_forward",
+                "move_backward",
+                "turn_left",
+                "turn_right",
+                "strafe_left",
+                "strafe_right",
+                "use",
+            ]
+
+        return [
+            "move_forward",
+            "move_backward",
+            "turn_left",
+            "turn_right",
+            "strafe_left",
+            "strafe_right",
+            "shoot",
+            "use",
+        ]
+    
+    def _angle_diff_degrees(self, a, b):
+        diff = (a - b + 180.0) % 360.0 - 180.0
+        return diff
+
+
+    def _is_enemy_object(self, name):
+        if not name:
+            return False
+
+        name = str(name).lower()
+
+        enemy_keywords = [
+            "zombie",
+            "shotgun",
+            "imp",
+            "demon",
+            "spectre",
+            "cacodemon",
+            "baron",
+            "hell",
+            "trooper",
+            "sergeant",
+            "former",
+            "chaingun",
+            "revenant",
+            "mancubus",
+            "arachnotron",
+            "pain",
+            "lost",
+        ]
+
+        return any(word in name for word in enemy_keywords)
+    
+    def route_progress_reward(self, game_state):
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        if x is None or y is None:
+            return 0.0
+
+        x = float(x)
+        y = float(y)
+
+        reward = 0.0
+        route_zones = self.level_guide.get("route_zones", [])
+
+        for zone in route_zones:
+            name = zone.get("name")
+            zx = float(zone.get("x", 0.0))
+            zy = float(zone.get("y", 0.0))
+            radius = float(zone.get("radius", 128.0))
+            zone_reward = float(zone.get("reward", 0.5))
+
+            if name in self.route_zones_reached:
+                continue
+
+            dist = ((x - zx) ** 2 + (y - zy) ** 2) ** 0.5
+
+            if dist <= radius:
+                self.route_zones_reached.add(name)
+                self.route_progress_level += 1
+                reward += zone_reward
+                self.reward_manager.add(f"viz_route_progress_{name}", zone_reward)
+
+                print(
+                    f"[viz_route_progress] reached={name} "
+                    f"level={self.route_progress_level} "
+                    f"x={x:.1f} y={y:.1f} reward={zone_reward:.2f}"
+                )
+
+        return reward
+
+
+    def enrich_game_state(self, game_state):
+        """
+        Add DoomEnv-like combat/navigation keys to ViZDoom state.
+        """
+
+        x = game_state.get("x")
+        y = game_state.get("y")
+        angle = game_state.get("angle")
+
+        enemy_visible = False
+        enemy_centered = False
+        enemy_left = False
+        enemy_right = False
+        enemy_distance = None
+        enemy_count = 0
+
+        if x is not None and y is not None and angle is not None:
+            px = float(x)
+            py = float(y)
+            player_angle = float(angle)
+
+            closest_dist = None
+            closest_angle_diff = None
+
+            for obj in game_state.get("objects", []):
+                name = obj.get("name")
+
+                if not self._is_enemy_object(name):
+                    continue
+
+                ox = obj.get("position_x")
+                oy = obj.get("position_y")
+
+                if ox is None or oy is None:
+                    continue
+
+                enemy_count += 1
+
+                dx = float(ox) - px
+                dy = float(oy) - py
+                dist = math.sqrt(dx * dx + dy * dy)
+
+                # Doom angle convention can vary, but this is good enough for teacher labels.
+                target_angle = math.degrees(math.atan2(dy, dx))
+                angle_diff = self._angle_diff_degrees(target_angle, player_angle)
+
+                if closest_dist is None or dist < closest_dist:
+                    closest_dist = dist
+                    closest_angle_diff = angle_diff
+
+            if closest_dist is not None:
+                closest_tiles = closest_dist / 64.0
+
+                # Only count as visible/relevant if inside useful combat range.
+                if closest_tiles <= 8.0 and abs(closest_angle_diff) <= 70.0:
+                    enemy_visible = True
+                    enemy_distance = closest_dist
+
+                    if abs(closest_angle_diff) <= 10.0:
+                        enemy_centered = True
+                    elif closest_angle_diff < 0:
+                        enemy_left = True
+                    else:
+                        enemy_right = True
+
+        game_state["enemy_visible"] = enemy_visible
+        game_state["enemy_centered"] = enemy_centered
+        game_state["enemy_left"] = enemy_left
+        game_state["enemy_right"] = enemy_right
+        game_state["enemy_count"] = enemy_count
+        game_state["enemy_distance"] = enemy_distance
+        game_state["enemy_distance_tiles"] = (
+            enemy_distance / 64.0 if enemy_distance is not None else None
+        )
+
+        game_state["curriculum_stage"] = self.curriculum_stage
+
+        return game_state
+    
+    def fast_enemy_reaction_action(self, action_name, game_state):
+        enemy_visible = bool(game_state.get("enemy_visible", False))
+        enemy_centered = bool(game_state.get("enemy_centered", False))
+        enemy_left = bool(game_state.get("enemy_left", False))
+        enemy_right = bool(game_state.get("enemy_right", False))
+        enemy_distance_tiles = game_state.get("enemy_distance_tiles")
+        ammo = int(game_state.get("ammo", 0) or 0)
+        health = int(game_state.get("health", 100) or 100)
+
+        if not enemy_visible:
+            return action_name
+
+        # If enemy is far away, do not hijack routing.
+        if enemy_distance_tiles is not None and float(enemy_distance_tiles) > 7.0:
+            return action_name
+
+        # No ammo: only dodge if enemy is close or health is low.
+        if ammo <= 0:
+            enemy_close = (
+                enemy_distance_tiles is not None
+                and float(enemy_distance_tiles) <= 2.0
+            )
+
+            if enemy_close and health <= 50:
+                return "move_backward"
+
+            return action_name
+
+        # Ammo exists: shoot only when centered.
+        if enemy_centered:
+            return "shoot"
+
+        # If enemy is off-center, turn toward it, but only if close enough.
+        enemy_relevant = (
+            enemy_distance_tiles is None
+            or float(enemy_distance_tiles) <= 6.0
+        )
+
+        if enemy_relevant and enemy_left:
+            return "turn_left"
+
+        if enemy_relevant and enemy_right:
+            return "turn_right"
+
+        return action_name
+    
+    def goal_progress_reward(self, director_result):
+        if director_result is None:
+            return 0.0
+
+        distance_delta = float(director_result.get("distance_delta", 0.0) or 0.0)
+
+        reward = 0.0
+
+        if distance_delta > 1.0:
+            reward += 0.03
+            self.reward_manager.add("small_goal_progress", 0.03)
+
+        if distance_delta > 8.0:
+            reward += 0.07
+            self.reward_manager.add("medium_goal_progress", 0.07)
+
+        if distance_delta > 20.0:
+            reward += 0.10
+            self.reward_manager.add("large_goal_progress", 0.10)
+
+        if distance_delta < -12.0:
+            reward -= 0.08
+            self.reward_manager.add("moving_away_from_goal", -0.08)
+
+        return reward
+        
+    def stagnation_penalty(self, game_state, director_result=None):
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        if x is None or y is None:
+            return 0.0
+
+        x = float(x)
+        y = float(y)
+
+        reward = 0.0
+
+        if self.last_progress_position is not None:
+            old_x, old_y = self.last_progress_position
+            moved = math.sqrt((x - old_x) ** 2 + (y - old_y) ** 2)
+
+            if moved < 2.0:
+                self.no_position_change_steps += 1
+            else:
+                self.no_position_change_steps = 0
+
+            if self.no_position_change_steps >= 4:
+                penalty = min(0.30, 0.03 * self.no_position_change_steps)
+                reward -= penalty
+                self.reward_manager.add("no_position_change", -penalty)
+
+        self.last_progress_position = (x, y)
+
+        if director_result is not None:
+            distance = director_result.get("distance")
+
+            if distance is not None:
+                distance = float(distance)
+
+                if self.last_distance_to_goal is not None:
+                    improvement = self.last_distance_to_goal - distance
+
+                    if improvement < 1.0:
+                        self.no_distance_progress_steps += 1
+                    else:
+                        self.no_distance_progress_steps = 0
+
+                    if self.no_distance_progress_steps >= 8:
+                        penalty = min(0.25, 0.02 * self.no_distance_progress_steps)
+                        reward -= penalty
+                        self.reward_manager.add("no_goal_distance_progress", -penalty)
+
+                self.last_distance_to_goal = distance
+
+        return reward
+    
+    def combat_movement_reward(self, game_state, action_name, distance_moved):
+        enemy_visible = bool(game_state.get("enemy_visible", False))
+        enemy_centered = bool(game_state.get("enemy_centered", False))
+        ammo = int(game_state.get("ammo", 0) or 0)
+        health = int(game_state.get("health", 100) or 100)
+
+        reward = 0.0
+        moved = float(distance_moved or 0.0)
+
+        if not enemy_visible:
+            return 0.0
+
+        if moved < 2.0 and action_name in ["turn_left", "turn_right", "shoot"]:
+            reward -= 0.12
+            self.reward_manager.add("combat_standing_still", -0.12)
+
+        if action_name in ["strafe_left", "strafe_right"] and moved >= 2.0:
+            reward += 0.08
+            self.reward_manager.add("combat_strafe_movement", 0.08)
+
+        if action_name == "move_backward":
+            reward += 0.05
+            self.reward_manager.add("combat_retreat_spacing", 0.05)
+
+        if action_name == "shoot" and ammo <= 0:
+            reward -= 0.60
+            self.reward_manager.add("shoot_no_ammo", -0.60)
+
+        elif action_name == "shoot" and enemy_centered and ammo > 0:
+            reward += 0.30
+            self.reward_manager.add("shoot_centered_with_ammo", 0.30)
+
+        elif action_name == "shoot" and enemy_visible and not enemy_centered and ammo > 0:
+            reward -= 0.15
+            self.reward_manager.add("shoot_not_centered", -0.15)
+
+        if health <= 35 and action_name in ["strafe_left", "strafe_right", "move_backward"]:
+            reward += 0.10
+            self.reward_manager.add("low_health_dodge", 0.10)
+
+        return reward
+    
+    def _distance_moved(self, game_state):
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        if x is None or y is None:
+            return 0.0
+
+        pos = (float(x), float(y))
+
+        if self.previous_position is None:
+            self.previous_position = pos
+            return 0.0
+
+        old_x, old_y = self.previous_position
+        moved = math.sqrt((pos[0] - old_x) ** 2 + (pos[1] - old_y) ** 2)
+
+        self.previous_position = pos
+
+        return moved
+
+
+    def sanitize_action(self, action_name, game_state):
+        allowed = self.get_allowed_actions()
+
+        if action_name not in allowed:
+            return "move_forward" if "move_forward" in allowed else allowed[0]
+
+        ammo = int(game_state.get("ammo", 0) or 0)
+        enemy_visible = bool(game_state.get("enemy_visible", False))
+
+        if action_name == "shoot":
+            if "shoot" not in allowed:
+                return "move_forward"
+
+            if ammo <= 0:
+                return "move_backward" if "move_backward" in allowed else "turn_right"
+
+            if not enemy_visible:
+                return "move_forward"
+
+        if action_name == "use" and "use" not in allowed:
+            return "move_forward"
+
+        return action_name
+
     def _action_name_to_index(self, action_name):
         if action_name in self.ACTIONS:
             return self.ACTIONS.index(action_name)
@@ -340,6 +809,37 @@ class VizDoomEnv(gym.Env):
             values[name] = float(value)
 
         return values
+    def update_curriculum_from_progress(self, game_state):
+        reached = self.route_zones_reached
+
+        if self.curriculum_stage == 0:
+            if len(reached) >= 1:
+                self.stage_success_counts[0] += 1
+
+        elif self.curriculum_stage == 1:
+            if "right_route" in reached or "door_area" in reached:
+                self.stage_success_counts[1] += 1
+
+        elif self.curriculum_stage == 2:
+            if "door_area" in reached or "combat_corridor" in reached:
+                self.stage_success_counts[2] += 1
+
+        elif self.curriculum_stage == 3:
+            enemy_visible = bool(game_state.get("enemy_visible", False))
+            kill_count = int(game_state.get("kill_count", 0) or 0)
+
+            if "combat_corridor" in reached or enemy_visible or kill_count > 0:
+                self.stage_success_counts[3] += 1
+
+        current = self.curriculum_stage
+
+        if (
+            current < self.max_stage
+            and self.stage_success_counts.get(current, 0) >= 3
+        ):
+            old = self.curriculum_stage
+            self.curriculum_stage += 1
+            print(f"[viz_curriculum] advanced Stage {old} -> {self.curriculum_stage}")
     
     def _state_to_game_state(self, state):
         """
@@ -498,6 +998,21 @@ class VizDoomEnv(gym.Env):
         self.game.new_episode()
         self.step_count = 0
         self.shared_logic.reset_episode()
+        self.reward_manager.reset()
+        self.route_director.reset()
+        state = self.game.get_state()
+        start_state = self._state_to_game_state(state)
+        self.spawn_position = (
+            float(start_state.get("x", 0.0) or 0.0),
+            float(start_state.get("y", 0.0) or 0.0),
+        )
+
+        self.last_progress_position = None
+        self.no_position_change_steps = 0
+        self.last_distance_to_goal = None
+        self.no_distance_progress_steps = 0
+        self.previous_position = None
+        self.visited_tiles.clear()
 
         state = self.game.get_state()
         self.previous_game_state = self._state_to_game_state(state)
@@ -508,6 +1023,8 @@ class VizDoomEnv(gym.Env):
         self.last_ammo = vars_now.get("ammo")
         self.last_kill_count = vars_now.get("kill_count", 0)
         self.last_item_count = vars_now.get("item_count", 0)
+        self.route_zones_reached = set()
+        self.route_progress_level = 0
 
         obs = self._make_obs()
 
@@ -517,6 +1034,36 @@ class VizDoomEnv(gym.Env):
         }
 
         return obs, info
+    
+    def spawn_escape_reward(self, game_state):
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        if x is None or y is None:
+            return 0.0
+
+        x = float(x)
+        y = float(y)
+
+        sx, sy = getattr(self, "spawn_position", (0.0, 0.0))
+        dist_from_spawn = ((x - sx) ** 2 + (y - sy) ** 2) ** 0.5
+
+        reward = 0.0
+
+        if self.curriculum_stage <= 1:
+            if dist_from_spawn > 128:
+                reward += 0.05
+                self.reward_manager.add("spawn_escape_small", 0.05)
+
+            if dist_from_spawn > 256:
+                reward += 0.10
+                self.reward_manager.add("spawn_escape_medium", 0.10)
+
+            if dist_from_spawn > 384:
+                reward += 0.20
+                self.reward_manager.add("spawn_escape_large", 0.20)
+
+        return reward
 
     def step(self, action_index):
         original_action_index = int(action_index)
@@ -524,6 +1071,24 @@ class VizDoomEnv(gym.Env):
 
         pre_state = self.game.get_state()
         pre_game_state = self._state_to_game_state(pre_state)
+        pre_state = self.game.get_state()
+        pre_game_state = self._state_to_game_state(pre_state)
+        pre_game_state = self.enrich_game_state(pre_game_state)
+
+        action_name = self.sanitize_action(action_name, pre_game_state)
+
+        if self.curriculum_stage >= 3:
+            before_fast = action_name
+            action_name = self.fast_enemy_reaction_action(
+                action_name=action_name,
+                game_state=pre_game_state,
+            )
+
+            if action_name != before_fast and self.step_count % 25 == 0:
+                print(f"[vizdoom] fast_enemy_reaction: {before_fast} -> {action_name}")
+
+        action_index = self._action_name_to_index(action_name)
+        buttons, action_name = self._action_to_buttons(action_index)
 
         depth_obs = None
 
@@ -586,6 +1151,35 @@ class VizDoomEnv(gym.Env):
         state = None if done else self.game.get_state()
         reward = self._compute_reward(action_name, state)
 
+        post_game_state = self._state_to_game_state(state)
+        post_game_state = self.enrich_game_state(post_game_state)
+
+        distance_moved = self._distance_moved(post_game_state)
+        post_game_state["distance_moved"] = distance_moved
+        post_game_state["action"] = action_name
+
+        director_result = self.route_director.evaluate(
+            game_state=post_game_state,
+            action=action_name,
+            level_guide=self.level_guide,
+        )
+
+        reward += self.spawn_escape_reward(post_game_state)
+        reward += self.route_progress_reward(post_game_state)
+
+        self.update_curriculum_from_progress(post_game_state)
+
+        reward += self.goal_progress_reward(director_result)
+        reward += self.stagnation_penalty(
+            game_state=post_game_state,
+            director_result=director_result,
+        )
+        reward += self.combat_movement_reward(
+            game_state=post_game_state,
+            action_name=action_name,
+            distance_moved=distance_moved,
+        )
+
         obs = self._make_obs()
 
         info = {
@@ -599,6 +1193,8 @@ class VizDoomEnv(gym.Env):
             "last_action": self.game.get_last_action(),
             "episode_time": self.game.get_episode_time(),
             "game_vars": self._get_game_vars(state),
+            "game_state": post_game_state,
+            "director_result": director_result,
             "reward_debug": self.last_reward_debug,
         }
 

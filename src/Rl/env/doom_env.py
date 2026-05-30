@@ -346,7 +346,7 @@ class DoomEnv(gym.Env):
         # Curriculum
         # -----------------------------------------------------
 
-        self.curriculum_stage = 0
+        self.curriculum_stage = 3
         self.max_stage = 7
         self.curriculum_rewards = []
         self.curriculum_log_interval = 50
@@ -1023,7 +1023,13 @@ class DoomEnv(gym.Env):
             self.last_forced_weapon_reason = "group_enemy_safe_rocket"
             return "swap_weapon"
 
+        ammo = int(game_state.get("ammo", 0) or 0)
+
         self.last_forced_weapon_reason = "swap_not_contextual"
+
+        if ammo <= 0:
+            return "move_backward"
+
         return "shoot" if enemy_centered else "move_backward"
 
     def reset(self, seed=None, options=None):
@@ -1594,18 +1600,6 @@ class DoomEnv(gym.Env):
                         f"stuck={self.stuck_counter}"
                     )
 
-            if pre_game_state.get("enemy_left", False):
-                before = action
-                action = "turn_left"
-                aimed_this_step = True
-                print(f"[override] aim_priority: {before} -> {action}")
-
-            elif pre_game_state.get("enemy_right", False):
-                before = action
-                action = "turn_right"
-                aimed_this_step = True
-                print(f"[override] aim_priority: {before} -> {action}")
-
             if not aimed_this_step:
                 before = action
                 pre_game_state["action"] = action
@@ -2022,6 +2016,10 @@ class DoomEnv(gym.Env):
             object_result=pre_object_result,
             wall_info=pre_wall_info,
         )
+        if action == "shoot" and int(pre_game_state.get("ammo", 0) or 0) <= 0:
+            before = action
+            action = "move_backward"
+            print(f"[override] no_ammo_after_tactical: {before} -> {action}")
 
         if action != before_weapon_guard:
             print(
@@ -2165,6 +2163,8 @@ class DoomEnv(gym.Env):
             action=action,
             level_guide=self.level_guide,
         )
+
+        reward += self.goal_progress_reward(director_result)
 
         reward += self.stagnation_penalty(
             game_state=game_state,
@@ -3852,6 +3852,56 @@ class DoomEnv(gym.Env):
         except Exception:
             return "None"
         
+    def fast_enemy_reaction_action(self, action, game_state):
+        """
+        Fast emergency combat reaction.
+
+        Purpose:
+        - shoot immediately when enemy is centered and ammo exists
+        - turn toward enemy quickly when off-center
+        - dodge/retreat instead of fighting with 0 ammo
+        """
+
+        enemy_visible = bool(game_state.get("enemy_visible", False))
+        enemy_centered = bool(game_state.get("enemy_centered", False))
+        enemy_left = bool(game_state.get("enemy_left", False))
+        enemy_right = bool(game_state.get("enemy_right", False))
+        ammo = int(game_state.get("ammo", 0) or 0)
+        health = int(game_state.get("health", 100) or 100)
+
+        if not enemy_visible:
+            return action
+
+        # Do not let combat interrupt retrace/wall recovery.
+        if (
+            self.retrace_lock_steps > 0
+            or getattr(self.retrace_navigator, "active", False)
+            or self.stuck_counter >= 4
+        ):
+            return action
+
+        # No ammo = do not fight. Move.
+        if ammo <= 0:
+            if health <= 35:
+                return "move_backward"
+
+            if self._step_count % 2 == 0:
+                return "strafe_left"
+            return "strafe_right"
+
+        # Enemy centered + ammo = shoot immediately.
+        if enemy_centered:
+            return "shoot"
+
+        # Enemy not centered = snap aim faster.
+        if enemy_left:
+            return "turn_left"
+
+        if enemy_right:
+            return "turn_right"
+
+        return action
+        
     def _shared_object_scene_reward_only(self):
         """
         Extract only object/scene shaping from SharedDoomLogic debug.
@@ -3923,6 +3973,107 @@ class DoomEnv(gym.Env):
         self.last_shared_debug = debug
 
         return float(total)
+    
+    def combat_movement_reward(self, game_state, action, distance_moved):
+        enemy_visible = bool(game_state.get("enemy_visible", False))
+        enemy_centered = bool(game_state.get("enemy_centered", False))
+        ammo = int(game_state.get("ammo", 0) or 0)
+        health = int(game_state.get("health", 100) or 100)
+
+        reward = 0.0
+        moved = float(distance_moved or 0.0)
+
+        if not enemy_visible:
+            return 0.0
+
+        # Standing still in combat is bad.
+        if moved < 2.0 and action in ["turn_left", "turn_right", "shoot", "melee_attack"]:
+            reward -= 0.12
+            self.reward_manager.add("combat_standing_still", -0.12)
+
+        # Strafing/backing up while enemy is visible is useful.
+        if action in ["strafe_left", "strafe_right"] and moved >= 2.0:
+            reward += 0.08
+            self.reward_manager.add("combat_strafe_movement", 0.08)
+
+        if action == "move_backward" and enemy_visible:
+            reward += 0.05
+            self.reward_manager.add("combat_retreat_spacing", 0.05)
+
+        # Shooting rules.
+        if action == "shoot" and ammo <= 0:
+            reward -= 0.60
+            self.reward_manager.add("shoot_no_ammo", -0.60)
+
+        elif action == "shoot" and enemy_centered and ammo > 0:
+            reward += 0.30
+            self.reward_manager.add("shoot_centered_with_ammo", 0.30)
+
+        elif action == "shoot" and enemy_visible and not enemy_centered and ammo > 0:
+            reward -= 0.15
+            self.reward_manager.add("shoot_not_centered", -0.15)
+
+        # Low health means movement is more important.
+        if health <= 35 and action in ["strafe_left", "strafe_right", "move_backward"]:
+            reward += 0.10
+            self.reward_manager.add("low_health_dodge", 0.10)
+
+        return reward
+    
+    def weapon_ammo_policy_reward(self, game_state, action):
+        weapon = str(
+            game_state.get("weapon")
+            or game_state.get("selected_weapon")
+            or self.current_weapon_name
+            or "pistol"
+        ).lower()
+
+        ammo = int(game_state.get("ammo", 0) or 0)
+        enemy_visible = bool(game_state.get("enemy_visible", False))
+        enemy_centered = bool(game_state.get("enemy_centered", False))
+
+        reward = 0.0
+
+        rare_ammo_weapons = [
+            "rocket",
+            "rocket_launcher",
+            "plasma",
+            "plasma_rifle",
+            "bfg",
+        ]
+
+        common_ammo_weapons = [
+            "pistol",
+            "chaingun",
+            "shotgun",
+            "super_shotgun",
+        ]
+
+        using_rare_ammo = any(name in weapon for name in rare_ammo_weapons)
+        using_common_ammo = any(name in weapon for name in common_ammo_weapons)
+
+        if action == "shoot" and ammo <= 0:
+            reward -= 0.75
+            self.reward_manager.add("weapon_no_ammo_shot", -0.75)
+            return reward
+
+        if action == "shoot" and using_rare_ammo:
+            if enemy_visible and enemy_centered:
+                reward += 0.10
+                self.reward_manager.add("rare_ammo_good_shot", 0.10)
+            else:
+                reward -= 0.35
+                self.reward_manager.add("rare_ammo_wasted", -0.35)
+
+        elif action == "shoot" and using_common_ammo:
+            if enemy_visible and enemy_centered:
+                reward += 0.15
+                self.reward_manager.add("common_ammo_good_shot", 0.15)
+            elif not enemy_visible:
+                reward -= 0.12
+                self.reward_manager.add("common_ammo_wasted", -0.12)
+
+        return reward
         
     def _shared_movement_reward_only(self):
         """
@@ -4598,6 +4749,30 @@ class DoomEnv(gym.Env):
     # ---------------------------------------------------------
     # Combat / action helpers
     # ---------------------------------------------------------
+    def combat_readiness_reward(self, game_state, action):
+        enemy_visible = bool(game_state.get("enemy_visible", False))
+        enemy_centered = bool(game_state.get("enemy_centered", False))
+        ammo = int(game_state.get("ammo", 0) or 0)
+
+        reward = 0.0
+
+        if enemy_visible and ammo > 0:
+            reward += 0.03
+            self.reward_manager.add("enemy_seen_with_ammo", 0.03)
+
+        if enemy_visible and enemy_centered and ammo > 0:
+            reward += 0.08
+            self.reward_manager.add("enemy_centered_with_ammo", 0.08)
+
+        if action == "shoot" and enemy_visible and enemy_centered and ammo > 0:
+            reward += 0.20
+            self.reward_manager.add("valid_shoot_attempt", 0.20)
+
+        if action == "shoot" and not enemy_visible:
+            reward -= 0.10
+            self.reward_manager.add("bad_shoot_no_enemy", -0.10)
+
+        return reward
 
     def weapon_context_reward(
         self,
@@ -4783,6 +4958,41 @@ class DoomEnv(gym.Env):
 
         # Already roughly aimed; leave shoot decision to vision_combat_action().
         return action
+    
+    def goal_progress_reward(self, director_result):
+        """
+        Small dense reward for moving closer to the current director target.
+
+        This helps the agent understand:
+        - closer to goal = good
+        - small progress matters
+        - route movement should continue
+        """
+
+        if director_result is None:
+            return 0.0
+
+        distance_delta = float(director_result.get("distance_delta", 0.0) or 0.0)
+
+        reward = 0.0
+
+        if distance_delta > 1.0:
+            reward += 0.03
+            self.reward_manager.add("small_goal_progress", 0.03)
+
+        if distance_delta > 8.0:
+            reward += 0.07
+            self.reward_manager.add("medium_goal_progress", 0.07)
+
+        if distance_delta > 20.0:
+            reward += 0.10
+            self.reward_manager.add("large_goal_progress", 0.10)
+
+        if distance_delta < -12.0:
+            reward -= 0.08
+            self.reward_manager.add("moving_away_from_goal", -0.08)
+
+        return reward
 
     def exploration_assist_action(self, action, enemy_visible, distance_moved=None, motion=None):
         if enemy_visible:
