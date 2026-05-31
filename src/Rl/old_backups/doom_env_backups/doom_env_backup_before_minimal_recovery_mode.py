@@ -771,54 +771,15 @@ class DoomEnv(gym.Env):
     
     def route_progress_reward(self, game_state):
         """
-        Safe route-progress helper.
+        HARD DISABLED FOR REAL EXIT TESTING.
 
-        This helper is allowed to reward route zones only if they come from
-        the active level_guide. It must not contain hardcoded old route names.
+        The old route reward was still rewarding:
+        spawn_exit, right_route, door_area, combat_corridor, exit_route.
 
-        For the current real-exit recovery phase, route_zones should be [].
-        Later, we can add real WAD-based zones near the true exit path.
+        During this recovery phase, only the real exit director should shape
+        navigation toward (-400, 1296).
         """
-        x = game_state.get("x")
-        y = game_state.get("y")
-
-        if x is None or y is None:
-            return 0.0
-
-        route_zones = self.level_guide.get("route_zones", [])
-
-        if not route_zones:
-            return 0.0
-
-        reward = 0.0
-
-        for idx, zone in enumerate(route_zones):
-            name = zone.get("name", f"route_zone_{idx}") if isinstance(zone, dict) else zone[0]
-            zx = zone.get("x") if isinstance(zone, dict) else zone[1]
-            zy = zone.get("y") if isinstance(zone, dict) else zone[2]
-            radius = zone.get("radius", 128) if isinstance(zone, dict) else zone[3]
-            zone_reward = zone.get("reward", 0.05) if isinstance(zone, dict) else zone[4]
-
-            if name in self.route_zones_reached:
-                continue
-
-            dx = float(x) - float(zx)
-            dy = float(y) - float(zy)
-            dist = (dx * dx + dy * dy) ** 0.5
-
-            if dist <= float(radius):
-                self.route_zones_reached.add(name)
-                self.route_progress_level = max(self.route_progress_level, idx + 1)
-                reward += float(zone_reward)
-                print(
-                    f"[route_progress] reached={name} "
-                    f"level={self.route_progress_level} "
-                    f"x={float(x):.1f} y={float(y):.1f} "
-                    f"reward={float(zone_reward):.2f}"
-                )
-
-        return reward
-
+        return 0.0
 
     def tile_exploration_reward(self, game_state):
         """
@@ -1529,7 +1490,7 @@ class DoomEnv(gym.Env):
         # 2) Stage 0/1/2 are movement/door learning only.
         # Combat helpers must not hijack these stages.
         if self.curriculum_stage < 3:
-            if False and can_use_exploration_override:
+            if can_use_exploration_override:
                 before = action
                 action = self.exploration_assist_action(
                     action=action,
@@ -1666,7 +1627,7 @@ class DoomEnv(gym.Env):
                                 f"stuck={self.stuck_counter}"
                             )
 
-            if False and can_use_exploration_override:
+            if can_use_exploration_override:
                 before = action
                 action = self.exploration_assist_action(
                     action=action,
@@ -4468,56 +4429,42 @@ class DoomEnv(gym.Env):
         return float(reward), result
 
     def route_progress_reward(self, game_state):
-        """
-        Safe route-progress helper.
+        reward = 0.0
 
-        This helper is allowed to reward route zones only if they come from
-        the active level_guide. It must not contain hardcoded old route names.
-
-        For the current real-exit recovery phase, route_zones should be [].
-        Later, we can add real WAD-based zones near the true exit path.
-        """
         x = game_state.get("x")
         y = game_state.get("y")
 
         if x is None or y is None:
             return 0.0
 
-        route_zones = self.level_guide.get("route_zones", [])
+        x = float(x)
+        y = float(y)
 
-        if not route_zones:
-            return 0.0
+        # Example placeholders — tune these from your real logs.
+        route_zones = [
+            ("spawn_exit", 600, 360, 120, 0.5),
+            ("right_route", 625, 360, 120, 0.8),
+            ("door_area", 700, 420, 140, 1.0),
+            ("combat_corridor", 850, 400, 160, 1.5),
+            ("exit_route", 1000, 500, 180, 2.0),
+        ]
 
-        reward = 0.0
+        for idx, (name, tx, ty, radius, zone_reward) in enumerate(route_zones, start=1):
+            dist = ((x - tx) ** 2 + (y - ty) ** 2) ** 0.5
 
-        for idx, zone in enumerate(route_zones):
-            name = zone.get("name", f"route_zone_{idx}") if isinstance(zone, dict) else zone[0]
-            zx = zone.get("x") if isinstance(zone, dict) else zone[1]
-            zy = zone.get("y") if isinstance(zone, dict) else zone[2]
-            radius = zone.get("radius", 128) if isinstance(zone, dict) else zone[3]
-            zone_reward = zone.get("reward", 0.05) if isinstance(zone, dict) else zone[4]
+            if dist <= radius and self.route_progress_level < idx:
+                self.route_progress_level = idx
+                reward += zone_reward
+                self.reward_manager.add(f"route_progress_{name}", zone_reward)
 
-            if name in self.route_zones_reached:
-                continue
-
-            dx = float(x) - float(zx)
-            dy = float(y) - float(zy)
-            dist = (dx * dx + dy * dy) ** 0.5
-
-            if dist <= float(radius):
-                self.route_zones_reached.add(name)
-                self.route_progress_level = max(self.route_progress_level, idx + 1)
-                reward += float(zone_reward)
                 print(
                     f"[route_progress] reached={name} "
                     f"level={self.route_progress_level} "
-                    f"x={float(x):.1f} y={float(y):.1f} "
-                    f"reward={float(zone_reward):.2f}"
+                    f"x={x:.1f} y={y:.1f} reward={zone_reward:.2f}"
                 )
 
         return reward
-
-
+    
     def doom_has_focus(self):
         try:
             expected = str(getattr(self.controller, "window_id", "")).strip()
@@ -5321,20 +5268,41 @@ class DoomEnv(gym.Env):
         return reward
 
     def exploration_assist_action(self, action, enemy_visible, distance_moved=None, motion=None):
-        """
-        Advisory-only exploration helper.
+        if enemy_visible:
+            return action
 
-        This preserves the helper but prevents it from hijacking PPO actions.
-        The old version changed turn_left/turn_right into move_forward too often,
-        which stopped PPO from learning navigation.
+        if action in ["shoot", "melee_attack"]:
+            return "move_forward"
 
-        Future use:
-        - log suggested action
-        - add small reward shaping
-        - never directly replace PPO action unless there is a true emergency
-        """
+        if self.wall_contact_steps >= 2 or self.stuck_counter > 12:
+            cycle = self._step_count % 6
+
+            if cycle == 0:
+                return "move_backward"
+            if cycle == 1:
+                return "turn_right"
+            if cycle == 2:
+                return "turn_right"
+            if cycle == 3:
+                return "strafe_left"
+            if cycle == 4:
+                return "move_forward"
+
+            return "turn_left"
+
+        if action in ["turn_left", "turn_right"]:
+            if self._step_count - self.last_aim_assist_step > 10:
+                return "move_forward"
+
+        if (
+            distance_moved is not None
+            and motion is not None
+            and distance_moved <= 0.0
+            and motion < 1.0
+        ):
+            return "move_forward"
+
         return action
-
 
     def penalty_scale(self):
         if not self.strong_penalty_mode:

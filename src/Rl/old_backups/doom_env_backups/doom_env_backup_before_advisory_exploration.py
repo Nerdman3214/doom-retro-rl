@@ -771,53 +771,15 @@ class DoomEnv(gym.Env):
     
     def route_progress_reward(self, game_state):
         """
-        Safe route-progress helper.
+        DISABLED: old route-zone helper.
 
-        This helper is allowed to reward route zones only if they come from
-        the active level_guide. It must not contain hardcoded old route names.
+        This helper was still rewarding old positive-X route names:
+        spawn_exit, right_route, door_area, combat_corridor, exit_route.
 
-        For the current real-exit recovery phase, route_zones should be [].
-        Later, we can add real WAD-based zones near the true exit path.
+        Recovery mode should use only the real exit director target:
+        (-400, 1296).
         """
-        x = game_state.get("x")
-        y = game_state.get("y")
-
-        if x is None or y is None:
-            return 0.0
-
-        route_zones = self.level_guide.get("route_zones", [])
-
-        if not route_zones:
-            return 0.0
-
-        reward = 0.0
-
-        for idx, zone in enumerate(route_zones):
-            name = zone.get("name", f"route_zone_{idx}") if isinstance(zone, dict) else zone[0]
-            zx = zone.get("x") if isinstance(zone, dict) else zone[1]
-            zy = zone.get("y") if isinstance(zone, dict) else zone[2]
-            radius = zone.get("radius", 128) if isinstance(zone, dict) else zone[3]
-            zone_reward = zone.get("reward", 0.05) if isinstance(zone, dict) else zone[4]
-
-            if name in self.route_zones_reached:
-                continue
-
-            dx = float(x) - float(zx)
-            dy = float(y) - float(zy)
-            dist = (dx * dx + dy * dy) ** 0.5
-
-            if dist <= float(radius):
-                self.route_zones_reached.add(name)
-                self.route_progress_level = max(self.route_progress_level, idx + 1)
-                reward += float(zone_reward)
-                print(
-                    f"[route_progress] reached={name} "
-                    f"level={self.route_progress_level} "
-                    f"x={float(x):.1f} y={float(y):.1f} "
-                    f"reward={float(zone_reward):.2f}"
-                )
-
-        return reward
+        return 0.0
 
 
     def tile_exploration_reward(self, game_state):
@@ -4469,53 +4431,15 @@ class DoomEnv(gym.Env):
 
     def route_progress_reward(self, game_state):
         """
-        Safe route-progress helper.
+        DISABLED: old route-zone helper.
 
-        This helper is allowed to reward route zones only if they come from
-        the active level_guide. It must not contain hardcoded old route names.
+        This helper was still rewarding old positive-X route names:
+        spawn_exit, right_route, door_area, combat_corridor, exit_route.
 
-        For the current real-exit recovery phase, route_zones should be [].
-        Later, we can add real WAD-based zones near the true exit path.
+        Recovery mode should use only the real exit director target:
+        (-400, 1296).
         """
-        x = game_state.get("x")
-        y = game_state.get("y")
-
-        if x is None or y is None:
-            return 0.0
-
-        route_zones = self.level_guide.get("route_zones", [])
-
-        if not route_zones:
-            return 0.0
-
-        reward = 0.0
-
-        for idx, zone in enumerate(route_zones):
-            name = zone.get("name", f"route_zone_{idx}") if isinstance(zone, dict) else zone[0]
-            zx = zone.get("x") if isinstance(zone, dict) else zone[1]
-            zy = zone.get("y") if isinstance(zone, dict) else zone[2]
-            radius = zone.get("radius", 128) if isinstance(zone, dict) else zone[3]
-            zone_reward = zone.get("reward", 0.05) if isinstance(zone, dict) else zone[4]
-
-            if name in self.route_zones_reached:
-                continue
-
-            dx = float(x) - float(zx)
-            dy = float(y) - float(zy)
-            dist = (dx * dx + dy * dy) ** 0.5
-
-            if dist <= float(radius):
-                self.route_zones_reached.add(name)
-                self.route_progress_level = max(self.route_progress_level, idx + 1)
-                reward += float(zone_reward)
-                print(
-                    f"[route_progress] reached={name} "
-                    f"level={self.route_progress_level} "
-                    f"x={float(x):.1f} y={float(y):.1f} "
-                    f"reward={float(zone_reward):.2f}"
-                )
-
-        return reward
+        return 0.0
 
 
     def doom_has_focus(self):

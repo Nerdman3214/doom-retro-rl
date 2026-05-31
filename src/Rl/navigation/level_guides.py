@@ -1,10 +1,13 @@
 """
-Real WAD-based level guide data.
+Real WAD-based level guide database.
+
+Current Freedoom E1M1 facts:
+- Player start: (-416, 256)
+- Real exit:    (-400, 1296)
 
 Important:
-- This file should store map facts only.
-- Do not put old fake route zones here.
-- The current Freedoom E1M1 goal is the real WAD exit near (-400, 1296).
+- route_zones are intentionally empty right now.
+- The old positive-X route was wrong and caused the agent to keep walking east/right.
 """
 
 DEFAULT_EMPTY_GUIDE = {
@@ -43,51 +46,17 @@ LEVEL_GUIDES = {
             "reward": 10.0,
         },
 
-        # Keep these empty for now.
-        # The old route zones were sending the agent east/right:
+        # Disabled until the real route is mapped.
         "route_nodes": [],
         "route_zones": [],
         "checkpoints": [],
 
-        # Real secret sector centers from the WAD, but disabled until
-        # the agent can finish the basic level route.
+        # Real secret sector centers, but disabled for now.
         "secrets": [
-            {
-                "name": "secret_52",
-                "sector": 52,
-                "x": 496,
-                "y": 712,
-                "radius": 96,
-                "reward": 0.0,
-                "enabled": False,
-            },
-            {
-                "name": "secret_86",
-                "sector": 86,
-                "x": 447,
-                "y": 1862,
-                "radius": 96,
-                "reward": 0.0,
-                "enabled": False,
-            },
-            {
-                "name": "secret_128",
-                "sector": 128,
-                "x": 1680,
-                "y": -880,
-                "radius": 96,
-                "reward": 0.0,
-                "enabled": False,
-            },
-            {
-                "name": "secret_132",
-                "sector": 132,
-                "x": 544,
-                "y": 804,
-                "radius": 96,
-                "reward": 0.0,
-                "enabled": False,
-            },
+            {"name": "secret_52", "sector": 52, "x": 496, "y": 712, "radius": 96, "reward": 0.0, "enabled": False},
+            {"name": "secret_86", "sector": 86, "x": 447, "y": 1862, "radius": 96, "reward": 0.0, "enabled": False},
+            {"name": "secret_128", "sector": 128, "x": 1680, "y": -880, "radius": 96, "reward": 0.0, "enabled": False},
+            {"name": "secret_132", "sector": 132, "x": 544, "y": 804, "radius": 96, "reward": 0.0, "enabled": False},
         ],
 
         "keys": [],
@@ -101,9 +70,6 @@ LEVEL_GUIDES = {
         ],
     }
 }
-
-
-GENERIC_EXPLORATION_ROUTE_ZONES = []
 
 
 def normalize_level_name(level_name=None):
@@ -133,39 +99,8 @@ def get_level_guide(level_name=None):
 
 
 def get_route_zones(level_name=None):
-    """
-    Return route zones as:
-        (name, x, y, radius, reward)
-
-    For now this intentionally returns an empty list for E1M1 so the old
-    positive-X corridor route cannot reward the agent.
-    """
-
-    normalized = normalize_level_name(level_name)
-
-    if normalized == "generic":
-        return list(GENERIC_EXPLORATION_ROUTE_ZONES)
-
-    guide = get_level_guide(normalized)
-    route_zones = guide.get("route_zones", [])
-
-    converted = []
-
-    for zone in route_zones:
-        if isinstance(zone, dict):
-            converted.append(
-                (
-                    zone.get("name", "unnamed_zone"),
-                    zone.get("x", 0),
-                    zone.get("y", 0),
-                    zone.get("radius", 128),
-                    zone.get("reward", 0.0),
-                )
-            )
-        else:
-            converted.append(zone)
-
-    return converted
+    guide = get_level_guide(level_name)
+    return list(guide.get("route_zones", []))
 
 
 def get_main_goal(level_name=None):
@@ -175,7 +110,6 @@ def get_main_goal(level_name=None):
 
 def get_enabled_secrets(level_name=None):
     guide = get_level_guide(level_name)
-
     return [
         secret
         for secret in guide.get("secrets", [])
