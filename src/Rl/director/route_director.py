@@ -196,3 +196,40 @@ class RouteDirector:
             "reason": reason,
             "reward_delta": reward_delta,
         }
+    
+    def get_next_route_waypoint(self, level_guide, route_progress_level):
+        """
+        Returns the next route waypoint safely.
+
+        If route data is missing or finished, return None so the normal
+        final-exit director can still work.
+        """
+
+        if not level_guide:
+            return None
+
+        route_zones = level_guide.get("route_zones", [])
+
+        if not route_zones:
+            return None
+
+        idx = int(route_progress_level or 0)
+
+        if idx < 0:
+            idx = 0
+
+        if idx >= len(route_zones):
+            return None
+
+        zone = route_zones[idx]
+
+        if zone.get("x") is None or zone.get("y") is None:
+            return None
+
+        return {
+            "name": zone.get("name", f"route_zone_{idx}"),
+            "x": float(zone["x"]),
+            "y": float(zone["y"]),
+            "radius": float(zone.get("radius", 128.0)),
+            "hint": zone.get("hint", "advance"),
+        }
