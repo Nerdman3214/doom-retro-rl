@@ -488,6 +488,67 @@ class VizDoomEnv(gym.Env):
 
         return reward
     
+    def main_goal_progress_reward(self, director_result):
+        """
+        Reward getting closer to the real E1M1 exit.
+
+        This uses RouteDirector output:
+        - distance
+        - distance_delta
+        - hint
+
+        Positive distance_delta means the agent moved closer to the true exit.
+        """
+
+        if director_result is None:
+            return 0.0
+
+        distance = director_result.get("distance")
+        distance_delta = float(director_result.get("distance_delta", 0.0) or 0.0)
+        hint = director_result.get("hint")
+
+        if distance is None:
+            return 0.0
+
+        reward = 0.0
+
+        if not hasattr(self, "best_main_goal_distance"):
+            self.best_main_goal_distance = None
+
+        # First seen distance this episode.
+        if self.best_main_goal_distance is None:
+            self.best_main_goal_distance = float(distance)
+
+        # Reward moving closer to the true exit.
+        if distance_delta > 1.0:
+            progress_reward = min(0.12, distance_delta / 96.0)
+            reward += progress_reward
+            self.reward_manager.add("main_goal_closer", progress_reward)
+
+        # Extra reward for setting a new best distance.
+        if float(distance) < self.best_main_goal_distance - 8.0:
+            self.best_main_goal_distance = float(distance)
+            reward += 0.10
+            self.reward_manager.add("main_goal_new_best", 0.10)
+
+        # Penalty for moving away from the exit.
+        if distance_delta < -6.0:
+            penalty = min(0.12, abs(distance_delta) / 96.0)
+            reward -= penalty
+            self.reward_manager.add("main_goal_moving_away", -penalty)
+
+        # Penalty for being stuck while not progressing.
+        if hint == "recover_unstuck":
+            reward -= 0.08
+            self.reward_manager.add("main_goal_stuck", -0.08)
+
+        # Big reward if the agent reaches the actual exit area.
+        if hint == "goal_reached":
+            reward += 10.0
+            self.reward_manager.add("main_goal_reached", 10.0)
+
+        return reward
+    
     def get_active_goal_bubble_target(self, game_state):
         """
         Pick the next unreached route target.
@@ -712,62 +773,6 @@ class VizDoomEnv(gym.Env):
 
         return action_name
     
-
-    def main_goal_progress_reward(self, director_result):
-        """
-        Reward getting closer to the real E1M1 exit.
-
-        Uses RouteDirector output:
-        - distance
-        - distance_delta
-        - hint
-
-        Positive distance_delta means the agent moved closer to the true exit.
-        """
-
-        if director_result is None:
-            return 0.0
-
-        distance = director_result.get("distance")
-        distance_delta = float(director_result.get("distance_delta", 0.0) or 0.0)
-        hint = director_result.get("hint")
-
-        if distance is None:
-            return 0.0
-
-        reward = 0.0
-
-        if not hasattr(self, "best_main_goal_distance"):
-            self.best_main_goal_distance = None
-
-        if self.best_main_goal_distance is None:
-            self.best_main_goal_distance = float(distance)
-
-        if distance_delta > 1.0:
-            progress_reward = min(0.12, distance_delta / 96.0)
-            reward += progress_reward
-            self.reward_manager.add("main_goal_closer", progress_reward)
-
-        if float(distance) < self.best_main_goal_distance - 8.0:
-            self.best_main_goal_distance = float(distance)
-            reward += 0.10
-            self.reward_manager.add("main_goal_new_best", 0.10)
-
-        if distance_delta < -6.0:
-            penalty = min(0.12, abs(distance_delta) / 96.0)
-            reward -= penalty
-            self.reward_manager.add("main_goal_moving_away", -penalty)
-
-        if hint == "recover_unstuck":
-            reward -= 0.08
-            self.reward_manager.add("main_goal_stuck", -0.08)
-
-        if hint == "goal_reached":
-            reward += 10.0
-            self.reward_manager.add("main_goal_reached", 10.0)
-
-        return reward
-
     def goal_progress_reward(self, director_result):
         if director_result is None:
             return 0.0
@@ -1300,6 +1305,7 @@ class VizDoomEnv(gym.Env):
         self.visited_tiles.clear()
         self.last_exit_distance = None
         self.best_exit_distance = None
+        self.best_main_goal_distance = None
 
         state = self.game.get_state()
         self.previous_game_state = self._state_to_game_state(state)

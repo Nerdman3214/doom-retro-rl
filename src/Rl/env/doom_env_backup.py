@@ -139,7 +139,7 @@ class DoomEnv(gym.Env):
         self.sensory_model = SensoryModel()
         self.route_director = RouteDirector()
         self.retrace_navigator = RetraceNavigator()
-        self.enable_retrace_navigator = False
+        self.enable_retrace_navigator = True
         self.shared_logic = SharedDoomLogic()
         self.previous_shared_game_state = None
         self.last_shared_debug = {}
@@ -187,11 +187,11 @@ class DoomEnv(gym.Env):
         # -----------------------------------------------------
         # Keep these False while PPO is learning.
         # These systems should guide with reward/logging, not hijack actions.
-        self.enable_sensory_action_override =False
-        self.enable_goal_assist_action_override = False
+        self.enable_sensory_action_override = True
+        self.enable_goal_assist_action_override = True
 
         # Keep wall safety on, but only for true front-wall emergencies.
-        self.enable_vision_blocker_override = False
+        self.enable_vision_blocker_override = True
 
         # -----------------------------------------------------
         # Death review buffer
@@ -771,16 +771,56 @@ class DoomEnv(gym.Env):
     
     def route_progress_reward(self, game_state):
         """
-        TEMP DISABLED.
+        First-level route progress reward.
 
-        Old hardcoded route zones were still rewarding:
-        spawn_exit, right_route, combat_corridor, exit_route.
-
-        Keep this disabled while testing the real WAD exit director:
-        target_xy=(-400, 1296)
+        This gives the agent small, clear milestones for Freedoom E1M1.
+        It is better than only using distance-to-exit because Doom maps are not straight lines.
         """
-        return 0.0
 
+        reward = 0.0
+
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        if x is None or y is None:
+            return 0.0
+
+        x = float(x)
+        y = float(y)
+
+        # These are starting placeholders based on the coordinates your logs show.
+        # Tune them as you collect better route logs.
+        route_zones = self.level_guide.get("route_zones", [])
+
+        position = (x, y)
+
+        zone_reward, reached_name, self.route_zones_reached = (
+            self.checkpoint_tracker.update_route_zones(
+                position=position,
+                route_zones=route_zones,
+                reached_zones=self.route_zones_reached,
+            )
+        )
+
+        if reached_name is not None:
+            self.route_progress_level += 1
+            self.best_route_progress_level = max(
+                self.best_route_progress_level,
+                self.route_progress_level,
+            )
+
+            reward += zone_reward
+            self.reward_manager.add(f"route_progress_{reached_name}", zone_reward)
+
+            print(
+                f"[route_progress] reached={reached_name} "
+                f"level={self.route_progress_level} "
+                f"x={x:.1f} y={y:.1f} "
+                f"reward={zone_reward:.2f}"
+            )
+
+        return reward
+    
     def tile_exploration_reward(self, game_state):
         """
         Simple exploration reward using player position tiles.
@@ -2517,32 +2557,30 @@ class DoomEnv(gym.Env):
             level_guide=self.level_guide,
         )
 
-        game_state["director_target"] = director_state.get("target")
-        game_state["director_distance"] = director_state.get("distance")
-        game_state["director_dx"] = director_state.get("dx", 0.0)
-        game_state["director_dy"] = director_state.get("dy", 0.0)
-        game_state["director_hint_action"] = director_state.get("hint_action")
+        game_state["director_target"] = director_state["target"]
+        game_state["director_distance"] = director_state["distance"]
+        game_state["director_dx"] = director_state["dx"]
+        game_state["director_dy"] = director_state["dy"]
+        game_state["director_hint_action"] = director_state["hint_action"]
         game_state["director_objective"] = director_state.get("objective")
         game_state["director_reason"] = director_state.get("reason")
 
-        reward += director_state.get("reward_delta", director_state.get("reward", 0.0))
+        reward += director_state["reward_delta"]
 
-        director_reward_delta = director_state.get("reward_delta", director_state.get("reward", 0.0))
-
-        if director_reward_delta > 0:
-            self.reward_manager.add("director_progress", director_reward_delta)
-        elif director_reward_delta < 0:
-            self.reward_manager.add("director_wrong_way", director_reward_delta)
+        if director_state["reward_delta"] > 0:
+            self.reward_manager.add("director_progress", director_state["reward_delta"])
+        elif director_state["reward_delta"] < 0:
+            self.reward_manager.add("director_wrong_way", director_state["reward_delta"])
 
         if self._step_count % 25 == 0:
             print(
                 "[director] "
-                f"target={director_state.get('target')} "
+                f"target={director_state['target']} "
                 f"reason={director_state.get('reason')} "
-                f"dist={director_state.get('distance')} "
-                f"delta={director_state.get('distance_delta', 0.0):.2f} "
-                f"hint={director_state.get('hint_action')} "
-                f"reward={director_state.get('reward_delta', director_state.get('reward', 0.0)):.2f}"
+                f"dist={director_state['distance']} "
+                f"delta={director_state['distance_delta']:.2f} "
+                f"hint={director_state['hint_action']} "
+                f"reward={director_state['reward_delta']:.2f}"
             )
 
         game_state["sensory_situation"] = sensory_state["situation"]
@@ -2945,20 +2983,6 @@ class DoomEnv(gym.Env):
                 f"secret={checkpoint_info.get('nearest_secret_name')} "
                 f"secret_dist={checkpoint_info.get('distance_to_secret')} "
                 f"reward={checkpoint_reward:.2f}"
-            )
-
-        if self._step_count % 10 == 0:
-            print(
-                "[director_debug] "
-                f"pos=({game_state.get('x'):.1f},{game_state.get('y'):.1f}) "
-                f"target={director_result.get('target')} "
-                f"target_xy=({director_result.get('target_x'):.1f},{director_result.get('target_y'):.1f}) "
-                f"dx={director_result.get('dx'):.1f} "
-                f"dy={director_result.get('dy'):.1f} "
-                f"dist={director_result.get('distance'):.1f} "
-                f"delta={director_result.get('distance_delta'):.1f} "
-                f"hint={director_result.get('hint')} "
-                f"hint_action={director_result.get('hint_action')}"
             )
 
         # -----------------------------------------------------

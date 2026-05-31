@@ -1,10 +1,15 @@
 """
-Real WAD-based level guide data.
+Map-specific level guide database.
 
-Important:
-- This file should store map facts only.
-- Do not put old fake route zones here.
-- The current Freedoom E1M1 goal is the real WAD exit near (-400, 1296).
+This file should contain real map facts, not behavior logic.
+
+Architecture:
+- level_guides.py stores static map knowledge.
+- route_director.py decides the active target.
+- doom_env.py / vizdoom_env.py calculate rewards from the director output.
+
+For Freedoom Phase 1 E1M1, the real WAD-based route should point toward
+the level exit near (-400, 1296), not toward the old east/right corridor route.
 """
 
 DEFAULT_EMPTY_GUIDE = {
@@ -27,6 +32,7 @@ LEVEL_GUIDES = {
     "freedoom1_e1m1": {
         "name": "freedoom1_e1m1",
 
+        # Real player start found from the uploaded freedoom1.wad.
         "player_start": {
             "name": "player_start",
             "x": -416,
@@ -34,6 +40,8 @@ LEVEL_GUIDES = {
             "angle": 0,
         },
 
+        # Real exit target found from the uploaded freedoom1.wad.
+        # This replaces the old incorrect positive-X target.
         "main_goal": {
             "name": "level_exit",
             "type": "exit",
@@ -43,14 +51,85 @@ LEVEL_GUIDES = {
             "reward": 10.0,
         },
 
-        # Keep these empty for now.
-        # The old route zones were sending the agent east/right:
-        "route_nodes": [],
-        "route_zones": [],
-        "checkpoints": [],
+        # Keep route nodes simple. These are weak guidance points along the
+        # main A -> B route. They are not supposed to be big prizes.
+        #
+        # The exact y-values may need small tuning from logs, but the direction
+        # is now correct: generally north/up from start toward the real exit.
+        "route_nodes": [
+            {
+                "name": "spawn_forward",
+                "type": "route",
+                "x": -416,
+                "y": 448,
+                "radius": 112,
+                "next": ["mid_route_1"],
+                "reward": 0.05,
+            },
+            {
+                "name": "mid_route_1",
+                "type": "route",
+                "x": -416,
+                "y": 704,
+                "radius": 112,
+                "next": ["mid_route_2"],
+                "reward": 0.08,
+            },
+            {
+                "name": "mid_route_2",
+                "type": "route",
+                "x": -416,
+                "y": 960,
+                "radius": 112,
+                "next": ["exit_approach"],
+                "reward": 0.10,
+            },
+            {
+                "name": "exit_approach",
+                "type": "exit_path",
+                "x": -400,
+                "y": 1184,
+                "radius": 128,
+                "next": ["level_exit"],
+                "reward": 0.15,
+            },
+        ],
 
-        # Real secret sector centers from the WAD, but disabled until
-        # the agent can finish the basic level route.
+        # route_zones are tiny one-time hints.
+        # Do not make these larger than completion/progress rewards.
+        "route_zones": [
+            {
+                "name": "spawn_forward",
+                "x": -416,
+                "y": 448,
+                "radius": 112,
+                "reward": 0.05,
+            },
+            {
+                "name": "mid_route_1",
+                "x": -416,
+                "y": 704,
+                "radius": 112,
+                "reward": 0.08,
+            },
+            {
+                "name": "mid_route_2",
+                "x": -416,
+                "y": 960,
+                "radius": 112,
+                "reward": 0.10,
+            },
+            {
+                "name": "exit_approach",
+                "x": -400,
+                "y": 1184,
+                "radius": 128,
+                "reward": 0.15,
+            },
+        ],
+
+        # Keep secrets recorded, but do NOT reward them during basic level
+        # completion training. They are optional routes later.
         "secrets": [
             {
                 "name": "secret_52",
@@ -90,13 +169,16 @@ LEVEL_GUIDES = {
             },
         ],
 
+        "checkpoints": [],
         "keys": [],
         "locked_doors": [],
         "switches": [],
         "use_points": [],
 
         "strategies": [
-            "real_exit_only",
+            "safe_main_route",
+            "recover_if_stuck",
+            "combat_clear_then_exit",
             "secrets_disabled_until_completion",
         ],
     }
@@ -134,11 +216,10 @@ def get_level_guide(level_name=None):
 
 def get_route_zones(level_name=None):
     """
-    Return route zones as:
-        (name, x, y, radius, reward)
+    Return route zones for a known level.
 
-    For now this intentionally returns an empty list for E1M1 so the old
-    positive-X corridor route cannot reward the agent.
+    SharedDoomLogic may expect route zones as:
+        (name, x, y, radius, reward)
     """
 
     normalized = normalize_level_name(level_name)

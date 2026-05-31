@@ -771,16 +771,56 @@ class DoomEnv(gym.Env):
     
     def route_progress_reward(self, game_state):
         """
-        TEMP DISABLED.
+        First-level route progress reward.
 
-        Old hardcoded route zones were still rewarding:
-        spawn_exit, right_route, combat_corridor, exit_route.
-
-        Keep this disabled while testing the real WAD exit director:
-        target_xy=(-400, 1296)
+        This gives the agent small, clear milestones for Freedoom E1M1.
+        It is better than only using distance-to-exit because Doom maps are not straight lines.
         """
-        return 0.0
 
+        reward = 0.0
+
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        if x is None or y is None:
+            return 0.0
+
+        x = float(x)
+        y = float(y)
+
+        # These are starting placeholders based on the coordinates your logs show.
+        # Tune them as you collect better route logs.
+        route_zones = self.level_guide.get("route_zones", [])
+
+        position = (x, y)
+
+        zone_reward, reached_name, self.route_zones_reached = (
+            self.checkpoint_tracker.update_route_zones(
+                position=position,
+                route_zones=route_zones,
+                reached_zones=self.route_zones_reached,
+            )
+        )
+
+        if reached_name is not None:
+            self.route_progress_level += 1
+            self.best_route_progress_level = max(
+                self.best_route_progress_level,
+                self.route_progress_level,
+            )
+
+            reward += zone_reward
+            self.reward_manager.add(f"route_progress_{reached_name}", zone_reward)
+
+            print(
+                f"[route_progress] reached={reached_name} "
+                f"level={self.route_progress_level} "
+                f"x={x:.1f} y={y:.1f} "
+                f"reward={zone_reward:.2f}"
+            )
+
+        return reward
+    
     def tile_exploration_reward(self, game_state):
         """
         Simple exploration reward using player position tiles.
