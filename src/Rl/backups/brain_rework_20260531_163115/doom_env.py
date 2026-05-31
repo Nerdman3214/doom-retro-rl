@@ -1,6 +1,3 @@
-from rewards.doom_brain_reward import compute_doom_brain_reward
-from navigation.mission_plan import MissionTracker, get_freedoom1_e1m1_mission
-from sensory.world_state import build_world_state, choose_world_mode
 import sys
 import os
 import cv2
@@ -44,7 +41,7 @@ from loggers.trajectory_logger import TrajectoryLogger
 from models.preference_model import PreferenceModel
 from recording.clip_generator import ClipGenerator
 from recording.smart_clip_generator import SmartClipGenerator
-from sensory.world_state import build_world_state, choose_world_mode
+from sensory.world_state import choose_world_mode
 try:
     from recording.record_player_session import PlayerRecorder
 except Exception as e:
@@ -173,7 +170,7 @@ class DoomEnv(gym.Env):
         self.recent_loop_steps = 0
 
         # Full replacement mode exists, but keep it OFF until tests pass.
-        self.use_full_shared_reward_mode = False
+        self.use_full_shared_reward_mode = True
         self.full_shared_reward_scale = 1.0
         self.full_shared_reward_clip = 5.0
 
@@ -237,8 +234,6 @@ class DoomEnv(gym.Env):
 
         self.current_level_name = "freedoom1_e1m1"
         self.level_guide = get_level_guide(self.current_level_name)
-        self.mission_tracker = MissionTracker(get_freedoom1_e1m1_mission())
-        self.enable_doom_brain_reward = True
 
         self.checkpoint_tracker.set_level_guide(
             checkpoints=self.level_guide.get("checkpoints", []),
@@ -391,8 +386,6 @@ class DoomEnv(gym.Env):
         self.wall_contact_steps = 0
         self.last_wall_escape_step = -100
         self.route_progress_level = 0
-        if hasattr(self, 'mission_tracker'):
-            self.mission_tracker.reset()
 
         # -----------------------------------------------------
         # First-level route progress tracking
@@ -607,12 +600,65 @@ class DoomEnv(gym.Env):
         return configs.get(self.curriculum_stage, configs[7])
 
     def get_allowed_actions(self):
-        """
-        Full-plan action set.
+        stage = self.curriculum_stage
 
-        We do not hide shooting/use/strafe for too long because Doom requires
-        navigation, fighting, resource use, doors, and survival together.
-        """
+        if stage == 0:
+            return [
+                "move_forward",
+                "move_backward",
+                "turn_left",
+                "turn_right",
+            ]
+
+        if stage == 1:
+            return [
+                "move_forward",
+                "move_backward",
+                "turn_left",
+                "turn_right",
+                "strafe_left",
+                "strafe_right",
+                "shoot",
+            ]
+
+        if stage == 2:
+            return [
+                "move_forward",
+                "move_backward",
+                "turn_left",
+                "turn_right",
+                "strafe_left",
+                "strafe_right",
+                "use",
+                "shoot",
+            ]
+        
+        if stage == 3:
+            return [
+                "move_forward",
+                "move_backward",
+                "turn_left",
+                "turn_right",
+                "strafe_left",
+                "strafe_right",
+                "use",
+                "shoot",
+            ]
+
+        if stage == 4:
+            return [
+                "move_forward",
+                "move_backward",
+                "turn_left",
+                "turn_right",
+                "strafe_left",
+                "strafe_right",
+                "shoot",
+                "use",
+                "melee_attack",
+                "swap_weapon",
+            ]
+
         return [
             "move_forward",
             "move_backward",
@@ -621,8 +667,8 @@ class DoomEnv(gym.Env):
             "strafe_left",
             "strafe_right",
             "shoot",
-            "use",
             "melee_attack",
+            "use",
             "swap_weapon",
         ]
 
@@ -1081,61 +1127,6 @@ class DoomEnv(gym.Env):
             return "move_backward"
 
         return "shoot" if enemy_centered else "move_backward"
-
-
-    def apply_doom_brain(self, game_state, action_name, sensory_state=None):
-        """
-        Shared full-plan brain:
-        - navigation survival
-        - fighting
-        - items/resources
-        - doors/use
-        - secrets
-        - final exit
-        """
-
-        if not getattr(self, "enable_doom_brain_reward", True):
-            return 0.0, {}
-
-        if sensory_state is None:
-            sensory_state = {
-                "situation": game_state.get("sensory_situation", "normal_navigation")
-            }
-
-        # Add movement/stuck counters so world_state can reason correctly.
-        game_state["repeated_position_steps"] = getattr(self, "repeated_position_steps", 0)
-        game_state["no_position_change_steps"] = getattr(self, "no_position_change_steps", 0)
-
-        world_state = build_world_state(game_state, sensory_state)
-        game_state["world_mode"] = world_state.get("mode", "navigate")
-
-        mission_update = self.mission_tracker.update(game_state, world_state)
-
-        # Set current director target for other reward/director code.
-        game_state["director_target"] = mission_update.get("target")
-
-        brain_reward, brain_events = compute_doom_brain_reward(
-            game_state=game_state,
-            action_name=action_name,
-            world_state=world_state,
-            mission_update=mission_update,
-        )
-
-        if self._step_count % 25 == 0:
-            target = mission_update.get("target", {})
-            print(
-                f"[doom_brain] mode={world_state.get('mode')} "
-                f"target={target.get('name')} "
-                f"hint={target.get('hint')} "
-                f"reward={brain_reward:.3f} "
-                f"events={brain_events[:3]}"
-            )
-
-        return brain_reward, {
-            "world_state": world_state,
-            "mission_update": mission_update,
-            "brain_events": brain_events,
-        }
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -3071,16 +3062,6 @@ class DoomEnv(gym.Env):
         game_state["near_use_point"] = near_use_point
         game_state["nearest_use_name"] = nearest_use_name
         reward += self.exit_distance_progress_reward(game_state)
-
-        brain_reward, brain_info = self.apply_doom_brain(
-            game_state=game_state,
-            action_name=action,
-            sensory_state={
-                    "situation": game_state.get("sensory_situation", "normal_navigation")
-                },
-            )
-        reward += brain_reward
-        info["doom_brain"] = brain_info
 
         if near_use_point:
             if action == "use":

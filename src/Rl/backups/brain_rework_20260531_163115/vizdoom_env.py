@@ -1,6 +1,3 @@
-from sensory.world_state import build_world_state
-from navigation.mission_plan import MissionTracker, get_freedoom1_e1m1_mission
-from rewards.doom_brain_reward import compute_doom_brain_reward
 import os
 from pathlib import Path
 
@@ -1570,16 +1567,6 @@ class VizDoomEnv(gym.Env):
 
         if done:
             reward += float(self.game.get_total_reward())
-
-        world_state = build_world_state(post_game_state, {})
-        mission_update = self.mission_tracker.update(post_game_state, world_state)
-        brain_reward, brain_events = compute_doom_brain_reward(
-            game_state=post_game_state,
-            action_name=action_name,
-            world_state=world_state,
-            mission_update=mission_update,
-        )
-        reward += brain_reward
 
         return obs, float(reward), bool(done), bool(truncated), info
     
