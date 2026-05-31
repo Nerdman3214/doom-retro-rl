@@ -831,10 +831,10 @@ class DoomEnv(gym.Env):
             improvement = previous - dist
 
             if improvement > 0:
-                reward += min(0.35, improvement * 0.010)
+                reward += min(0.10, improvement * 0.003)
                 self.best_main_goal_distance = min(previous, dist)
             elif improvement < -24:
-                reward -= 0.015
+                reward -= 0.03
 
         # Soft lane shaping: exit is around x=-400.
         lateral_error = abs(x - gx)
@@ -842,9 +842,9 @@ class DoomEnv(gym.Env):
         if lateral_error <= 192:
             reward += 0.01
         elif lateral_error > 600:
-            reward -= 0.01
+            reward -= 0.04
         elif lateral_error > 384:
-            reward -= 0.01
+            reward -= 0.02
 
         # Penalize extreme east drift, which the old route caused.
         bounds = guide.get("safe_bounds") or {}
@@ -3310,11 +3310,11 @@ class DoomEnv(gym.Env):
             ammo = int(game_state.get("ammo", 0) or 0)
 
             if not enemy_visible:
-                ammo_discipline_reward -= 0.015
+                ammo_discipline_reward -= 0.03
                 self.reward_manager.add("shoot_no_enemy", -0.03)
 
             elif enemy_visible and not enemy_centered:
-                ammo_discipline_reward -= 0.01
+                ammo_discipline_reward -= 0.02
                 self.reward_manager.add("shoot_not_centered", -0.02)
 
             elif enemy_visible and enemy_centered:

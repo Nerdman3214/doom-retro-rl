@@ -831,10 +831,10 @@ class DoomEnv(gym.Env):
             improvement = previous - dist
 
             if improvement > 0:
-                reward += min(0.35, improvement * 0.010)
+                reward += min(0.10, improvement * 0.003)
                 self.best_main_goal_distance = min(previous, dist)
             elif improvement < -24:
-                reward -= 0.015
+                reward -= 0.03
 
         # Soft lane shaping: exit is around x=-400.
         lateral_error = abs(x - gx)
@@ -842,9 +842,9 @@ class DoomEnv(gym.Env):
         if lateral_error <= 192:
             reward += 0.01
         elif lateral_error > 600:
-            reward -= 0.01
+            reward -= 0.04
         elif lateral_error > 384:
-            reward -= 0.01
+            reward -= 0.02
 
         # Penalize extreme east drift, which the old route caused.
         bounds = guide.get("safe_bounds") or {}
@@ -1925,7 +1925,7 @@ class DoomEnv(gym.Env):
             )
 
         # Corner/stuck escape beats combat. Do not shoot while trapped.
-        if self.corner_trap_steps >= 120:
+        if self.corner_trap_steps >= 20:
             before = action
             cycle = self.corner_trap_steps % 12
 
@@ -3006,7 +3006,7 @@ class DoomEnv(gym.Env):
             if self.distance_traveled < 25.0 and self._step_count > 100:
                 reward += self.add_penalty("no_route_progress", -1.5)
 
-        if self.corner_trap_steps >= 120 and not self.sensory_emergency_active:
+        if self.corner_trap_steps >= 20 and not self.sensory_emergency_active:
             reward -= 5.0
             terminated = True
             info["corner_trap_reset"] = True
@@ -3310,11 +3310,11 @@ class DoomEnv(gym.Env):
             ammo = int(game_state.get("ammo", 0) or 0)
 
             if not enemy_visible:
-                ammo_discipline_reward -= 0.015
+                ammo_discipline_reward -= 0.03
                 self.reward_manager.add("shoot_no_enemy", -0.03)
 
             elif enemy_visible and not enemy_centered:
-                ammo_discipline_reward -= 0.01
+                ammo_discipline_reward -= 0.02
                 self.reward_manager.add("shoot_not_centered", -0.02)
 
             elif enemy_visible and enemy_centered:
@@ -5855,7 +5855,7 @@ class DoomEnv(gym.Env):
             self.corner_trap_position = current_tile
             self.corner_trap_steps = 0
 
-        return self.corner_trap_steps >= 120
+        return self.corner_trap_steps >= 20
 
     def wall_assist_action(self, action, frame, enemy_visible, distance_moved=None, motion=None):
         if action == "move_backward" and self.stuck_counter < 8 and self.corner_trap_steps < 12:
