@@ -769,139 +769,55 @@ class DoomEnv(gym.Env):
 
         return reward
     
-
-    def real_map_navigation_reward(self, game_state):
-        """
-        Real-coordinate navigation shaping.
-
-        This rewards:
-        - getting closer to the actual exit
-        - staying near the real exit lane
-        - reaching real WAD-based waypoint bubbles
-
-        It penalizes:
-        - drifting far east/right into the old fake route area
-        """
-
-        x = game_state.get("x")
-        y = game_state.get("y")
-
-        if x is None or y is None:
-            return 0.0
-
-        x = float(x)
-        y = float(y)
-
-        guide = getattr(self, "level_guide", {}) or {}
-        goal = guide.get("main_goal") or {}
-
-        gx = goal.get("x")
-        gy = goal.get("y")
-
-        if gx is None or gy is None:
-            return 0.0
-
-        gx = float(gx)
-        gy = float(gy)
-
-        dx = x - gx
-        dy = y - gy
-        dist = (dx * dx + dy * dy) ** 0.5
-
-        reward = 0.0
-
-        # Main progress reward.
-        previous = getattr(self, "best_main_goal_distance", None)
-
-        if previous is None:
-            self.best_main_goal_distance = dist
-        else:
-            improvement = previous - dist
-
-            if improvement > 0:
-                reward += min(0.10, improvement * 0.003)
-                self.best_main_goal_distance = min(previous, dist)
-            elif improvement < -24:
-                reward -= 0.03
-
-        # Soft lane shaping: exit is around x=-400.
-        lateral_error = abs(x - gx)
-
-        if lateral_error <= 192:
-            reward += 0.01
-        elif lateral_error > 600:
-            reward -= 0.04
-        elif lateral_error > 384:
-            reward -= 0.02
-
-        # Penalize extreme east drift, which the old route caused.
-        bounds = guide.get("safe_bounds") or {}
-        max_x = float(bounds.get("max_x", 200.0))
-        min_x = float(bounds.get("min_x", -900.0))
-
-        if x > max_x:
-            reward += float(bounds.get("soft_penalty", -0.02))
-            if x > max_x + 500:
-                reward += float(bounds.get("hard_penalty", -0.08))
-
-        if x < min_x:
-            reward += float(bounds.get("soft_penalty", -0.02))
-
-        return float(reward)
-
-
     def route_progress_reward(self, game_state):
         """
-        Sequential real-map route progress.
+        Safe route-progress helper.
 
-        Only the next expected route zone can trigger. This prevents broad
-        overlapping bubbles from awarding later milestones too early.
+        This helper is allowed to reward route zones only if they come from
+        the active level_guide. It must not contain hardcoded old route names.
+
+        For the current real-exit recovery phase, route_zones should be [].
+        Later, we can add real WAD-based zones near the true exit path.
         """
-
         x = game_state.get("x")
         y = game_state.get("y")
 
         if x is None or y is None:
             return 0.0
-
-        x = float(x)
-        y = float(y)
 
         route_zones = self.level_guide.get("route_zones", [])
 
         if not route_zones:
             return 0.0
 
-        next_idx = int(getattr(self, "route_progress_level", 0))
+        reward = 0.0
 
-        if next_idx >= len(route_zones):
-            return 0.0
+        for idx, zone in enumerate(route_zones):
+            name = zone.get("name", f"route_zone_{idx}") if isinstance(zone, dict) else zone[0]
+            zx = zone.get("x") if isinstance(zone, dict) else zone[1]
+            zy = zone.get("y") if isinstance(zone, dict) else zone[2]
+            radius = zone.get("radius", 128) if isinstance(zone, dict) else zone[3]
+            zone_reward = zone.get("reward", 0.05) if isinstance(zone, dict) else zone[4]
 
-        zone = route_zones[next_idx]
+            if name in self.route_zones_reached:
+                continue
 
-        name = zone.get("name", f"route_zone_{next_idx}")
-        zx = float(zone.get("x", 0.0))
-        zy = float(zone.get("y", 0.0))
-        radius = float(zone.get("radius", 128.0))
-        zone_reward = float(zone.get("reward", 0.05))
+            dx = float(x) - float(zx)
+            dy = float(y) - float(zy)
+            dist = (dx * dx + dy * dy) ** 0.5
 
-        dx = x - zx
-        dy = y - zy
-        dist = (dx * dx + dy * dy) ** 0.5
+            if dist <= float(radius):
+                self.route_zones_reached.add(name)
+                self.route_progress_level = max(self.route_progress_level, idx + 1)
+                reward += float(zone_reward)
+                print(
+                    f"[route_progress] reached={name} "
+                    f"level={self.route_progress_level} "
+                    f"x={float(x):.1f} y={float(y):.1f} "
+                    f"reward={float(zone_reward):.2f}"
+                )
 
-        if dist <= radius:
-            self.route_zones_reached.add(name)
-            self.route_progress_level = next_idx + 1
-
-            print(
-                f"[route_progress] reached={name} "
-                f"level={self.route_progress_level} "
-                f"x={x:.1f} y={y:.1f} reward={zone_reward:.2f}"
-            )
-
-            return zone_reward
-
-        return 0.0
+        return reward
 
 
     def tile_exploration_reward(self, game_state):
@@ -2202,7 +2118,6 @@ class DoomEnv(gym.Env):
 
 
         reward += self.route_progress_reward(game_state)
-        reward += self.real_map_navigation_reward(game_state)
         reward += self.tile_exploration_reward(game_state)
         reward += self.door_use_reward(
             action=action,
@@ -4554,56 +4469,53 @@ class DoomEnv(gym.Env):
 
     def route_progress_reward(self, game_state):
         """
-        Sequential real-map route progress.
+        Safe route-progress helper.
 
-        Only the next expected route zone can trigger. This prevents broad
-        overlapping bubbles from awarding later milestones too early.
+        This helper is allowed to reward route zones only if they come from
+        the active level_guide. It must not contain hardcoded old route names.
+
+        For the current real-exit recovery phase, route_zones should be [].
+        Later, we can add real WAD-based zones near the true exit path.
         """
-
         x = game_state.get("x")
         y = game_state.get("y")
 
         if x is None or y is None:
             return 0.0
 
-        x = float(x)
-        y = float(y)
-
         route_zones = self.level_guide.get("route_zones", [])
 
         if not route_zones:
             return 0.0
 
-        next_idx = int(getattr(self, "route_progress_level", 0))
+        reward = 0.0
 
-        if next_idx >= len(route_zones):
-            return 0.0
+        for idx, zone in enumerate(route_zones):
+            name = zone.get("name", f"route_zone_{idx}") if isinstance(zone, dict) else zone[0]
+            zx = zone.get("x") if isinstance(zone, dict) else zone[1]
+            zy = zone.get("y") if isinstance(zone, dict) else zone[2]
+            radius = zone.get("radius", 128) if isinstance(zone, dict) else zone[3]
+            zone_reward = zone.get("reward", 0.05) if isinstance(zone, dict) else zone[4]
 
-        zone = route_zones[next_idx]
+            if name in self.route_zones_reached:
+                continue
 
-        name = zone.get("name", f"route_zone_{next_idx}")
-        zx = float(zone.get("x", 0.0))
-        zy = float(zone.get("y", 0.0))
-        radius = float(zone.get("radius", 128.0))
-        zone_reward = float(zone.get("reward", 0.05))
+            dx = float(x) - float(zx)
+            dy = float(y) - float(zy)
+            dist = (dx * dx + dy * dy) ** 0.5
 
-        dx = x - zx
-        dy = y - zy
-        dist = (dx * dx + dy * dy) ** 0.5
+            if dist <= float(radius):
+                self.route_zones_reached.add(name)
+                self.route_progress_level = max(self.route_progress_level, idx + 1)
+                reward += float(zone_reward)
+                print(
+                    f"[route_progress] reached={name} "
+                    f"level={self.route_progress_level} "
+                    f"x={float(x):.1f} y={float(y):.1f} "
+                    f"reward={float(zone_reward):.2f}"
+                )
 
-        if dist <= radius:
-            self.route_zones_reached.add(name)
-            self.route_progress_level = next_idx + 1
-
-            print(
-                f"[route_progress] reached={name} "
-                f"level={self.route_progress_level} "
-                f"x={x:.1f} y={y:.1f} reward={zone_reward:.2f}"
-            )
-
-            return zone_reward
-
-        return 0.0
+        return reward
 
 
     def doom_has_focus(self):
@@ -5410,10 +5322,16 @@ class DoomEnv(gym.Env):
 
     def exploration_assist_action(self, action, enemy_visible, distance_moved=None, motion=None):
         """
-        Advisory-only exploration.
+        Advisory-only exploration helper.
 
-        Keep this helper available for logging/future reward shaping,
-        but never replace PPO movement choices during route learning.
+        This preserves the helper but prevents it from hijacking PPO actions.
+        The old version changed turn_left/turn_right into move_forward too often,
+        which stopped PPO from learning navigation.
+
+        Future use:
+        - log suggested action
+        - add small reward shaping
+        - never directly replace PPO action unless there is a true emergency
         """
         return action
 

@@ -852,10 +852,10 @@ class DoomEnv(gym.Env):
 
     def route_progress_reward(self, game_state):
         """
-        Sequential real-map route progress.
+        Real-map route progress.
 
-        Only the next expected route zone can trigger. This prevents broad
-        overlapping bubbles from awarding later milestones too early.
+        This uses route_zones from navigation/level_guides.py.
+        No hardcoded old route names are allowed here.
         """
 
         x = game_state.get("x")
@@ -872,36 +872,34 @@ class DoomEnv(gym.Env):
         if not route_zones:
             return 0.0
 
-        next_idx = int(getattr(self, "route_progress_level", 0))
+        reward = 0.0
 
-        if next_idx >= len(route_zones):
-            return 0.0
+        for idx, zone in enumerate(route_zones):
+            name = zone.get("name", f"route_zone_{idx}")
+            zx = float(zone.get("x", 0.0))
+            zy = float(zone.get("y", 0.0))
+            radius = float(zone.get("radius", 128.0))
+            zone_reward = float(zone.get("reward", 0.05))
 
-        zone = route_zones[next_idx]
+            if name in self.route_zones_reached:
+                continue
 
-        name = zone.get("name", f"route_zone_{next_idx}")
-        zx = float(zone.get("x", 0.0))
-        zy = float(zone.get("y", 0.0))
-        radius = float(zone.get("radius", 128.0))
-        zone_reward = float(zone.get("reward", 0.05))
+            dx = x - zx
+            dy = y - zy
+            dist = (dx * dx + dy * dy) ** 0.5
 
-        dx = x - zx
-        dy = y - zy
-        dist = (dx * dx + dy * dy) ** 0.5
+            if dist <= radius:
+                self.route_zones_reached.add(name)
+                self.route_progress_level = max(self.route_progress_level, idx + 1)
+                reward += zone_reward
 
-        if dist <= radius:
-            self.route_zones_reached.add(name)
-            self.route_progress_level = next_idx + 1
+                print(
+                    f"[route_progress] reached={name} "
+                    f"level={self.route_progress_level} "
+                    f"x={x:.1f} y={y:.1f} reward={zone_reward:.2f}"
+                )
 
-            print(
-                f"[route_progress] reached={name} "
-                f"level={self.route_progress_level} "
-                f"x={x:.1f} y={y:.1f} reward={zone_reward:.2f}"
-            )
-
-            return zone_reward
-
-        return 0.0
+        return float(reward)
 
 
     def tile_exploration_reward(self, game_state):
@@ -4554,10 +4552,10 @@ class DoomEnv(gym.Env):
 
     def route_progress_reward(self, game_state):
         """
-        Sequential real-map route progress.
+        Real-map route progress.
 
-        Only the next expected route zone can trigger. This prevents broad
-        overlapping bubbles from awarding later milestones too early.
+        This uses route_zones from navigation/level_guides.py.
+        No hardcoded old route names are allowed here.
         """
 
         x = game_state.get("x")
@@ -4574,36 +4572,34 @@ class DoomEnv(gym.Env):
         if not route_zones:
             return 0.0
 
-        next_idx = int(getattr(self, "route_progress_level", 0))
+        reward = 0.0
 
-        if next_idx >= len(route_zones):
-            return 0.0
+        for idx, zone in enumerate(route_zones):
+            name = zone.get("name", f"route_zone_{idx}")
+            zx = float(zone.get("x", 0.0))
+            zy = float(zone.get("y", 0.0))
+            radius = float(zone.get("radius", 128.0))
+            zone_reward = float(zone.get("reward", 0.05))
 
-        zone = route_zones[next_idx]
+            if name in self.route_zones_reached:
+                continue
 
-        name = zone.get("name", f"route_zone_{next_idx}")
-        zx = float(zone.get("x", 0.0))
-        zy = float(zone.get("y", 0.0))
-        radius = float(zone.get("radius", 128.0))
-        zone_reward = float(zone.get("reward", 0.05))
+            dx = x - zx
+            dy = y - zy
+            dist = (dx * dx + dy * dy) ** 0.5
 
-        dx = x - zx
-        dy = y - zy
-        dist = (dx * dx + dy * dy) ** 0.5
+            if dist <= radius:
+                self.route_zones_reached.add(name)
+                self.route_progress_level = max(self.route_progress_level, idx + 1)
+                reward += zone_reward
 
-        if dist <= radius:
-            self.route_zones_reached.add(name)
-            self.route_progress_level = next_idx + 1
+                print(
+                    f"[route_progress] reached={name} "
+                    f"level={self.route_progress_level} "
+                    f"x={x:.1f} y={y:.1f} reward={zone_reward:.2f}"
+                )
 
-            print(
-                f"[route_progress] reached={name} "
-                f"level={self.route_progress_level} "
-                f"x={x:.1f} y={y:.1f} reward={zone_reward:.2f}"
-            )
-
-            return zone_reward
-
-        return 0.0
+        return float(reward)
 
 
     def doom_has_focus(self):

@@ -1102,18 +1102,18 @@ class VizDoomEnv(gym.Env):
                 self.stage_success_counts[0] += 1
 
         elif self.curriculum_stage == 1:
-            if False:
+            if "right_route" in reached or "door_area" in reached:
                 self.stage_success_counts[1] += 1
 
         elif self.curriculum_stage == 2:
-            if False:
+            if "door_area" in reached or "combat_corridor" in reached:
                 self.stage_success_counts[2] += 1
 
         elif self.curriculum_stage == 3:
             enemy_visible = bool(game_state.get("enemy_visible", False))
             kill_count = int(game_state.get("kill_count", 0) or 0)
 
-            if enemy_visible or kill_count > 0:
+            if "combat_corridor" in reached or enemy_visible or kill_count > 0:
                 self.stage_success_counts[3] += 1
 
         current = self.curriculum_stage
@@ -1243,107 +1243,36 @@ class VizDoomEnv(gym.Env):
 
     def _compute_reward(self, action_name, state):
         """
-        ViZDoom real-map reward.
+        Shared reward wrapper for ViZDoom.
 
-        This mirrors Doom Retro's real E1M1 guide:
-        - reward progress toward actual exit (-400, 1296)
-        - reward sequential route milestones
-        - keep combat/item rewards
-        - avoid old fake route names
+        This converts ViZDoom state into our backend-independent game_state,
+        extracts the depth buffer, and lets SharedDoomLogic compute reward.
         """
 
-        reward = 0.0
-        vars_now = self._get_game_vars(state)
+        current_game_state = self._state_to_game_state(state)
 
-        health = vars_now.get("health")
-        kills = vars_now.get("kill_count", 0)
-        items = vars_now.get("item_count", 0)
-        x = vars_now.get("x")
-        y = vars_now.get("y")
+        depth_obs = None
 
-        # Small living cost.
-        reward -= 0.001
+        if state is not None:
+            depth_raw = getattr(state, "depth_buffer", None)
 
-        # Combat/items still matter.
-        if self.last_health is not None and health is not None:
-            health_delta = health - self.last_health
-            if health_delta < 0:
-                reward += health_delta * 0.02
+            if depth_raw is not None:
+                try:
+                    depth_obs = self.native_packer.pack_depth(depth_raw)
+                except Exception:
+                    depth_obs = None
 
-        if kills > self.last_kill_count:
-            reward += 1.0 * (kills - self.last_kill_count)
+        reward, debug = self.shared_logic.compute_reward(
+            previous_state=self.previous_game_state,
+            current_state=current_game_state,
+            action_name=action_name,
+            depth_obs=depth_obs,
+        )
 
-        if items > self.last_item_count:
-            reward += 0.25 * (items - self.last_item_count)
-
-        # Real map navigation.
-        guide = getattr(self, "level_guide", {}) or {}
-        goal = guide.get("main_goal") or {}
-
-        if x is not None and y is not None and goal.get("x") is not None and goal.get("y") is not None:
-            x = float(x)
-            y = float(y)
-            gx = float(goal["x"])
-            gy = float(goal["y"])
-
-            dx = x - gx
-            dy = y - gy
-            dist = (dx * dx + dy * dy) ** 0.5
-
-            if self.best_main_goal_distance is None:
-                self.best_main_goal_distance = dist
-            else:
-                improvement = self.best_main_goal_distance - dist
-
-                if improvement > 0:
-                    reward += min(0.10, improvement * 0.003)
-                    self.best_main_goal_distance = min(self.best_main_goal_distance, dist)
-                elif improvement < -24:
-                    reward -= 0.02
-
-            # Sequential route zones.
-            route_zones = guide.get("route_zones", [])
-            next_idx = int(getattr(self, "route_progress_level", 0))
-
-            if next_idx < len(route_zones):
-                zone = route_zones[next_idx]
-                zx = float(zone.get("x", 0.0))
-                zy = float(zone.get("y", 0.0))
-                radius = float(zone.get("radius", 128.0))
-                zone_reward = float(zone.get("reward", 0.05))
-                name = zone.get("name", f"route_zone_{next_idx}")
-
-                zdx = x - zx
-                zdy = y - zy
-                zdist = (zdx * zdx + zdy * zdy) ** 0.5
-
-                if zdist <= radius:
-                    self.route_progress_level = next_idx + 1
-                    self.route_zones_reached.add(name)
-                    reward += zone_reward
-
-                    print(
-                        f"[viz_route_progress] reached={name} "
-                        f"level={self.route_progress_level} "
-                        f"x={x:.1f} y={y:.1f} reward={zone_reward:.2f}"
-                    )
-
-            # Penalize old east/right drift.
-            bounds = guide.get("safe_bounds") or {}
-            max_x = float(bounds.get("max_x", 200.0))
-
-            if x > max_x:
-                reward -= 0.03
-                if x > max_x + 500:
-                    reward -= 0.08
-
-        self.last_health = health
-        self.last_ammo = vars_now.get("ammo")
-        self.last_kill_count = kills
-        self.last_item_count = items
+        self.previous_game_state = current_game_state
+        self.last_reward_debug = debug
 
         return float(reward)
-
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -1381,9 +1310,6 @@ class VizDoomEnv(gym.Env):
         self.last_ammo = vars_now.get("ammo")
         self.last_kill_count = vars_now.get("kill_count", 0)
         self.last_item_count = vars_now.get("item_count", 0)
-        self.best_main_goal_distance = None
-        self.route_progress_level = 0
-        self.route_zones_reached = set()
         self.route_zones_reached = set()
         self.route_progress_level = 0
         self.goal_bubble_best_dist = {}

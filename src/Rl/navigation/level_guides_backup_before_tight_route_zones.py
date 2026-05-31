@@ -48,23 +48,23 @@ LEVEL_GUIDES = {
         # Real-coordinate soft corridor toward the exit.
         # These are not fake route names. They are broad navigation bubbles.
         "waypoints": [
-            {"name": "spawn_exit_lane", "x": -416.0, "y": 384.0, "radius": 128.0, "reward": 0.15},
-            {"name": "mid_room_entry", "x": -400.0, "y": 480.0, "radius": 144.0, "reward": 0.25},
-            {"name": "mid_room_progress", "x": -360.0, "y": 640.0, "radius": 144.0, "reward": 0.40},
-            {"name": "exit_lane_rejoin", "x": -400.0, "y": 850.0, "radius": 160.0, "reward": 0.60},
-            {"name": "exit_approach", "x": -400.0, "y": 1100.0, "radius": 160.0, "reward": 0.85},
-            {"name": "level_exit", "x": -400.0, "y": 1296.0, "radius": 128.0, "reward": 2.50},
+            {"name": "spawn_exit_lane", "x": -416.0, "y": 384.0, "radius": 224.0, "reward": 0.15},
+            {"name": "mid_room_entry", "x": -100.0, "y": 480.0, "radius": 256.0, "reward": 0.25},
+            {"name": "mid_room_progress", "x": -250.0, "y": 640.0, "radius": 256.0, "reward": 0.35},
+            {"name": "exit_lane_rejoin", "x": -400.0, "y": 850.0, "radius": 288.0, "reward": 0.45},
+            {"name": "exit_approach", "x": -400.0, "y": 1100.0, "radius": 256.0, "reward": 0.60},
+            {"name": "level_exit", "x": -400.0, "y": 1296.0, "radius": 128.0, "reward": 2.00},
         ],
 
         # route_zones is kept for compatibility with old helper code,
         # but now it mirrors real waypoints only.
         "route_zones": [
-            {"name": "spawn_exit_lane", "x": -416.0, "y": 384.0, "radius": 128.0, "reward": 0.15},
-            {"name": "mid_room_entry", "x": -400.0, "y": 480.0, "radius": 144.0, "reward": 0.25},
-            {"name": "mid_room_progress", "x": -360.0, "y": 640.0, "radius": 144.0, "reward": 0.40},
-            {"name": "exit_lane_rejoin", "x": -400.0, "y": 850.0, "radius": 160.0, "reward": 0.60},
-            {"name": "exit_approach", "x": -400.0, "y": 1100.0, "radius": 160.0, "reward": 0.85},
-            {"name": "level_exit", "x": -400.0, "y": 1296.0, "radius": 128.0, "reward": 2.50},
+            {"name": "spawn_exit_lane", "x": -416.0, "y": 384.0, "radius": 224.0, "reward": 0.15},
+            {"name": "mid_room_entry", "x": -100.0, "y": 480.0, "radius": 256.0, "reward": 0.25},
+            {"name": "mid_room_progress", "x": -250.0, "y": 640.0, "radius": 256.0, "reward": 0.35},
+            {"name": "exit_lane_rejoin", "x": -400.0, "y": 850.0, "radius": 288.0, "reward": 0.45},
+            {"name": "exit_approach", "x": -400.0, "y": 1100.0, "radius": 256.0, "reward": 0.60},
+            {"name": "level_exit", "x": -400.0, "y": 1296.0, "radius": 128.0, "reward": 2.00},
         ],
 
         # Soft bounds to stop the agent from drifting into the old east/right trap.
