@@ -121,6 +121,8 @@ class VizDoomEnv(gym.Env):
 
         self.game = None
         self.step_count = 0
+        self.mission_tracker = MissionTracker(get_freedoom1_e1m1_mission())
+        self.enable_doom_brain_reward = True
         self.last_health = None
         self.last_ammo = None
         self.last_kill_count = 0
@@ -1356,6 +1358,8 @@ class VizDoomEnv(gym.Env):
 
         self.game.new_episode()
         self.step_count = 0
+        if hasattr(self, "mission_tracker"):
+            self.mission_tracker.reset()
         self.shared_logic.reset_episode()
         self.reward_manager.reset()
         self.route_director.reset()
