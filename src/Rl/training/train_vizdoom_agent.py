@@ -116,7 +116,7 @@ checkpoint_callback = CheckpointCallback(
 
 try:
     model.learn(
-        total_timesteps=1_000_000_000,
+        total_timesteps=1_000_000_000_000_000,
         callback=[checkpoint_callback, ProgressPrintCallback(print_freq=1000)],
         progress_bar=True,
     )
