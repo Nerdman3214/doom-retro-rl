@@ -118,6 +118,17 @@ class VizDoomEnv(gym.Env):
         self.visited_tiles = set()
         self.previous_game_state = None
         self.last_reward_debug = {}
+        # -----------------------------------------------------
+        # Reward-only training mode
+        # -----------------------------------------------------
+        # In this mode, PPO chooses the action.
+        # Helpers may add rewards/debug info, but they must not replace actions.
+        self.reward_only_mode = True
+        self.disable_action_helpers = True
+        self.disable_fast_enemy_reaction = True
+        self.disable_recovery_action_override = True
+        self.disable_advisor_action_override = True
+        self.disable_route_action_override = True
 
         self.game = None
         self.step_count = 0
@@ -671,52 +682,14 @@ class VizDoomEnv(gym.Env):
 
         return game_state
     
-    def fast_enemy_reaction_action(self, action_name, game_state):
-        enemy_visible = bool(game_state.get("enemy_visible", False))
-        enemy_centered = bool(game_state.get("enemy_centered", False))
-        enemy_left = bool(game_state.get("enemy_left", False))
-        enemy_right = bool(game_state.get("enemy_right", False))
-        enemy_distance_tiles = game_state.get("enemy_distance_tiles")
-        ammo = int(game_state.get("ammo", 0) or 0)
-        health = int(game_state.get("health", 100) or 100)
+    def fast_enemy_reaction_action(self, action, *args, **kwargs):
+        """
+        Reward-only mode:
+        Do not override PPO action.
+        Combat behavior should be learned through rewards.
+        """
+        return action
 
-        if not enemy_visible:
-            return action_name
-
-        # If enemy is far away, do not hijack routing.
-        if enemy_distance_tiles is not None and float(enemy_distance_tiles) > 7.0:
-            return action_name
-
-        # No ammo: only dodge if enemy is close or health is low.
-        if ammo <= 0:
-            enemy_close = (
-                enemy_distance_tiles is not None
-                and float(enemy_distance_tiles) <= 2.0
-            )
-
-            if enemy_close and health <= 50:
-                return "move_backward"
-
-            return action_name
-
-        # Ammo exists: shoot only when centered.
-        if enemy_centered:
-            return "shoot"
-
-        # If enemy is off-center, turn toward it, but only if close enough.
-        enemy_relevant = (
-            enemy_distance_tiles is None
-            or float(enemy_distance_tiles) <= 6.0
-        )
-
-        if enemy_relevant and enemy_left:
-            return "turn_left"
-
-        if enemy_relevant and enemy_right:
-            return "turn_right"
-
-        return action_name
-    
 
     def main_goal_progress_reward(self, director_result):
         """
