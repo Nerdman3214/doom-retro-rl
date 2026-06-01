@@ -690,7 +690,7 @@ class DoomEnv(gym.Env):
             self.door_interaction_count += 1
 
             if door_like:
-                reward += 0.10
+                reward += self.add_positive("direct_positive_reward", 0.10)
                 self.reward_manager.add("use_near_door_like_scene", 0.10)
             else:
                 reward += self.add_penalty("use_not_near_door", -0.05)
@@ -725,7 +725,7 @@ class DoomEnv(gym.Env):
                     )
 
                     if door_or_route_context and (moved >= 32.0 or route_improved):
-                        reward += 0.40
+                        reward += self.add_positive("direct_positive_reward", 0.40)
                         self.reward_manager.add("use_created_progress", 0.40)
                         print(
                             f"[door_use] useful_use moved={moved:.1f} "
@@ -794,7 +794,7 @@ class DoomEnv(gym.Env):
         lateral_error = abs(x - gx)
 
         if lateral_error <= 192:
-            reward += 0.01
+            reward += self.add_positive("direct_positive_reward", 0.01)
         elif lateral_error > 600:
             reward -= 0.01
         elif lateral_error > 384:
@@ -1262,14 +1262,14 @@ class DoomEnv(gym.Env):
             if action == "move_forward":
                 reward += self.add_penalty("push_into_half_wall_rail", -15.0)
             elif action in ["move_backward", "turn_left", "turn_right", "strafe_left", "strafe_right"]:
-                reward += 0.35
-                self.reward_manager.add("half_wall_rail_escape_action", 0.35)
+                reward += self.add_positive("half_wall_rail_escape_action", 15.0)
+                self.reward_manager.add("half_wall_rail_escape_action", 45.0)
 
         elif label == "side_rail" or rail_position == "side":
             if action in ["strafe_left", "strafe_right"] and game_state.get("distance_moved", 0.0) <= 1.0:
                 reward += self.add_penalty("scrape_side_rail", -8.0)
             elif action in ["move_forward", "turn_left", "turn_right"]:
-                reward += 0.05
+                reward += self.add_positive("direct_positive_reward", 0.05)
                 self.reward_manager.add("side_rail_safe_action", 0.05)
 
         return reward
@@ -2269,7 +2269,7 @@ class DoomEnv(gym.Env):
         helper_action = self.helper.get_action(pre_game_state)
 
         if action == helper_action:
-            reward += 0.05
+            reward += self.add_positive("direct_positive_reward", 0.05)
         else:
             reward -= 0.01
 
@@ -2706,7 +2706,7 @@ class DoomEnv(gym.Env):
                 self.recent_loop_steps -= 1
 
                 if self.recent_loop_tile is not None and current_tile != self.recent_loop_tile:
-                    reward += 0.15
+                    reward += self.add_positive("direct_positive_reward", 0.15)
                     self.reward_manager.add("escaped_loop_tile", 0.15)
                     print(
                         f"[route_escape] escaped loop tile "
@@ -2848,7 +2848,7 @@ class DoomEnv(gym.Env):
             and distance_moved > 6.0
             and motion > 2.0
         ):
-            reward += 0.8
+            reward += self.add_positive("direct_positive_reward", 0.8)
             self.reward_manager.add("successful_retrace_escape", 0.8)
 
         # -----------------------------------------------------
@@ -2985,14 +2985,14 @@ class DoomEnv(gym.Env):
 
         # Reward actual escape, but only if movement really improved.
         if self.stuck_counter >= 5 and distance_moved > 5.0 and motion > 2.0:
-            reward += 3.0
-            self.reward_manager.add("strong_escape_from_stuck", 3.0)
+            reward += self.add_positive("strong_escape_from_stuck", 15.0)
+            self.reward_manager.add("strong_escape_from_stuck", 45.0)
 
         # If the agent is near a wall but takes a reasonable escape action,
         # give a small reward so it learns the alternative.
         if trapped_near_boundary and action in ["turn_left", "turn_right", "strafe_left", "strafe_right", "move_backward"]:
-            reward += 0.6
-            self.reward_manager.add("correct_boundary_escape_action", 0.6)
+            reward += self.add_positive("correct_boundary_escape_action", 15.0)
+            self.reward_manager.add("correct_boundary_escape_action", 45.0)
 
 
         # Reward open-space movement and penalize wall-hugging.
@@ -3093,7 +3093,7 @@ class DoomEnv(gym.Env):
 
         elif wall_bubble["level"] == "green":
             if distance_moved > 2.0 and action in ["move_forward", "strafe_left", "strafe_right"]:
-                reward += 0.15
+                reward += self.add_positive("direct_positive_reward", 0.15)
                 self.reward_manager.add("green_space_movement", 0.15)
 
         if scene_label in ["obstacle", "boundary_or_stuck_wall"] and scene_confidence >= 0.55:
@@ -3101,8 +3101,8 @@ class DoomEnv(gym.Env):
                 reward += self.add_penalty("push_into_obstacle", -15.0)
 
             elif action in ["move_backward", "strafe_left", "strafe_right", "turn_left", "turn_right"]:
-                reward += 0.35
-                self.reward_manager.add("avoid_obstacle", 0.35)
+                reward += self.add_positive("avoid_obstacle", 15.0)
+                self.reward_manager.add("avoid_obstacle", 45.0)
         # -----------------------------------------------------
         # Tactical behavior rewards
         # -----------------------------------------------------
@@ -3126,28 +3126,28 @@ class DoomEnv(gym.Env):
             reward += self.add_penalty("stuck_critical", -2.0)
 
         if wall_info["front_wall"] and action == "move_backward":
-            reward += 0.4
-            self.reward_manager.add("back_away_from_wall", 0.4)
+            reward += self.add_positive("back_away_from_wall", 15.0)
+            self.reward_manager.add("back_away_from_wall", 45.0)
 
         if wall_info["left_wall"] and action in ["turn_right", "strafe_right"]:
-            reward += 0.25
-            self.reward_manager.add("escape_left_wall", 0.25)
+            reward += self.add_positive("escape_left_wall", 15.0)
+            self.reward_manager.add("escape_left_wall", 45.0)
 
         if wall_info["right_wall"] and action in ["turn_left", "strafe_left"]:
-            reward += 0.25
-            self.reward_manager.add("escape_right_wall", 0.25)
+            reward += self.add_positive("escape_right_wall", 15.0)
+            self.reward_manager.add("escape_right_wall", 45.0)
 
         if enemy_visible and action == "shoot" and ammo > 0:
-            reward += 0.25
+            reward += self.add_positive("direct_positive_reward", 0.25)
             self.reward_manager.add("shoot_enemy_on_sight", 0.25)
 
         if enemy_visible and health_delta < 0 and action in ["strafe_left", "strafe_right"]:
-            reward += 0.8
+            reward += self.add_positive("direct_positive_reward", 0.8)
             self.dodge_when_damaged_count += 1
             self.reward_manager.add("dodge_when_damaged", 0.8)
 
         if enemy_visible and health < 45 and action == "move_backward":
-            reward += 0.6
+            reward += self.add_positive("direct_positive_reward", 0.6)
             self.retreat_from_close_enemy_count += 1
             self.reward_manager.add("retreat_low_health", 0.6)
 
@@ -3158,7 +3158,7 @@ class DoomEnv(gym.Env):
             reward += self.add_penalty("unneeded_turning", -0.6)
 
         if self.wall_escape_mode and distance_moved > 4.0 and motion > 2.0:
-            reward += 0.5
+            reward += self.add_positive("direct_positive_reward", 0.5)
             self.reward_manager.add("successful_wall_escape", 0.5)
 
         # -----------------------------------------------------
@@ -3167,11 +3167,11 @@ class DoomEnv(gym.Env):
 
         if self.curriculum_stage >= 5:
             if distance_moved > 3.0:
-                reward += 0.15
+                reward += self.add_positive("direct_positive_reward", 0.15)
                 self.reward_manager.add("route_movement_progress", 0.15)
 
             if action in ["move_forward", "move_backward", "strafe_left", "strafe_right"]:
-                reward += 0.03
+                reward += self.add_positive("direct_positive_reward", 0.03)
                 self.reward_manager.add("route_movement_action", 0.03)
 
             if action == "melee_attack" and self.consecutive_melee_steps > 3:
@@ -3251,7 +3251,7 @@ class DoomEnv(gym.Env):
 
         if near_use_point:
             if action == "use":
-                reward += 2.0
+                reward += self.add_positive("direct_positive_reward", 2.0)
                 self.reward_manager.add("used_known_use_point", 2.0)
                 print(f"[use_point] used {nearest_use_name}")
 
@@ -3326,26 +3326,26 @@ class DoomEnv(gym.Env):
         # -----------------------------------------------------
 
         if ammo_delta > 0:
-            reward += 0.4
+            reward += self.add_positive("direct_positive_reward", 0.4)
             self.ammo_pickup_count += 1
             self.reward_manager.add("ammo_pickup", 0.4)
 
         if weapon_delta > 0:
-            reward += 3.0
+            reward += self.add_positive("direct_positive_reward", 3.0)
             self.weapon_pickup_count += 1
             self.reward_manager.add("weapon_pickup", 3.0)
 
         if kill_delta > 0:
-            reward += 5.0 * kill_delta
+            reward += self.add_positive("direct_positive_reward", 5.0) * kill_delta
             self.enemy_kill_count += kill_delta
             self.reward_manager.add("enemy_kill", 5.0 * kill_delta)
 
         if enemy_visible and health_delta < 0 and action in ["strafe_left", "strafe_right"]:
-            reward += 0.5
+            reward += self.add_positive("direct_positive_reward", 0.5)
             self.dodge_when_damaged_count += 1
 
         if enemy_visible and enemy_close and action == "move_backward":
-            reward += 0.4
+            reward += self.add_positive("direct_positive_reward", 0.4)
             self.retreat_from_close_enemy_count += 1
 
         # -----------------------------------------------------
@@ -3356,7 +3356,7 @@ class DoomEnv(gym.Env):
             self.stuck_counter += 1
         else:
             if self.stuck_counter > 10:
-                reward += 1.0
+                reward += self.add_positive("direct_positive_reward", 1.0)
             self.stuck_counter = 0
 
         if motion < 1.0 and action == "move_forward":
@@ -3369,14 +3369,14 @@ class DoomEnv(gym.Env):
             "strafe_left",
             "strafe_right",
         ]:
-            reward += 0.2
+            reward += self.add_positive("direct_positive_reward", 0.2)
             self.reward_manager.add("escape_stuck_action", 0.2)
 
         if self.stuck_counter > 25:
             reward += self.add_penalty("long_stuck", -1.0)
 
         if distance_moved > 5.0:
-            reward += 0.04
+            reward += self.add_positive("direct_positive_reward", 0.04)
             self.movement_count += 1
 
         # -----------------------------------------------------
@@ -3389,7 +3389,7 @@ class DoomEnv(gym.Env):
         )
 
         if game_state.get("health_delta", 0) > 0 or game_state.get("ammo_delta", 0) > 0:
-            reward += 0.5
+            reward += self.add_positive("direct_positive_reward", 0.5)
             self.pickup_count += 1
             self.key_item_count += 1
 
@@ -3418,37 +3418,37 @@ class DoomEnv(gym.Env):
             ]
 
             if not enemy_visible and action == "move_forward":
-                reward += 0.03
+                reward += self.add_positive("direct_positive_reward", 0.03)
 
             if distance_moved > 5.0:
-                reward += 0.04
+                reward += self.add_positive("direct_positive_reward", 0.04)
 
             if len(self.visited_tiles) > 0 and action in movement_actions:
-                reward += 0.01
+                reward += self.add_positive("direct_positive_reward", 0.01)
 
             if action in ["turn_left", "turn_right"] and not enemy_visible:
                 reward += self.add_penalty("stage3_unneeded_turn", -0.1)
 
             if action in ["turn_left", "turn_right"] and enemy_visible:
-                reward += 0.05
+                reward += self.add_positive("direct_positive_reward", 0.05)
 
             if enemy_visible and not self.prev_enemy_visible:
-                reward += 2.0
+                reward += self.add_positive("direct_positive_reward", 2.0)
                 self.reward_manager.add("enemy_discovered", 2.0)
 
             if enemy_visible:
-                reward += 0.50
+                reward += self.add_positive("direct_positive_reward", 0.50)
 
             if enemy_visible and enemy_centered:
-                reward += 1.00
+                reward += self.add_positive("direct_positive_reward", 1.00)
                 self.track_enemy_count += 1
 
             if action == "shoot" and enemy_visible and ammo > 0:
                 # Smaller reward to avoid ammo-spam learning.
-                reward += 0.30
+                reward += self.add_positive("direct_positive_reward", 0.30)
 
                 if enemy_centered:
-                    reward += 0.50
+                    reward += self.add_positive("direct_positive_reward", 0.50)
                     self.enemy_engagement_count += 1
                     self.valid_shot_count += 1
 
@@ -3468,20 +3468,20 @@ class DoomEnv(gym.Env):
 
                 else:
                     if enemy_visible:
-                        reward += 0.6
+                        reward += self.add_positive("direct_positive_reward", 0.6)
                         self.enemy_engagement_count += 1
 
                     if enemy_visible:
-                        reward += 1.2
+                        reward += self.add_positive("direct_positive_reward", 1.2)
                         self.valid_shot_count += 1
                         self.reward_manager.add("visible_enemy_shot", 1.2)
 
                         if enemy_centered:
-                            reward += 0.8
+                            reward += self.add_positive("direct_positive_reward", 0.8)
                             self.reward_manager.add("centered_enemy_shot", 0.8)
 
                     if enemy_visible and not enemy_centered:
-                        reward += 0.15
+                        reward += self.add_positive("direct_positive_reward", 0.15)
 
                     if ammo <= 5:
                         reward += self.add_penalty("low_ammo_shot_pressure", -0.5)
@@ -3522,11 +3522,11 @@ class DoomEnv(gym.Env):
                 reward += self.add_penalty("melee_without_enemy", -0.4)
 
             elif enemy_visible and enemy_centered:
-                reward += 0.8
+                reward += self.add_positive("direct_positive_reward", 0.8)
                 self.reward_manager.add("melee_enemy_centered", 0.8)
 
                 if enemy_close:
-                    reward += 1.5
+                    reward += self.add_positive("direct_positive_reward", 1.5)
                     self.melee_close_bonus_count += 1
                     self.reward_manager.add("melee_close_range", 1.5)
 
@@ -3573,7 +3573,7 @@ class DoomEnv(gym.Env):
 
             if meaningful_use:
                 self.door_interaction_count += 1
-                reward += 1.0
+                reward += self.add_positive("direct_positive_reward", 1.0)
                 self.reward_manager.add("meaningful_door_use", 1.0)
 
                 x = game_state.get("x")
@@ -3588,10 +3588,10 @@ class DoomEnv(gym.Env):
                     if use_tile not in self.secret_use_locations:
                         self.secret_use_locations.add(use_tile)
 
-                        reward += 3.0
+                        reward += self.add_positive("direct_positive_reward", 3.0)
                         self.reward_manager.add("new_use_location_discovered", 3.0)
                     else:
-                        reward += 0.8
+                        reward += self.add_positive("direct_positive_reward", 0.8)
                         self.reward_manager.add("known_use_location_reused", 0.8)
 
                         print(f"[memory] useful use location discovered: {use_tile}")
@@ -3623,7 +3623,7 @@ class DoomEnv(gym.Env):
                     reward += self.add_penalty("bad_melee_weapon_distance", -1.0)
 
                 if weapon == "melee" and close_enemy:
-                    reward += 0.4
+                    reward += self.add_positive("direct_positive_reward", 0.4)
                     self.reward_manager.add("melee_only_close_range", 0.4)
 
                 # RPG/rocket is powerful, but dangerous near barrels or close enemies.
@@ -3631,12 +3631,12 @@ class DoomEnv(gym.Env):
                     reward += self.add_penalty("dangerous_rpg_context", -1.5)
 
                 if weapon == "rpg" and enemy_visible and not barrel_visible and not close_enemy and health >= 60:
-                    reward += 0.8
+                    reward += self.add_positive("direct_positive_reward", 0.8)
                     self.reward_manager.add("good_rpg_context", 0.8)
 
                 # Shotgun/chaingun are generally good combat defaults.
                 if enemy_visible and weapon in ["shotgun", "chaingun"]:
-                    reward += 0.3
+                    reward += self.add_positive("direct_positive_reward", 0.3)
                     self.reward_manager.add("good_general_weapon", 0.3)
 
                 # Weapon swap should not be spammed.
@@ -3655,7 +3655,7 @@ class DoomEnv(gym.Env):
                         reward += self.add_penalty("crashed_into_known_door", -2.0)
 
                     if near_known_use and action == "use":
-                        reward += 1.0
+                        reward += self.add_positive("direct_positive_reward", 1.0)
                         self.reward_manager.add("used_known_door_location", 1.0)
 
         # -----------------------------------------------------
@@ -3684,7 +3684,7 @@ class DoomEnv(gym.Env):
                 reward += self.add_penalty("weak_weapon_pressure", -0.02)
 
             if self.weapon_pickup_count > 0:
-                reward += 0.05
+                reward += self.add_positive("direct_positive_reward", 0.05)
 
         # -----------------------------------------------------
         # Route progress milestones
@@ -3692,39 +3692,39 @@ class DoomEnv(gym.Env):
 
         if self.curriculum_stage >= 7:
             if game_state.get("checkpoint_reached", False):
-                reward += 2.0
+                reward += self.add_positive("direct_positive_reward", 2.0)
                 self.reward_manager.add("stage7_checkpoint_bonus", 2.0)
 
             if game_state.get("secret_reached", False):
-                reward += 5.0
+                reward += self.add_positive("direct_positive_reward", 5.0)
                 self.reward_manager.add("stage7_secret_bonus", 5.0)
 
             if game_state.get("all_checkpoints_reached", False):
-                reward += 20.0
+                reward += self.add_positive("direct_positive_reward", 20.0)
                 self.reward_manager.add("all_checkpoints_reached", 20.0)
 
             if len(self.visited_tiles) >= 10 and self.route_progress_level < 1:
-                reward += 5.0
+                reward += self.add_positive("direct_positive_reward", 5.0)
                 self.route_progress_level = 1
                 self.reward_manager.add("route_tiles_10", 5.0)
 
             if self.pickup_count >= 2 and self.route_progress_level < 2:
-                reward += 5.0
+                reward += self.add_positive("direct_positive_reward", 5.0)
                 self.route_progress_level = 2
                 self.reward_manager.add("route_pickups_2", 5.0)
 
             if self.door_interaction_count >= 1 and self.route_progress_level < 3:
-                reward += 8.0
+                reward += self.add_positive("direct_positive_reward", 8.0)
                 self.route_progress_level = 3
                 self.reward_manager.add("route_door_1", 8.0)
 
             if self.enemy_kill_count >= 1 and self.route_progress_level < 4:
-                reward += 5.0
+                reward += self.add_positive("direct_positive_reward", 5.0)
                 self.route_progress_level = 4
                 self.reward_manager.add("route_kill_1", 5.0)
 
             if len(self.visited_tiles) >= 25 and self.route_progress_level < 5:
-                reward += 8.0
+                reward += self.add_positive("direct_positive_reward", 8.0)
                 self.route_progress_level = 5
                 self.reward_manager.add("route_tiles_25", 8.0)
 
@@ -3759,7 +3759,7 @@ class DoomEnv(gym.Env):
 
             if "enemy_visible" in present_objects:
                 game_state["aux_enemy_visible"] = True
-                reward += 0.02
+                reward += self.add_positive("direct_positive_reward", 0.02)
                 self.reward_manager.add("aux_enemy_awareness", 0.02)
             else:
                 game_state["aux_enemy_visible"] = False
@@ -3768,7 +3768,7 @@ class DoomEnv(gym.Env):
                 game_state["aux_health_pickup_visible"] = True
 
                 if health < 80 and action in ["move_forward", "strafe_left", "strafe_right"]:
-                    reward += 0.08
+                    reward += self.add_positive("direct_positive_reward", 0.08)
                     self.reward_manager.add("aux_move_toward_health", 0.08)
             else:
                 game_state["aux_health_pickup_visible"] = False
@@ -3777,7 +3777,7 @@ class DoomEnv(gym.Env):
                 game_state["aux_ammo_pickup_visible"] = True
 
                 if ammo < 20 and action in ["move_forward", "strafe_left", "strafe_right"]:
-                    reward += 0.08
+                    reward += self.add_positive("direct_positive_reward", 0.08)
                     self.reward_manager.add("aux_move_toward_ammo", 0.08)
             else:
                 game_state["aux_ammo_pickup_visible"] = False
@@ -3786,7 +3786,7 @@ class DoomEnv(gym.Env):
                 game_state["aux_barrel_visible"] = True
 
                 if action == "shoot" and enemy_visible:
-                    reward += 0.05
+                    reward += self.add_positive("direct_positive_reward", 0.05)
                     self.reward_manager.add("aux_barrel_combat_awareness", 0.05)
             else:
                 game_state["aux_barrel_visible"] = False
@@ -3810,7 +3810,7 @@ class DoomEnv(gym.Env):
         # taking damage, allow simple defensive shooting instead of dying helplessly.
         if self.curriculum_stage == 2 and health_delta < 0 and ammo > 0:
             if enemy_visible and enemy_centered:
-                reward += 0.5
+                reward += self.add_positive("direct_positive_reward", 0.5)
                 self.reward_manager.add("emergency_enemy_defense", 0.5)
 
         death_like_screen = (
@@ -3823,7 +3823,7 @@ class DoomEnv(gym.Env):
         )
 
         if game_state.get("level_complete", False):
-            reward += 100.0
+            reward += self.add_positive("direct_positive_reward", 100.0)
             self.level_completion_count += 1
             terminated = True
 
@@ -3906,12 +3906,12 @@ class DoomEnv(gym.Env):
         )
 
         if self.wall_contact_steps > 0 and action in ["move_backward", "turn_left", "turn_right", "strafe_left", "strafe_right"]:
-            reward += 0.10
+            reward += self.add_positive("direct_positive_reward", 0.10)
         self.reward_manager.add("wall_escape_attempt", 0.10)
 
         if front_ratio < 0.25 and left_ratio < 0.35 and right_ratio < 0.35:
             if self.wall_contact_steps > 0 or self.stuck_counter > 0:
-                reward += 0.25
+                reward += self.add_positive("direct_positive_reward", 0.25)
         self.reward_manager.add("cleared_wall_pressure", 0.25)
 
         info["route_progress_level"] = self.route_progress_level
@@ -4207,7 +4207,7 @@ class DoomEnv(gym.Env):
 
         if self.best_exit_distance is None or dist < self.best_exit_distance - 8.0:
             self.best_exit_distance = dist
-            reward += 0.10
+            reward += self.add_positive("direct_positive_reward", 0.10)
             self.reward_manager.add("new_best_exit_distance", 0.10)
 
         self.last_exit_distance = dist
@@ -4363,12 +4363,12 @@ class DoomEnv(gym.Env):
         ty = float(target["y"])
 
         target_angle = math.degrees(math.atan2(ty - y, tx - x))
-        diff = abs((target_angle - angle + 180.0) % 360.0 - 180.0)
+        diff = abs((target_angle - angle + 180.0) % 345.0 - 180.0)
 
         reward = 0.0
 
         if diff <= 15:
-            reward += 0.05
+            reward += self.add_positive("direct_positive_reward", 0.05)
             self.reward_manager.add("facing_goal", 0.05)
         elif diff >= 90:
             reward -= 0.05
@@ -4410,7 +4410,7 @@ class DoomEnv(gym.Env):
 
         if float(distance) < self.best_main_goal_distance - 8.0:
             self.best_main_goal_distance = float(distance)
-            reward += 0.10
+            reward += self.add_positive("direct_positive_reward", 0.10)
             self.reward_manager.add("main_goal_new_best", 0.10)
 
         # Moving away from the exit.
@@ -4426,7 +4426,7 @@ class DoomEnv(gym.Env):
 
         # Reached the actual exit area.
         if hint == "goal_reached":
-            reward += 10.0
+            reward += self.add_positive("direct_positive_reward", 10.0)
             self.reward_manager.add("main_goal_reached", 10.0)
 
         return reward
@@ -4479,11 +4479,11 @@ class DoomEnv(gym.Env):
 
         # Strafing/backing up while enemy is visible is useful.
         if action in ["strafe_left", "strafe_right"] and moved >= 2.0:
-            reward += 0.08
+            reward += self.add_positive("direct_positive_reward", 0.08)
             self.reward_manager.add("combat_strafe_movement", 0.08)
 
         if action == "move_backward" and enemy_visible:
-            reward += 0.05
+            reward += self.add_positive("direct_positive_reward", 0.05)
             self.reward_manager.add("combat_retreat_spacing", 0.05)
 
         # Shooting rules.
@@ -4492,7 +4492,7 @@ class DoomEnv(gym.Env):
             self.reward_manager.add("shoot_no_ammo", -0.60)
 
         elif action == "shoot" and enemy_centered and ammo > 0:
-            reward += 0.30
+            reward += self.add_positive("direct_positive_reward", 0.30)
             self.reward_manager.add("shoot_centered_with_ammo", 0.30)
 
         elif action == "shoot" and enemy_visible and not enemy_centered and ammo > 0:
@@ -4501,7 +4501,7 @@ class DoomEnv(gym.Env):
 
         # Low health means movement is more important.
         if health <= 35 and action in ["strafe_left", "strafe_right", "move_backward"]:
-            reward += 0.10
+            reward += self.add_positive("direct_positive_reward", 0.10)
             self.reward_manager.add("low_health_dodge", 0.10)
 
         return reward
@@ -4545,7 +4545,7 @@ class DoomEnv(gym.Env):
 
         if action == "shoot" and using_rare_ammo:
             if enemy_visible and enemy_centered:
-                reward += 0.10
+                reward += self.add_positive("direct_positive_reward", 0.10)
                 self.reward_manager.add("rare_ammo_good_shot", 0.10)
             else:
                 reward -= 0.35
@@ -4553,7 +4553,7 @@ class DoomEnv(gym.Env):
 
         elif action == "shoot" and using_common_ammo:
             if enemy_visible and enemy_centered:
-                reward += 0.15
+                reward += self.add_positive("direct_positive_reward", 0.15)
                 self.reward_manager.add("common_ammo_good_shot", 0.15)
             elif not enemy_visible:
                 reward -= 0.12
@@ -4988,7 +4988,7 @@ class DoomEnv(gym.Env):
 
         # 6. Do not punish recovery actions as hard.
         if action in ["move_backward", "turn_left", "turn_right", "strafe_left", "strafe_right"]:
-            reward += 0.10
+            reward += self.add_positive("direct_positive_reward", 0.10)
             self.reward_manager.add("wall_recovery_action", 0.10)
 
         return reward
@@ -5055,23 +5055,23 @@ class DoomEnv(gym.Env):
         # Ring reward: closer = bigger
         # -----------------------------
         if dist <= 1024:
-            reward += 0.01
+            reward += self.add_positive("direct_positive_reward", 0.01)
             self.reward_manager.add("goal_outer_bubble", 0.01)
 
         if dist <= 768:
-            reward += 0.02
+            reward += self.add_positive("direct_positive_reward", 0.02)
             self.reward_manager.add("goal_mid_outer_bubble", 0.02)
 
         if dist <= 512:
-            reward += 0.04
+            reward += self.add_positive("direct_positive_reward", 0.04)
             self.reward_manager.add("goal_mid_bubble", 0.04)
 
         if dist <= 256:
-            reward += 0.08
+            reward += self.add_positive("direct_positive_reward", 0.08)
             self.reward_manager.add("goal_inner_bubble", 0.08)
 
         if dist <= 128:
-            reward += 0.15
+            reward += self.add_positive("direct_positive_reward", 0.15)
             self.reward_manager.add("goal_core_bubble", 0.15)
 
         # -----------------------------
@@ -5099,7 +5099,7 @@ class DoomEnv(gym.Env):
         # -----------------------------
         if dist < best_dist - 8.0:
             self.goal_bubble_best_dist[target_name] = dist
-            reward += 0.10
+            reward += self.add_positive("direct_positive_reward", 0.10)
             self.reward_manager.add("goal_bubble_new_best", 0.10)
 
         # -----------------------------
@@ -5408,15 +5408,15 @@ class DoomEnv(gym.Env):
         reward = 0.0
 
         if enemy_visible and ammo > 0:
-            reward += 0.03
+            reward += self.add_positive("direct_positive_reward", 0.03)
             self.reward_manager.add("enemy_seen_with_ammo", 0.03)
 
         if enemy_visible and enemy_centered and ammo > 0:
-            reward += 0.08
+            reward += self.add_positive("direct_positive_reward", 0.08)
             self.reward_manager.add("enemy_centered_with_ammo", 0.08)
 
         if action == "shoot" and enemy_visible and enemy_centered and ammo > 0:
-            reward += 0.20
+            reward += self.add_positive("direct_positive_reward", 0.20)
             self.reward_manager.add("valid_shoot_attempt", 0.20)
 
         if action == "shoot" and not enemy_visible:
@@ -5477,20 +5477,20 @@ class DoomEnv(gym.Env):
         # -----------------------------------------------------
 
         if trusted_enemy_visible and weapon in ["pistol", "shotgun", "chaingun", "plasma"]:
-            reward += 0.20
+            reward += self.add_positive("direct_positive_reward", 0.20)
             self.reward_manager.add("good_combat_weapon_context", 0.20)
 
         if enemy_close and weapon == "melee":
-            reward += 0.30
+            reward += self.add_positive("direct_positive_reward", 0.30)
             self.reward_manager.add("melee_close_context", 0.30)
 
         if enemy_mid_or_far and weapon in ["shotgun", "chaingun", "plasma"]:
-            reward += 0.25
+            reward += self.add_positive("direct_positive_reward", 0.25)
             self.reward_manager.add("midrange_weapon_context", 0.25)
 
         if weapon == "rpg":
             if trusted_enemy_visible and not enemy_close and not barrel_visible and health >= 60:
-                reward += 0.30
+                reward += self.add_positive("direct_positive_reward", 0.30)
                 self.reward_manager.add("safe_rpg_context", 0.30)
             else:
                 reward += self.add_penalty("unsafe_rpg_context", -0.80)
@@ -5628,15 +5628,15 @@ class DoomEnv(gym.Env):
         reward = 0.0
 
         if distance_delta > 1.0:
-            reward += 0.03
+            reward += self.add_positive("direct_positive_reward", 0.03)
             self.reward_manager.add("small_goal_progress", 0.03)
 
         if distance_delta > 8.0:
-            reward += 0.07
+            reward += self.add_positive("direct_positive_reward", 0.07)
             self.reward_manager.add("medium_goal_progress", 0.07)
 
         if distance_delta > 20.0:
-            reward += 0.10
+            reward += self.add_positive("direct_positive_reward", 0.10)
             self.reward_manager.add("large_goal_progress", 0.10)
 
         if distance_delta < -12.0:
@@ -5704,6 +5704,35 @@ class DoomEnv(gym.Env):
 
         progress = min(1.0, self._step_count / float(self.penalty_decay_steps))
         return 4.0 - (3.0 * progress)
+
+
+    def add_positive(self, name, base_reward):
+        """
+        TEST MODE:
+        Triple positive rewards.
+
+        This keeps your hard negative reward experiment intact while making
+        successful behavior easier for PPO to notice.
+
+        Example:
+        +0.35 -> +1.05
+        +3.00 -> +9.00
+        +15.00 -> +45.00
+        """
+
+        try:
+            value = float(base_reward)
+        except Exception:
+            return base_reward
+
+        if value > 0:
+            boosted = value * 3.0
+            self.reward_manager.add(name, boosted)
+            return boosted
+
+        self.reward_manager.add(name, value)
+        return value
+
 
     def add_penalty(self, name, base_penalty):
         scaled_penalty = base_penalty * self.penalty_scale()
@@ -6333,14 +6362,14 @@ class DoomEnv(gym.Env):
 
         # Very close enemies should trigger retreat or strafe.
         if enemy_close and action in ["move_backward", "strafe_left", "strafe_right"]:
-            reward += 0.35
+            reward += self.add_positive("direct_positive_reward", 0.35)
 
         if enemy_very_close and action == "move_forward":
             reward -= 1.25
 
         # If taking damage, reward evasive movement.
         if health_delta < 0 and action in ["move_backward", "strafe_left", "strafe_right"]:
-            reward += 0.75
+            reward += self.add_positive("direct_positive_reward", 0.75)
 
         # Standing close and using/shooting without repositioning can be risky.
         if enemy_very_close and action == "use":
@@ -6431,11 +6460,11 @@ class DoomEnv(gym.Env):
         target_angle = np.degrees(np.arctan2(dy, dx))
 
         # Normalize both angles to 0-360.
-        current_angle = float(angle) % 360.0
-        target_angle = float(target_angle) % 360.0
+        current_angle = float(angle) % 345.0
+        target_angle = float(target_angle) % 345.0
 
         # Shortest signed angular difference: -180 to +180.
-        diff = (target_angle - current_angle + 180.0) % 360.0 - 180.0
+        diff = (target_angle - current_angle + 180.0) % 345.0 - 180.0
 
         return diff
 
@@ -6640,19 +6669,19 @@ class DoomEnv(gym.Env):
             reward += self.add_penalty("wall_sensor_no_progress_near_wall", -15.0)
 
         if near_wall and action in ["move_backward", "turn_left", "turn_right", "strafe_left", "strafe_right"]:
-            reward += 0.15
-            self.reward_manager.add("wall_sensor_escape_action", 0.15)
+            reward += self.add_positive("wall_sensor_escape_action", 15.0)
+            self.reward_manager.add("wall_sensor_escape_action", 45.0)
 
         if safest == "right" and action in ["turn_right", "strafe_right"]:
-            reward += 0.08
+            reward += self.add_positive("direct_positive_reward", 0.08)
             self.reward_manager.add("wall_sensor_escape_right", 0.08)
 
         if safest == "left" and action in ["turn_left", "strafe_left"]:
-            reward += 0.08
+            reward += self.add_positive("direct_positive_reward", 0.08)
             self.reward_manager.add("wall_sensor_escape_left", 0.08)
 
         if obstacle_pressure < 0.25 and action == "move_forward" and distance_moved > 3.0:
-            reward += 0.05
+            reward += self.add_positive("direct_positive_reward", 0.05)
             self.reward_manager.add("wall_sensor_open_forward", 0.05)
 
         return reward

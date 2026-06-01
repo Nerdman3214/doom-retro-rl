@@ -1,3 +1,18 @@
+POSITIVE_REWARD_TEST_MULTIPLIER = 3.0
+
+
+def positive_reward(value):
+    try:
+        value = float(value)
+    except Exception:
+        return value
+
+    if value > 0:
+        return value * POSITIVE_REWARD_TEST_MULTIPLIER
+
+    return value
+
+
 def compute_doom_brain_reward(game_state, action_name, world_state, mission_update):
     """
     Shared reward logic for DoomEnv and VizDoomEnv.
@@ -48,11 +63,11 @@ def compute_doom_brain_reward(game_state, action_name, world_state, mission_upda
     # Combat.
     if enemy_visible:
         if action_name == "shoot" and ammo > 0:
-            reward += 0.08
+            reward += positive_reward(15.0)
             events.append("shoot_visible_enemy")
 
         if enemy_centered and action_name == "shoot" and ammo > 0:
-            reward += 0.18
+            reward += positive_reward(15.0)
             events.append("shoot_centered_enemy")
 
         if action_name in {"move_forward"} and damage_taken > 0:
@@ -60,11 +75,11 @@ def compute_doom_brain_reward(game_state, action_name, world_state, mission_upda
             events.append("pushed_into_damage")
 
     if hit_enemy:
-        reward += 0.75
+        reward += positive_reward(0.75)
         events.append("hit_enemy")
 
     if killed_enemy:
-        reward += 1.50
+        reward += positive_reward(1.50)
         events.append("killed_enemy")
 
     if action_name == "shoot" and not enemy_visible:
@@ -82,19 +97,19 @@ def compute_doom_brain_reward(game_state, action_name, world_state, mission_upda
 
     # Items/resources.
     if picked_item:
-        reward += 0.20
+        reward += positive_reward(15.0)
         events.append("picked_item")
 
     if picked_health:
-        reward += 0.40
+        reward += positive_reward(15.0)
         events.append("picked_health")
 
     if picked_ammo:
-        reward += 0.30
+        reward += positive_reward(15.0)
         events.append("picked_ammo")
 
     if picked_weapon:
-        reward += 1.00
+        reward += positive_reward(1.00)
         events.append("picked_weapon")
 
     if ammo <= 5 and action_name == "shoot":
@@ -103,12 +118,12 @@ def compute_doom_brain_reward(game_state, action_name, world_state, mission_upda
 
     # Door/use logic.
     if opened_door:
-        reward += 1.00
+        reward += positive_reward(15.0)
         events.append("opened_door")
 
     if action_name == "use":
         if front_blocked:
-            reward += 0.10
+            reward += positive_reward(0.10)
             events.append("use_near_blocker")
         else:
             reward -= 15.0
@@ -117,7 +132,7 @@ def compute_doom_brain_reward(game_state, action_name, world_state, mission_upda
     # Unstuck / wall logic.
     if mode == "unstuck":
         if action_name in {"turn_left", "turn_right", "move_backward", "strafe_left", "strafe_right"}:
-            reward += 0.05
+            reward += positive_reward(15.0)
             events.append("unstuck_action")
         if action_name == "move_forward" and front_blocked:
             reward -= 15.0
