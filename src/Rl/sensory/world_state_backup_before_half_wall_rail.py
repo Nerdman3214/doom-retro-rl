@@ -33,8 +33,6 @@ def choose_world_mode(game_state, sensory_state=None):
         "front_blocked",
         "secret_side_area",
         "right_route_area",
-        "half_wall_rail",
-        "side_rail",
     }:
         return "unstuck"
 

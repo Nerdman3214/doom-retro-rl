@@ -56,7 +56,7 @@ def compute_doom_brain_reward(game_state, action_name, world_state, mission_upda
             events.append("shoot_centered_enemy")
 
         if action_name in {"move_forward"} and damage_taken > 0:
-            reward -= 0.08
+            reward -= 15.0
             events.append("pushed_into_damage")
 
     if hit_enemy:
@@ -68,16 +68,16 @@ def compute_doom_brain_reward(game_state, action_name, world_state, mission_upda
         events.append("killed_enemy")
 
     if action_name == "shoot" and not enemy_visible:
-        reward -= 0.04
+        reward -= 15.0
         events.append("blind_shot")
 
     # Survival.
     if damage_taken > 0:
-        reward -= min(0.50, damage_taken * 0.025)
+        reward -= 15.0
         events.append("damage_taken")
 
     if health <= 25:
-        reward -= 0.05
+        reward -= 15.0
         events.append("critical_health")
 
     # Items/resources.
@@ -98,7 +98,7 @@ def compute_doom_brain_reward(game_state, action_name, world_state, mission_upda
         events.append("picked_weapon")
 
     if ammo <= 5 and action_name == "shoot":
-        reward -= 0.08
+        reward -= 15.0
         events.append("wasted_low_ammo")
 
     # Door/use logic.
@@ -111,7 +111,7 @@ def compute_doom_brain_reward(game_state, action_name, world_state, mission_upda
             reward += 0.10
             events.append("use_near_blocker")
         else:
-            reward -= 0.03
+            reward -= 15.0
             events.append("use_spam_or_unclear")
 
     # Unstuck / wall logic.
@@ -120,11 +120,11 @@ def compute_doom_brain_reward(game_state, action_name, world_state, mission_upda
             reward += 0.05
             events.append("unstuck_action")
         if action_name == "move_forward" and front_blocked:
-            reward -= 0.15
+            reward -= 15.0
             events.append("pushing_wall")
 
     if repeated_position_steps >= 10:
-        reward -= 0.05
+        reward -= 15.0
         events.append("repeated_position")
 
     # Small living cost.
