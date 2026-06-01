@@ -16,7 +16,7 @@ LEVEL_GUIDES = {
             "name": "level_exit",
             "x": -400.0,
             "y": 1296.0,
-            "radius": 128.0,
+            "radius": 160.0,
         },
 
         "safe_bounds": {
@@ -34,7 +34,7 @@ LEVEL_GUIDES = {
                 "x": -416.0,
                 "y": 256.0,
                 "radius": 80.0,
-                "reward": 0.15,
+                "reward": 0.0,
                 "hint": "leave_spawn",
             },
             {
@@ -42,7 +42,7 @@ LEVEL_GUIDES = {
                 "x": -360.0,
                 "y": 330.0,
                 "radius": 75.0,
-                "reward": 0.30,
+                "reward": 0.0,
                 "hint": "follow_corridor_slope",
             },
             {
@@ -50,7 +50,7 @@ LEVEL_GUIDES = {
                 "x": -285.0,
                 "y": 405.0,
                 "radius": 80.0,
-                "reward": 0.45,
+                "reward": 0.0,
                 "hint": "follow_corridor_slope",
             },
             {
@@ -58,7 +58,7 @@ LEVEL_GUIDES = {
                 "x": -425.0,
                 "y": 430.0,
                 "radius": 90.0,
-                "reward": 0.90,
+                "reward": 0.0,
                 "hint": "turn_left",
             },
             {
@@ -66,7 +66,7 @@ LEVEL_GUIDES = {
                 "x": -430.0,
                 "y": 620.0,
                 "radius": 150.0,
-                "reward": 1.00,
+                "reward": 0.0,
                 "hint": "advance_after_left_turn",
             },
             {
@@ -74,15 +74,15 @@ LEVEL_GUIDES = {
                 "x": -400.0,
                 "y": 1000.0,
                 "radius": 190.0,
-                "reward": 1.50,
+                "reward": 0.0,
                 "hint": "advance_to_exit",
             },
             {
                 "name": "level_exit",
                 "x": -400.0,
                 "y": 1296.0,
-                "radius": 128.0,
-                "reward": 5.00,
+                "radius": 160.0,
+                "reward": 100.0,
                 "hint": "finish_level",
             },
         ],

@@ -3,6 +3,38 @@ from dataclasses import dataclass, field
 
 
 @dataclass
+
+class MissionObjective:
+    def __init__(
+        self,
+        name,
+        kind,
+        x,
+        y,
+        radius=160.0,
+        reward=0.0,
+        required=True,
+        hint="",
+    ):
+        self.name = name
+        self.kind = kind
+        self.x = float(x)
+        self.y = float(y)
+        self.radius = float(radius)
+        self.reward = float(reward)
+        self.required = bool(required)
+        self.hint = hint
+
+    def as_target_dict(self):
+        return {
+            "name": self.name,
+            "kind": self.kind,
+            "x": self.x,
+            "y": self.y,
+            "radius": self.radius,
+            "hint": self.hint,
+        }
+
 class Objective:
     name: str
     kind: str
@@ -22,131 +54,23 @@ def dist2d(x1, y1, x2, y2):
 
 def get_freedoom1_e1m1_mission():
     """
-    Mission model for Freedoom 1 E1M1.
+    Exit-only E1M1 mission.
 
-    This does not force secrets before basic survival.
-    It tracks navigation, combat, items, doors/use, secrets, then exit.
+    No corridor/slope/secret objectives for now.
+    MissionTracker expects objectives with attributes like .required.
     """
 
     return [
-        Objective(
-            name="spawn_exit_lane",
-            kind="route",
-            x=-416.0,
-            y=256.0,
-            radius=96.0,
-            reward=0.15,
-            required=True,
-            hint="leave_spawn",
-        ),
-
-        # Sloped corridor path.
-        Objective(
-            name="sloped_corridor_entry",
-            kind="route",
-            x=-380.0,
-            y=320.0,
-            radius=105.0,
-            reward=0.30,
-            required=True,
-            hint="follow_corridor_slope",
-        ),
-        Objective(
-            name="sloped_corridor_mid",
-            kind="route",
-            x=-300.0,
-            y=390.0,
-            radius=105.0,
-            reward=0.40,
-            required=True,
-            hint="follow_corridor_slope",
-        ),
-
-        # Important: corridor continuation/exit is to the left.
-        Objective(
-            name="corridor_left_turn",
-            kind="route",
-            x=-420.0,
-            y=430.0,
-            radius=125.0,
-            reward=0.80,
-            required=True,
-            hint="turn_left",
-        ),
-
-        Objective(
-            name="post_corridor_room",
-            kind="route",
-            x=-430.0,
-            y=620.0,
-            radius=160.0,
-            reward=1.00,
-            required=True,
-            hint="advance_after_left_turn",
-        ),
-
-        # Secrets are optional for now, but tracked for 100%.
-        Objective(
-            name="secret_sector_52",
-            kind="secret",
-            x=496.0,
-            y=712.0,
-            radius=160.0,
-            reward=0.60,
-            required=False,
-            hint="optional_secret",
-        ),
-        Objective(
-            name="secret_sector_86",
-            kind="secret",
-            x=447.0,
-            y=1862.0,
-            radius=160.0,
-            reward=0.60,
-            required=False,
-            hint="optional_secret",
-        ),
-        Objective(
-            name="secret_sector_128",
-            kind="secret",
-            x=1680.0,
-            y=-880.0,
-            radius=180.0,
-            reward=0.60,
-            required=False,
-            hint="optional_secret",
-        ),
-        Objective(
-            name="secret_sector_132",
-            kind="secret",
-            x=544.0,
-            y=804.0,
-            radius=160.0,
-            reward=0.60,
-            required=False,
-            hint="optional_secret",
-        ),
-
-        Objective(
-            name="exit_approach",
-            kind="route",
-            x=-400.0,
-            y=1000.0,
-            radius=200.0,
-            reward=1.50,
-            required=True,
-            hint="advance_to_exit",
-        ),
-        Objective(
+        MissionObjective(
             name="level_exit",
             kind="exit",
             x=-400.0,
             y=1296.0,
-            radius=128.0,
-            reward=5.00,
+            radius=160.0,
+            reward=100.0,
             required=True,
-            hint="finish_level",
-        ),
+            hint="complete_level",
+        )
     ]
 
 
@@ -230,7 +154,7 @@ class MissionTracker:
 
         # Dense progress toward current objective.
         if improvement > 0.0:
-            shaped = min(0.25, improvement * 0.006)
+            shaped = min(0.05, improvement * 0.001)
             result["reward"] += shaped
             self.best_target_distance = min(self.best_target_distance, target_dist)
         elif improvement < -24.0:
@@ -269,7 +193,7 @@ class MissionTracker:
             else:
                 exit_improvement = self.best_exit_distance - exit_dist
                 if exit_improvement > 0:
-                    result["reward"] += min(0.12, exit_improvement * 0.002)
+                    result["reward"] += min(2.00, exit_improvement * 0.020)
                     self.best_exit_distance = min(self.best_exit_distance, exit_dist)
 
         result["target"] = self.as_target_dict()
