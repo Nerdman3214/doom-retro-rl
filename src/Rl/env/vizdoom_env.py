@@ -1558,6 +1558,25 @@ class VizDoomEnv(gym.Env):
         )
         reward += brain_reward
 
+        # Track wall/rail pushing or no-progress behavior.
+        if not hasattr(self, "reroute_stuck_steps"):
+            self.reroute_stuck_steps = 0
+
+        exit_delta = float(director_result.get("distance_delta", 0.0) or 0.0)
+
+        is_not_progressing = exit_delta < 1.0
+        is_barely_moving = distance_moved < 2.0
+        is_push_action = action_name in ["move_forward", "strafe_left", "strafe_right"]
+
+        if is_push_action and is_not_progressing and is_barely_moving:
+            self.reroute_stuck_steps += 1
+        else:
+            self.reroute_stuck_steps = 0
+
+        if self.reroute_stuck_steps >= 8:
+            reward -= 12.0
+            info["reroute_needed"] = True
+
         return obs, float(reward), bool(done), bool(truncated), info
     
     def _restart_game_after_crash(self):
