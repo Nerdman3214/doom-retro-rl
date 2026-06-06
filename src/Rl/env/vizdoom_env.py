@@ -1,3 +1,10 @@
+
+# Recovery prior imports
+import torch
+import torch.nn as nn
+import numpy as np
+from pathlib import Path as _RecoveryPath
+
 from sensory.world_state import build_world_state
 from navigation.mission_plan import MissionTracker, get_freedoom1_e1m1_mission
 from rewards.doom_brain_reward import compute_doom_brain_reward
@@ -28,6 +35,185 @@ else:
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_IWAD = "/usr/share/games/doom/freedoom1.wad"
+
+
+
+class RecoveryActionPriorAdvisor:
+    RECOVERY_ALLOWED = {
+        "move_forward",
+        "move_backward",
+        "turn_left",
+        "turn_right",
+        "strafe_left",
+        "strafe_right",
+    }
+
+    def __init__(self, checkpoint_path, device=None):
+
+        # Recovery action prior: used only when stuck/wall-blocked.
+        self.use_recovery_action_prior = True
+        self.recovery_prior_min_confidence = 0.20
+        self.recovery_prior_reward_scale = 0.04
+        self.recovery_prior_mismatch_penalty = -0.004
+        self.recovery_prior_debug_every = 100
+        self.recovery_prior_call_count = 0
+        self.recovery_action_prior = RecoveryActionPriorAdvisor(
+            _RecoveryPath(__file__).resolve().parents[1] / "checkpoints" / "recovery_action_prior.pt"
+        )
+        self.checkpoint_path = _RecoveryPath(checkpoint_path)
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = None
+        self.action_names = []
+        self.ready = False
+
+        if not self.checkpoint_path.exists():
+            print(f"[recovery_prior] missing {self.checkpoint_path}")
+            return
+
+        try:
+            ckpt = torch.load(self.checkpoint_path, map_location=self.device)
+            self.action_names = list(ckpt.get("action_names", []))
+            num_actions = int(ckpt.get("num_actions", len(self.action_names) or 8))
+
+            self.model = nn.Sequential(
+                nn.Conv2d(3, 32, 8, stride=4),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, 4, stride=2),
+                nn.ReLU(),
+                nn.Conv2d(64, 64, 3, stride=1),
+                nn.ReLU(),
+                nn.Flatten(),
+                nn.Linear(64 * 7 * 7, 256),
+                nn.ReLU(),
+                nn.Linear(256, num_actions),
+            ).to(self.device)
+
+            self.model.load_state_dict(ckpt["model_state_dict"])
+            self.model.eval()
+            self.ready = True
+
+            print(
+                f"[recovery_prior] loaded {self.checkpoint_path} "
+                f"num_actions={num_actions} device={self.device}"
+            )
+        except Exception as e:
+            print(f"[recovery_prior] failed to load {self.checkpoint_path}: {e}")
+            self.ready = False
+
+    def preprocess(self, frame):
+        if frame is None:
+            return None
+
+        arr = np.asarray(frame)
+
+        if arr.ndim == 3 and arr.shape[0] in (1, 3, 4):
+            arr = np.transpose(arr, (1, 2, 0))
+
+        if arr.ndim == 2:
+            arr = np.stack([arr, arr, arr], axis=-1)
+
+        if arr.ndim != 3:
+            return None
+
+        if arr.shape[-1] > 3:
+            arr = arr[..., :3]
+
+        arr = arr.astype(np.uint8)
+
+        import cv2
+        arr = cv2.resize(arr, (84, 84), interpolation=cv2.INTER_AREA)
+        arr = arr.astype(np.float32) / 255.0
+
+        x = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        return x
+
+    @torch.no_grad()
+    def advise(self, frame):
+        if not self.ready or self.model is None:
+            return None, 0.0
+
+        x = self.preprocess(frame)
+        if x is None:
+            return None, 0.0
+
+        logits = self.model(x)
+        probs = torch.softmax(logits, dim=1)[0]
+        ranked = torch.argsort(probs, descending=True).detach().cpu().tolist()
+
+        for idx in ranked:
+            if idx < 0 or idx >= len(self.action_names):
+                continue
+
+            name = self.action_names[idx]
+            conf = float(probs[idx].detach().cpu().item())
+
+            # Important: never use shoot/use as recovery advice.
+            if name in self.RECOVERY_ALLOWED:
+                return name, conf
+
+        return None, 0.0
+
+
+def recovery_prior_is_recovery_state(env):
+    wall_contact_steps = int(getattr(env, "wall_contact_steps", 0) or 0)
+    corner_trap_steps = int(getattr(env, "corner_trap_steps", 0) or 0)
+    stuck_steps = int(getattr(env, "stuck_steps", 0) or 0)
+    no_progress_steps = int(getattr(env, "no_progress_steps", 0) or 0)
+    recovery_mode = bool(getattr(env, "recovery_mode", False))
+
+    if recovery_mode:
+        return True
+    if wall_contact_steps >= 8:
+        return True
+    if corner_trap_steps >= 6:
+        return True
+    if stuck_steps >= 10:
+        return True
+    if no_progress_steps >= 18:
+        return True
+
+    return False
+
+
+def recovery_action_prior_reward(env, frame, action_name):
+    if not bool(getattr(env, "use_recovery_action_prior", False)):
+        return 0.0
+
+    if not recovery_prior_is_recovery_state(env):
+        return 0.0
+
+    advisor = getattr(env, "recovery_action_prior", None)
+    if advisor is None or not getattr(advisor, "ready", False):
+        return 0.0
+
+    advised_action, confidence = advisor.advise(frame)
+
+    env.recovery_prior_call_count = int(getattr(env, "recovery_prior_call_count", 0)) + 1
+
+    if advised_action is None:
+        return 0.0
+
+    min_conf = float(getattr(env, "recovery_prior_min_confidence", 0.20))
+
+    if confidence < min_conf:
+        reward = 0.0
+    elif str(action_name) == str(advised_action):
+        reward = float(getattr(env, "recovery_prior_reward_scale", 0.04))
+    else:
+        reward = float(getattr(env, "recovery_prior_mismatch_penalty", -0.004))
+
+    every = int(getattr(env, "recovery_prior_debug_every", 100))
+    if every > 0 and env.recovery_prior_call_count % every == 0:
+        print(
+            f"[recovery_prior_reward] call={env.recovery_prior_call_count} "
+            f"advised={advised_action} action={action_name} "
+            f"conf={confidence:.2f} reward={reward:.4f} "
+            f"wall={getattr(env, 'wall_contact_steps', 0)} "
+            f"stuck={getattr(env, 'stuck_steps', 0)} "
+            f"noprog={getattr(env, 'no_progress_steps', 0)}"
+        )
+
+    return float(reward)
 
 
 class VizDoomEnv(gym.Env):
@@ -274,6 +460,30 @@ class VizDoomEnv(gym.Env):
             f"automap={self.use_automap} "
             f"mode={self.observation_mode}"
         )
+
+        # Force Doom skill before game.init(). 1=easiest, 3=normal.
+
+
+        try:
+
+
+            skill = int(os.environ.get('VIZDOOM_SKILL', '3'))
+
+
+            skill = max(1, min(5, skill))
+
+
+            self.game.set_doom_skill(skill)
+
+
+            print(f'[vizdoom_env] doom_skill={skill} (1=easiest, 3=normal)')
+
+
+        except Exception as e:
+
+
+            print(f'[vizdoom_env] could not set doom skill: {e}')
+
 
         game.init()
         self.game = game
@@ -1494,6 +1704,18 @@ class VizDoomEnv(gym.Env):
 
         state = None if done else self.game.get_state()
         reward = self._compute_reward(action_name, state)
+
+        # Recovery-prior reward only activates during stuck/wall-blocked states.
+        try:
+            recovery_frame = None
+            if 'post_game_state' in locals() and post_game_state is not None:
+                recovery_frame = getattr(post_game_state, 'screen_buffer', None)
+            if recovery_frame is None and 'state' in locals() and state is not None:
+                recovery_frame = getattr(state, 'screen_buffer', None)
+            reward += recovery_action_prior_reward(self, recovery_frame, action_name)
+        except Exception as e:
+            if int(getattr(self, 'recovery_prior_call_count', 0)) % 500 == 0:
+                print(f'[recovery_prior_reward] skipped due error: {e}')
 
         post_game_state = self._state_to_game_state(state)
         post_game_state = self.enrich_game_state(post_game_state)

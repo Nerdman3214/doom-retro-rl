@@ -60,7 +60,11 @@ from curriculum.curriculum_manager import CurriculumManager
 from observation.frame_processor import FrameProcessor
 from navigation.checkpoint_tracker import CheckpointTracker
 from navigation.level_guides import get_level_guide
-from vision.scene_predictor import ScenePredictor
+try:
+    from vision.scene_predictor import ScenePredictor
+except Exception as e:
+    print(f"[scene_vision] ScenePredictor disabled: {e}")
+    ScenePredictor = None
 from sensory.sensory_model import SensoryModel
 from director.route_director import RouteDirector
 from navigation.retrace_navigator import RetraceNavigator
@@ -5153,6 +5157,14 @@ class DoomEnv(gym.Env):
                 reward += self.action_prior_reward_scale
             else:
                 reward -= self.action_prior_reward_scale * 0.25
+
+        step = getattr(self, "step_count", getattr(self, "current_step", 0))
+        if step % 100 == 0:
+            print(
+                f"[action_prior_reward] step={step} "
+                f"advised={advised_action} action={action} "
+                f"conf={confidence:.2f} reward={reward:.4f}"
+            )
 
         return float(reward), result
 
