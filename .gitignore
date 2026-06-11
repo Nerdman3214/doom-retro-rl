@@ -163,3 +163,13 @@ src/doomretro
 *.db
 *.layout
 msvc/.github/copilot-instructions.md
+
+# RL generated data/checkpoints
+src/Rl/dataset/
+src/Rl/vision_dataset/
+src/Rl/vision_dataset_v2/
+src/Rl/checkpoints/
+src/Rl/tensorboard_logs/
+src/Rl/runs/
+src/Rl/trajectories/
+src/Rl/clips/
