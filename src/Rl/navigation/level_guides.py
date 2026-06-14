@@ -1,260 +1,135 @@
-"""
-Manual level guide database.
-
-This file stores map-specific knowledge:
-- main goal / exit
-- optional secrets
-- keycards
-- locked doors
-- switches/buttons
-- elevators/doors/use points
-
-Important:
-The coordinates are still placeholders until you record real x/y values
-from your debug logs.
-
-The important architecture change is:
-RouteDirector should read goals from here instead of hardcoding one map path.
-"""
-
-
 DEFAULT_EMPTY_GUIDE = {
+    "player_start": None,
     "main_goal": None,
     "checkpoints": [],
     "secrets": [],
-    "keys": [],
-    "locked_doors": [],
-    "switches": [],
-    "use_points": [],
+    "route_zones": [],
+    "safe_bounds": None,
 }
 
 
 LEVEL_GUIDES = {
     "freedoom1_e1m1": {
+        "player_start": {"x": -416.0, "y": 256.0, "angle": 0.0},
+
+        "main_goal": {
+            "name": "level_exit",
+            "x": -400.0,
+            "y": 1296.0,
+            "radius": 160.0,
+        },
+
+        "safe_bounds": {
+            "min_x": -900.0,
+            "max_x": 1200.0,
+            "min_y": -1200.0,
+            "max_y": 2200.0,
+        },
+
+        # Main route: corridor is sloped, and continuation exits left.
+        # Keep radii tight enough so they do not all fire at spawn.
         "route_zones": [
             {
-                "name": "spawn_exit",
-                "x": 600,
-                "y": 360,
-                "radius": 120,
-                "reward": 0.50,
+                "name": "spawn_exit_lane",
+                "x": -416.0,
+                "y": 256.0,
+                "radius": 80.0,
+                "reward": 0.0,
+                "hint": "leave_spawn",
             },
             {
-                "name": "right_route",
-                "x": 625,
-                "y": 360,
-                "radius": 120,
-                "reward": 0.80,
+                "name": "sloped_corridor_entry",
+                "x": -360.0,
+                "y": 330.0,
+                "radius": 75.0,
+                "reward": 0.0,
+                "hint": "follow_corridor_slope",
             },
             {
-                "name": "door_area",
-                "x": 700,
-                "y": 420,
-                "radius": 140,
-                "reward": 1.00,
+                "name": "sloped_corridor_mid",
+                "x": -285.0,
+                "y": 405.0,
+                "radius": 80.0,
+                "reward": 0.0,
+                "hint": "follow_corridor_slope",
             },
             {
-                "name": "combat_corridor",
-                "x": 850,
-                "y": 400,
-                "radius": 160,
-                "reward": 1.50,
+                "name": "corridor_left_turn",
+                "x": -425.0,
+                "y": 430.0,
+                "radius": 90.0,
+                "reward": 0.0,
+                "hint": "turn_left",
             },
             {
-                "name": "exit_route",
-                "x": 1000,
-                "y": 500,
-                "radius": 180,
-                "reward": 2.00,
+                "name": "post_corridor_room",
+                "x": -430.0,
+                "y": 620.0,
+                "radius": 150.0,
+                "reward": 0.0,
+                "hint": "advance_after_left_turn",
+            },
+            {
+                "name": "exit_approach",
+                "x": -400.0,
+                "y": 1000.0,
+                "radius": 190.0,
+                "reward": 0.0,
+                "hint": "advance_to_exit",
+            },
+            {
+                "name": "level_exit",
+                "x": -400.0,
+                "y": 1296.0,
+                "radius": 160.0,
+                "reward": 100.0,
+                "hint": "finish_level",
             },
         ],
+
         "checkpoints": [],
-        "secrets": [],
+
+        # Optional 100% objectives. Do not make these mandatory yet.
+        "secrets": [
+            {"name": "secret_sector_52", "x": 496.0, "y": 712.0, "radius": 160.0},
+            {"name": "secret_sector_86", "x": 447.0, "y": 1862.0, "radius": 160.0},
+            {"name": "secret_sector_128", "x": 1680.0, "y": -880.0, "radius": 180.0},
+            {"name": "secret_sector_132", "x": 544.0, "y": 804.0, "radius": 160.0},
+        ],
     }
 }
 
-"""LEVEL_GUIDES = {
-    "freedoom1_e1m1": {
-        "main_goal": {
-            "name": "level_exit",
-            "type": "exit",
-            "x": 1200.0,
-            "y": -100.0,
-            "radius": 160.0,
-            "reward": 10.0,
-        },
-
-        "checkpoints": [
-            {
-                "name": "start_exit_path",
-                "type": "route",
-                "x": 300.0,
-                "y": 200.0,
-                "radius": 128.0,
-                "reward": 3.0,
-            },
-        ],
-
-        "secrets": [
-            {
-                "name": "secret_1",
-                "type": "secret",
-                "x": -208.0,
-                "y": 144.0,
-                "radius": 128.0,
-                "reward": 6.0,
-            },
-            {
-                "name": "secret_2",
-                "type": "secret",
-                "x": 400.0,
-                "y": 300.0,
-                "radius": 128.0,
-                "reward": 6.0,
-            },
-        ],
-
-        "keys": [
-            # Fill these with real coordinates when you find keycards.
-            # Example:
-            # {
-            #     "name": "blue_keycard",
-            #     "type": "key",
-            #     "key": "blue",
-            #     "x": 500.0,
-            #     "y": 300.0,
-            #     "radius": 96.0,
-            #     "reward": 8.0,
-            # },
-        ],
-
-        "locked_doors": [
-            # Example:
-            # {
-            #     "name": "blue_exit_door",
-            #     "type": "locked_door",
-            #     "requires_key": "blue",
-            #     "x": 900.0,
-            #     "y": 100.0,
-            #     "radius": 128.0,
-            #     "leads_to": "level_exit",
-            # },
-        ],
-
-        "switches": [
-            # Example:
-            # {
-            #     "name": "bridge_switch",
-            #     "type": "switch",
-            #     "x": 700.0,
-            #     "y": 250.0,
-            #     "radius": 96.0,
-            #     "unlocks": "bridge_door",
-            #     "reward": 5.0,
-            # },
-        ],
-
-        "use_points": [
-            # Doors/elevators/buttons that should teach the agent to press use.
-            # Replace placeholders with real x/y values from logs.
-            {
-                "name": "possible_first_door_or_elevator",
-                "type": "use_point",
-                "x": 300.0,
-                "y": 200.0,
-                "radius": 128.0,
-                "reward": 3.0,
-            },
-        ],
-    },
-
-    "freedoom1_e1m2": {
-        "main_goal": {
-            "name": "level_exit",
-            "type": "exit",
-            "x": 0.0,
-            "y": 0.0,
-            "radius": 160.0,
-            "reward": 10.0,
-        },
-        "checkpoints": [],
-        "secrets": [],
-        "keys": [],
-        "locked_doors": [],
-        "switches": [],
-        "use_points": [],
-    },
-
-    "freedoom2_default": {
-        "main_goal": {
-            "name": "exit_area",
-            "type": "exit",
-            "x": 1024.0,
-            "y": 512.0,
-            "radius": 192.0,
-            "reward": 10.0,
-        },
-
-        "checkpoints": [
-            {
-                "name": "leave_start_area",
-                "type": "route",
-                "x": 0.0,
-                "y": 0.0,
-                "radius": 128.0,
-                "reward": 4.0,
-            },
-            {
-                "name": "first_combat_area",
-                "type": "route",
-                "x": 256.0,
-                "y": 128.0,
-                "radius": 128.0,
-                "reward": 5.0,
-            },
-            {
-                "name": "first_door_or_opening",
-                "type": "route",
-                "x": 512.0,
-                "y": 256.0,
-                "radius": 128.0,
-                "reward": 6.0,
-            },
-            {
-                "name": "main_route_midpoint",
-                "type": "route",
-                "x": 768.0,
-                "y": 384.0,
-                "radius": 160.0,
-                "reward": 8.0,
-            },
-        ],
-
-        "secrets": [
-            {
-                "name": "secret_1_placeholder",
-                "type": "secret",
-                "x": 384.0,
-                "y": -256.0,
-                "radius": 96.0,
-                "reward": 6.0,
-            },
-        ],
-
-        "keys": [],
-        "locked_doors": [],
-        "switches": [],
-        "use_points": [],
-    },
-}
-"""
 
 def get_level_guide(level_name):
-    guide = LEVEL_GUIDES.get(level_name)
+    return LEVEL_GUIDES.get(level_name, DEFAULT_EMPTY_GUIDE)
 
-    if guide is None:
-        return DEFAULT_EMPTY_GUIDE.copy()
 
-    fixed = DEFAULT_EMPTY_GUIDE.copy()
-    fixed.update(guide)
-    return fixed
+# ---------------------------------------------------------
+# Backward-compatibility helpers
+# ---------------------------------------------------------
+# Older project files such as env/shared_doom_logic.py expect these functions.
+# Keep them so new mission-plan logic and old shared logic can both work.
+
+def get_route_zones(level_name="freedoom1_e1m1"):
+    guide = get_level_guide(level_name)
+    return guide.get("route_zones", [])
+
+
+def get_checkpoints(level_name="freedoom1_e1m1"):
+    guide = get_level_guide(level_name)
+    return guide.get("checkpoints", [])
+
+
+def get_secrets(level_name="freedoom1_e1m1"):
+    guide = get_level_guide(level_name)
+    return guide.get("secrets", [])
+
+
+def get_main_goal(level_name="freedoom1_e1m1"):
+    guide = get_level_guide(level_name)
+    return guide.get("main_goal")
+
+
+def get_player_start(level_name="freedoom1_e1m1"):
+    guide = get_level_guide(level_name)
+    return guide.get("player_start")

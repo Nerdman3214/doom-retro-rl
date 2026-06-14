@@ -163,3 +163,86 @@ src/doomretro
 *.db
 *.layout
 msvc/.github/copilot-instructions.md
+
+# RL generated data/checkpoints
+src/Rl/dataset/
+src/Rl/vision_dataset/
+src/Rl/vision_dataset_v2/
+src/Rl/checkpoints/
+src/Rl/tensorboard_logs/
+src/Rl/runs/
+src/Rl/trajectories/
+src/Rl/clips/
+
+# RL generated supervised/imitation data
+src/Rl/supervised_models/
+src/Rl/vision_dataset/
+src/Rl/vision_dataset_v2/
+src/Rl/checkpoints/*.pt
+src/Rl/checkpoints/*.zip
+src/Rl/dataset/
+src/Rl/runs/
+src/Rl/tensorboard_logs/
+src/Rl/trajectories/
+src/Rl/clips/
+
+# Supervised Doom Retro reset dataset
+src/Rl/data/supervised_doomretro_v1/
+src/Rl/supervised_models/
+src/Rl/vision_dataset/
+src/Rl/vision_dataset_v2/
+
+# RL/generated training artifacts
+src/Rl/checkpoints/*.pt
+src/Rl/checkpoints/*.zip
+src/Rl/dataset/
+src/Rl/runs/
+src/Rl/tensorboard_logs/
+src/Rl/trajectories/
+src/Rl/clips/
+# RL generated data
+frames/
+frame*/
+screenshots/
+videos/
+recordings/
+runs/
+logs/
+traces/
+replays/
+datasets/
+data/
+tmp/
+outputs/
+results/
+
+# Common generated file types
+*.csv
+*.jsonl
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.mp4
+*.avi
+*.mkv
+*.gif
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.log
+
+# Doom/game assets - don't commit these
+*.wad
+*.pk3
+*.deh
+
+# Python junk
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env

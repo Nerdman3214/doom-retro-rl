@@ -127,6 +127,7 @@ class SensoryModel:
             )
         )
 
+
         side_wall_pressure = (
             left_ratio >= 0.75
             or right_ratio >= 0.75

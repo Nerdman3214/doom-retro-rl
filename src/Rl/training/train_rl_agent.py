@@ -2,7 +2,6 @@ import sys
 import os
 import time
 
-from env.vizdoom_env import VizDoomEnv
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -27,7 +26,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(TENSORBOARD_DIR, exist_ok=True)
 
 
-def make_env(launch_doom=True, record=True):
+def make_env(launch_doom=True, record=False):
     """
     Training env.
 
@@ -42,7 +41,8 @@ def make_env(launch_doom=True, record=True):
 
     env = DoomEnv(
         launch_doom=launch_doom,
-        record=record,
+        record=False,
+        training_mode=True,
     )
 
     
@@ -106,7 +106,7 @@ checkpoint_callback = CheckpointCallback(
 
 try:
     model.learn(
-        total_timesteps=200_000,
+        total_timesteps=1_000_000,
         callback=checkpoint_callback,
         progress_bar=True,
     )

@@ -1,7 +1,11 @@
+from rewards.doom_brain_reward import compute_doom_brain_reward
+from navigation.mission_plan import MissionTracker, get_freedoom1_e1m1_mission
+from sensory.world_state import build_world_state, choose_world_mode
 import sys
 import os
 import cv2
 import json
+import math
 from pathlib import Path
 from collections import deque
 
@@ -40,6 +44,7 @@ from loggers.trajectory_logger import TrajectoryLogger
 from models.preference_model import PreferenceModel
 from recording.clip_generator import ClipGenerator
 from recording.smart_clip_generator import SmartClipGenerator
+from sensory.world_state import build_world_state, choose_world_mode
 try:
     from recording.record_player_session import PlayerRecorder
 except Exception as e:
@@ -55,11 +60,18 @@ from curriculum.curriculum_manager import CurriculumManager
 from observation.frame_processor import FrameProcessor
 from navigation.checkpoint_tracker import CheckpointTracker
 from navigation.level_guides import get_level_guide
-from vision.scene_predictor import ScenePredictor
+try:
+    from vision.scene_predictor import ScenePredictor
+except Exception as e:
+    print(f"[scene_vision] ScenePredictor disabled: {e}")
+    ScenePredictor = None
 from sensory.sensory_model import SensoryModel
 from director.route_director import RouteDirector
 from navigation.retrace_navigator import RetraceNavigator
 from observation.wall_sensor import WallSensor
+from env.shared_doom_logic import SharedDoomLogic
+from perception.prediction_adapter import build_doomretro_game_state
+from imitation.action_prior_advisor import ActionPriorAdvisor
 
 try:
     from observation.vision_detector import VisionDetector
@@ -92,7 +104,7 @@ DOOM_IWAD = "/usr/share/games/doom/freedoom1.wad"
 class DoomEnv(gym.Env):
     metadata = {"render_modes": []}
 
-    def __init__(self, launch_doom=True, record=True):
+    def __init__(self, launch_doom=True, record=False, training_mode=True):
         super().__init__()
 
         self.game_process = None
@@ -136,17 +148,72 @@ class DoomEnv(gym.Env):
         self.route_director = RouteDirector()
         self.retrace_navigator = RetraceNavigator()
         self.enable_retrace_navigator = False
+        self.shared_logic = SharedDoomLogic()
+        self.previous_shared_game_state = None
+        self.last_shared_debug = {}
+        self.use_shared_logic_reward = True
+        self.use_shared_logic_reward_blend = True
+        self.shared_logic_reward_scale = 0.10
+        self.shared_logic_reward_clip = 0.25
+        self.use_shared_movement_reward = True
+        self.shared_movement_reward_scale = 1.0
+        self.use_shared_wall_reward = True
+        self.shared_wall_reward_scale = 1.0
+        self.use_shared_route_curriculum_reward = True
+        self.shared_route_curriculum_reward_scale = 1.0
+        self.use_shared_object_scene_reward = True
+        self.shared_object_scene_reward_scale = 1.0
+        self.retrace_lock_steps = 0
+        self.pending_retrace_action = None
+        self.secret_area_reached_this_episode = False
+        self.secrets_found_this_episode = set()
+        self.training_mode = training_mode
+        self.last_progress_position = None
+        self.no_position_change_steps = 0
+        self.last_distance_to_goal = None
+        self.no_distance_progress_steps = 0
+        # in __init__
+        self.recent_loop_tile = None
+        self.recent_loop_steps = 0
+        self.recovery_pulse_steps = 0
+        self.recovery_escape_side = "right"
+        self.recovery_last_position = None
+        self.recovery_no_move_steps = 0
+        self.hard_180_recovery_steps = 0
+        self.hard_180_turn_direction = "left"
+        self.hard_180_reason = None
+        self.route_gravity_steps = 0
+        # Any obstacle/no-movement recovery settings.
+        # About 2 seconds. With 0.10-0.12s actions plus overhead, 18 steps is a good test.
+        self.no_movement_recovery_threshold_steps = 18
+        self.any_obstacle_recovery_steps = 0
+        self.last_meaningful_position = None
+
+        # Full replacement mode exists, but keep it OFF until tests pass.
+        self.use_full_shared_reward_mode = False
+        self.full_shared_reward_scale = 1.0
+        self.full_shared_reward_clip = 5.0
+
+        self.old_route_reward_scale = 0.25
+        self.old_curriculum_reward_scale = 0.25
+
+        self.old_wall_reward_scale = 0.25
+        self.old_stuck_reward_scale = 0.25
+        self.old_object_reward_scale = 0.25
+        self.old_scene_reward_scale = 0.25
+        self.old_combat_reward_scale = 0.25
         
         # -----------------------------------------------------
         # Helper control switches
         # -----------------------------------------------------
         # Keep these False while PPO is learning.
         # These systems should guide with reward/logging, not hijack actions.
-        self.enable_sensory_action_override = True
+        self.enable_sensory_action_override =False
         self.enable_goal_assist_action_override = False
 
         # Keep wall safety on, but only for true front-wall emergencies.
-        self.enable_vision_blocker_override = True
+        self.enable_vision_blocker_override = False
+        self.collect_world_images = True
 
         # -----------------------------------------------------
         # Death review buffer
@@ -187,6 +254,8 @@ class DoomEnv(gym.Env):
 
         self.current_level_name = "freedoom1_e1m1"
         self.level_guide = get_level_guide(self.current_level_name)
+        self.mission_tracker = MissionTracker(get_freedoom1_e1m1_mission())
+        self.enable_doom_brain_reward = True
 
         self.checkpoint_tracker.set_level_guide(
             checkpoints=self.level_guide.get("checkpoints", []),
@@ -202,6 +271,14 @@ class DoomEnv(gym.Env):
         self.corridor_reach_count = 0
         self.corridor_reached_this_episode = False
         self.corridor_reach_target = 3
+
+        self.world_image_dir = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "vision_dataset",
+            "world_debug",
+        )
+        os.makedirs(self.world_image_dir, exist_ok=True)
 
         # -----------------------------------------------------
         # Penalty tuning
@@ -254,8 +331,43 @@ class DoomEnv(gym.Env):
         # -----------------------------------------------------
         # RL spaces
         # -----------------------------------------------------
+        if self.training_mode:
+            self.collect_vision_frames = False
+            self.enable_smart_clips = False
+            self.enable_death_review_capture = False
+        else:
+            self.enable_smart_clips = True
+            self.enable_death_review_capture = True
 
         self.action_space = spaces.Discrete(len(self.actions))
+        self.use_action_prior_advice = True
+        self.action_prior_reward_scale = 0.005
+        self.action_prior_min_confidence = 0.70
+
+        action_prior_path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "checkpoints",
+            "action_prior_from_teacher_balanced.pt",
+        )
+
+        try:
+            self.action_prior_advisor = ActionPriorAdvisor(
+                checkpoint_path=action_prior_path,
+                action_names=[
+                    "move_forward",
+                    "turn_left",
+                    "turn_right",
+                    "strafe_left",
+                    "strafe_right",
+                    "move_backward",
+                    "shoot",
+                    "use",
+                ],
+            )
+        except Exception as e:
+            print(f"[action_prior] disabled: {e}")
+            self.action_prior_advisor = None
         self.observation_space = spaces.Box(
             low=0,
             high=255,
@@ -267,8 +379,8 @@ class DoomEnv(gym.Env):
         # Curriculum
         # -----------------------------------------------------
 
-        self.curriculum_stage = 1
-        self.max_stage = 3
+        self.curriculum_stage = 0
+        self.max_stage = 7
         self.curriculum_rewards = []
         self.curriculum_log_interval = 50
 
@@ -296,6 +408,8 @@ class DoomEnv(gym.Env):
         self.wall_contact_steps = 0
         self.last_wall_escape_step = -100
         self.route_progress_level = 0
+        if hasattr(self, 'mission_tracker'):
+            self.mission_tracker.reset()
 
         # -----------------------------------------------------
         # First-level route progress tracking
@@ -330,6 +444,12 @@ class DoomEnv(gym.Env):
         self.dead_target_ignore_steps = 0
         self.last_aim_assist_step = -100
         self.last_shot_step = -100
+        self.current_weapon_name = "pistol"
+        self.has_berserk = False
+        self.berserk_steps_remaining = 0
+        self.last_weapon_swap_step = -100
+        self.last_forced_weapon_reason = None
+        self.weapon_swap_cooldown = 25
 
         self.consecutive_melee_steps = 0
         self.last_melee_step = -100
@@ -438,24 +558,24 @@ class DoomEnv(gym.Env):
             },
             1: {
                 "name": "movement_escape",
-                "allow_shoot": False,
+                "allow_shoot": True,
                 "allow_melee": False,
-                "require_enemy_visible_to_shoot": False,
-                "track_enemy": False,
-                "dodge_enemies": False,
+                "require_enemy_visible_to_shoot": True,
+                "track_enemy": True,
+                "dodge_enemies": True,
                 "allow_use": False,
             },
             2: {
-                "name": "doors_and_use",
-                "allow_shoot": False,
+                "name": "doors_use_and_survival",
+                "allow_shoot": True,
                 "allow_melee": False,
-                "require_enemy_visible_to_shoot": False,
-                "track_enemy": False,
-                "dodge_enemies": False,
+                "require_enemy_visible_to_shoot": True,
+                "track_enemy": True,
+                "dodge_enemies": True,
                 "allow_use": True,
             },
             3: {
-                "name": "shoot_visible_enemies",
+                "name": "complete_level_basic",
                 "allow_shoot": True,
                 "allow_melee": False,
                 "require_enemy_visible_to_shoot": True,
@@ -504,63 +624,12 @@ class DoomEnv(gym.Env):
         return configs.get(self.curriculum_stage, configs[7])
 
     def get_allowed_actions(self):
-        stage = self.curriculum_stage
+        """
+        Full-plan action set.
 
-        if stage == 0:
-            return [
-                "move_forward",
-                "turn_left",
-                "turn_right",
-            ]
-
-        if stage == 1:
-            return [
-                "move_forward",
-                "move_backward",
-                "turn_left",
-                "turn_right",
-                "strafe_left",
-                "strafe_right",
-            ]
-
-        if stage == 2:
-            return [
-                "move_forward",
-                "move_backward",
-                "turn_left",
-                "turn_right",
-                "strafe_left",
-                "strafe_right",
-                "use",
-            ]
-
-        if stage == 3:
-            return [
-                "move_forward",
-                "move_backward",
-                "turn_left",
-                "turn_right",
-                "strafe_left",
-                "strafe_right",
-                "use",
-                "shoot",
-                "swap_weapon",
-            ]
-
-        if stage == 4:
-            return [
-                "move_forward",
-                "move_backward",
-                "turn_left",
-                "turn_right",
-                "strafe_left",
-                "strafe_right",
-                "shoot",
-                "use",
-                "melee_attack",
-                "swap_weapon",
-            ]
-
+        We do not hide shooting/use/strafe for too long because Doom requires
+        navigation, fighting, resource use, doors, and survival together.
+        """
         return [
             "move_forward",
             "move_backward",
@@ -569,8 +638,8 @@ class DoomEnv(gym.Env):
             "strafe_left",
             "strafe_right",
             "shoot",
-            "melee_attack",
             "use",
+            "melee_attack",
             "swap_weapon",
         ]
 
@@ -607,7 +676,6 @@ class DoomEnv(gym.Env):
         if damage_flash:
             reward += self.add_penalty("hud_damage_flash", -0.03)
 
-        reward += self.hud_status_reward(hud_result, action)
 
         return reward
 
@@ -639,8 +707,8 @@ class DoomEnv(gym.Env):
             self.door_interaction_count += 1
 
             if door_like:
-                reward += 0.30
-                self.reward_manager.add("use_near_door_like_scene", 0.30)
+                reward += self.add_positive("direct_positive_reward", 0.10)
+                self.reward_manager.add("use_near_door_like_scene", 0.10)
             else:
                 reward += self.add_penalty("use_not_near_door", -0.05)
 
@@ -667,28 +735,36 @@ class DoomEnv(gym.Env):
                 )
 
                 if moved >= 32.0 or route_improved:
-                    reward += 0.80
-                    self.reward_manager.add("use_created_progress", 0.80)
-                    print(
-                        f"[door_use] useful_use moved={moved:.1f} "
-                        f"route_improved={route_improved}"
+                    door_or_route_context = (
+                        route_improved
+                        or scene_label in ["door_or_button", "door", "switch", "elevator", "lift"]
+                        or game_state.get("sensory_situation") in ["door_possible", "right_route_area"]
                     )
-                    self.pending_use_check = None
 
-            elif age > 20:
-                self.pending_use_check = None
+                    if door_or_route_context and (moved >= 32.0 or route_improved):
+                        reward += self.add_positive("direct_positive_reward", 0.40)
+                        self.reward_manager.add("use_created_progress", 0.40)
+                        print(
+                            f"[door_use] useful_use moved={moved:.1f} "
+                            f"route_improved={route_improved}"
+                        )
+                        self.pending_use_check = None
 
         return reward
     
-    def route_progress_reward(self, game_state):
-        """
-        First-level route progress reward.
 
-        This gives the agent small, clear milestones for Freedoom E1M1.
-        It is better than only using distance-to-exit because Doom maps are not straight lines.
+    def real_map_navigation_reward(self, game_state):
         """
+        Real-coordinate navigation shaping.
 
-        reward = 0.0
+        This rewards:
+        - getting closer to the actual exit
+        - staying near the real exit lane
+        - reaching real WAD-based waypoint bubbles
+
+        It penalizes:
+        - drifting far east/right into the old fake route area
+        """
 
         x = game_state.get("x")
         y = game_state.get("y")
@@ -699,39 +775,118 @@ class DoomEnv(gym.Env):
         x = float(x)
         y = float(y)
 
-        # These are starting placeholders based on the coordinates your logs show.
-        # Tune them as you collect better route logs.
+        guide = getattr(self, "level_guide", {}) or {}
+        goal = guide.get("main_goal") or {}
+
+        gx = goal.get("x")
+        gy = goal.get("y")
+
+        if gx is None or gy is None:
+            return 0.0
+
+        gx = float(gx)
+        gy = float(gy)
+
+        dx = x - gx
+        dy = y - gy
+        dist = (dx * dx + dy * dy) ** 0.5
+
+        reward = 0.0
+
+        # Main progress reward.
+        previous = getattr(self, "best_main_goal_distance", None)
+
+        if previous is None:
+            self.best_main_goal_distance = dist
+        else:
+            improvement = previous - dist
+
+            if improvement > 0:
+                reward += min(0.35, improvement * 0.010)
+                self.best_main_goal_distance = min(previous, dist)
+            elif improvement < -24:
+                reward -= 0.015
+
+        # Soft lane shaping: exit is around x=-400.
+        lateral_error = abs(x - gx)
+
+        if lateral_error <= 192:
+            reward += self.add_positive("direct_positive_reward", 0.01)
+        elif lateral_error > 600:
+            reward -= 0.01
+        elif lateral_error > 384:
+            reward -= 0.01
+
+        # Penalize extreme east drift, which the old route caused.
+        bounds = guide.get("safe_bounds") or {}
+        max_x = float(bounds.get("max_x", 200.0))
+        min_x = float(bounds.get("min_x", -900.0))
+
+        if x > max_x:
+            reward += float(bounds.get("soft_penalty", -0.02))
+            if x > max_x + 500:
+                reward += float(bounds.get("hard_penalty", -0.08))
+
+        if x < min_x:
+            reward += float(bounds.get("soft_penalty", -0.02))
+
+        return float(reward)
+
+
+    def route_progress_reward(self, game_state):
+        """
+        Sequential real-map route progress.
+
+        Only the next expected route zone can trigger. This prevents broad
+        overlapping bubbles from awarding later milestones too early.
+        """
+
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        if x is None or y is None:
+            return 0.0
+
+        x = float(x)
+        y = float(y)
+
         route_zones = self.level_guide.get("route_zones", [])
 
-        position = (x, y)
+        if not route_zones:
+            return 0.0
 
-        zone_reward, reached_name, self.route_zones_reached = (
-            self.checkpoint_tracker.update_route_zones(
-                position=position,
-                route_zones=route_zones,
-                reached_zones=self.route_zones_reached,
-            )
-        )
+        next_idx = int(getattr(self, "route_progress_level", 0))
 
-        if reached_name is not None:
-            self.route_progress_level += 1
-            self.best_route_progress_level = max(
-                self.best_route_progress_level,
-                self.route_progress_level,
-            )
+        if next_idx >= len(route_zones):
+            return 0.0
 
-            reward += zone_reward
-            self.reward_manager.add(f"route_progress_{reached_name}", zone_reward)
+        zone = route_zones[next_idx]
+
+        name = zone.get("name", f"route_zone_{next_idx}")
+        zx = float(zone.get("x", 0.0))
+        zy = float(zone.get("y", 0.0))
+        radius = float(zone.get("radius", 128.0))
+        zone_reward = float(zone.get("reward", 0.05))
+
+        dx = x - zx
+        dy = y - zy
+        dist = (dx * dx + dy * dy) ** 0.5
+
+        if dist <= radius:
+            self.route_zones_reached.add(name)
+            self.route_progress_level = next_idx + 1
 
             print(
-                f"[route_progress] reached={reached_name} "
+                f"[route_progress] reached={name} "
                 f"level={self.route_progress_level} "
-                f"x={x:.1f} y={y:.1f} "
-                f"reward={zone_reward:.2f}"
+                f"x={x:.1f} y={y:.1f} reward={zone_reward:.2f}"
             )
 
-        return reward
-    
+            return zone_reward
+
+        return 0.0
+
+
     def tile_exploration_reward(self, game_state):
         """
         Simple exploration reward using player position tiles.
@@ -758,6 +913,698 @@ class DoomEnv(gym.Env):
             return self.add_penalty("same_tile_loop_penalty", -0.03)
 
         return 0.0
+    
+    def update_powerup_state(self, game_state, object_result=None):
+        """
+        Track powerups using object labels and game-state hints.
+
+        Berserk in Doom/Freedoom may appear as a black/dark medkit-like pickup.
+        We intentionally use aliases because Freedoom sprite/model labels may differ.
+        """
+
+        berserk_aliases = {
+            "berserk",
+            "berserk_pack",
+            "berserker",
+            "black_medkit",
+            "dark_medkit",
+            "powerup_berserk",
+            "strength_powerup",
+        }
+
+        labels = set()
+
+        if object_result:
+            labels.update(object_result.get("present", []))
+
+            scores = object_result.get("scores", {})
+            for label, score in scores.items():
+                try:
+                    if float(score) >= 0.50:
+                        labels.add(label)
+                except Exception:
+                    pass
+
+        if labels.intersection(berserk_aliases):
+            self.has_berserk = True
+            # Treat as level-long for training, but keep a debug counter.
+            self.berserk_steps_remaining = max(self.berserk_steps_remaining, 5000)
+            self.last_forced_weapon_reason = "berserk_pickup"
+
+        if self.berserk_steps_remaining > 0:
+            self.berserk_steps_remaining -= 1
+
+        game_state["has_berserk"] = self.has_berserk
+        game_state["berserk_steps_remaining"] = self.berserk_steps_remaining
+
+        return game_state
+
+
+    def infer_enemy_distance_tiles(self, game_state, object_result=None):
+        """
+        Estimate enemy distance in tiles.
+
+        This is intentionally conservative. If no distance source exists,
+        return None instead of guessing.
+        """
+
+        if game_state.get("enemy_distance_tiles") is not None:
+            return game_state.get("enemy_distance_tiles")
+
+        if game_state.get("enemy_distance") is not None:
+            try:
+                return float(game_state["enemy_distance"]) / 64.0
+            except Exception:
+                return None
+
+        if object_result:
+            if object_result.get("enemy_distance_tiles") is not None:
+                return object_result.get("enemy_distance_tiles")
+
+            if object_result.get("enemy_distance") is not None:
+                try:
+                    return float(object_result["enemy_distance"]) / 64.0
+                except Exception:
+                    return None
+
+        return None
+
+
+    def infer_enemy_count(self, game_state, object_result=None):
+        """
+        Estimate visible enemy count.
+
+        If the object model cannot count enemies yet, fall back to 1 when enemy_visible is true.
+        """
+
+        if game_state.get("enemy_count") is not None:
+            try:
+                return int(game_state["enemy_count"])
+            except Exception:
+                pass
+
+        if object_result:
+            if object_result.get("enemy_count") is not None:
+                try:
+                    return int(object_result["enemy_count"])
+                except Exception:
+                    pass
+
+            present = object_result.get("present", [])
+            if "enemy_visible" in present:
+                return 1
+
+        if game_state.get("enemy_visible", False):
+            return 1
+
+        return 0
+
+
+    def tactical_weapon_action(
+        self,
+        action,
+        game_state,
+        object_result=None,
+        wall_info=None,
+    ):
+        """
+        Situational weapon swapping.
+
+        This prevents blind swap_weapon spam while still allowing:
+        - berserk/fist for very close enemies
+        - guns for medium/far enemies
+        - rockets only for groups at safe distance
+        """
+
+        if self.curriculum_stage < 3:
+            if action == "swap_weapon":
+                self.last_forced_weapon_reason = "swap_blocked_before_combat_stage"
+                return "move_forward"
+            return action
+
+        if action != "swap_weapon":
+            return action
+
+        if self._step_count - self.last_weapon_swap_step < self.weapon_swap_cooldown:
+            self.last_forced_weapon_reason = "swap_cooldown"
+            return "move_backward"
+
+        enemy_visible = bool(game_state.get("enemy_visible", False))
+        enemy_centered = bool(game_state.get("enemy_centered", False))
+        enemy_distance_tiles = self.infer_enemy_distance_tiles(game_state, object_result)
+        enemy_count = self.infer_enemy_count(game_state, object_result)
+
+        current_weapon = str(
+            game_state.get("weapon", self.current_weapon_name)
+        ).lower()
+
+        front_ratio = 0.0
+        if wall_info:
+            front_ratio = float(wall_info.get("front_ratio", 0.0))
+
+        rocket_unsafe = (
+            front_ratio >= 0.45
+            or (
+                enemy_distance_tiles is not None
+                and enemy_distance_tiles < 4.0
+            )
+        )
+
+        if not enemy_visible:
+            self.last_forced_weapon_reason = "swap_blocked_no_enemy"
+            return "move_forward"
+
+        if self.has_berserk and enemy_distance_tiles is not None:
+            if enemy_distance_tiles <= 1.5 and enemy_centered:
+                self.last_weapon_swap_step = self._step_count
+                self.last_forced_weapon_reason = "berserk_close_enemy"
+                return "swap_weapon"
+
+            if current_weapon in ["fist", "chainsaw", "riptor"] and enemy_distance_tiles > 2.0:
+                self.last_weapon_swap_step = self._step_count
+                self.last_forced_weapon_reason = "leave_melee_range"
+                return "swap_weapon"
+
+        if enemy_count >= 2 and not rocket_unsafe:
+            self.last_weapon_swap_step = self._step_count
+            self.last_forced_weapon_reason = "group_enemy_safe_rocket"
+            return "swap_weapon"
+
+        ammo = int(game_state.get("ammo", 0) or 0)
+
+        self.last_forced_weapon_reason = "swap_not_contextual"
+
+        if ammo <= 0:
+            return "move_backward"
+
+        return "shoot" if enemy_centered else "move_backward"
+
+
+    def apply_doom_brain(self, game_state, action_name, sensory_state=None):
+        """
+        Shared full-plan brain:
+        - navigation survival
+        - fighting
+        - items/resources
+        - doors/use
+        - secrets
+        - final exit
+        """
+
+        if not getattr(self, "enable_doom_brain_reward", True):
+            return 0.0, {}
+
+        if sensory_state is None:
+            sensory_state = {
+                "situation": game_state.get("sensory_situation", "normal_navigation")
+            }
+
+        # Add movement/stuck counters so world_state can reason correctly.
+        game_state["repeated_position_steps"] = getattr(self, "repeated_position_steps", 0)
+        game_state["no_position_change_steps"] = getattr(self, "no_position_change_steps", 0)
+
+        world_state = build_world_state(game_state, sensory_state)
+        game_state["world_mode"] = world_state.get("mode", "navigate")
+
+        mission_update = self.mission_tracker.update(game_state, world_state)
+
+        # Set current director target for other reward/director code.
+        game_state["director_target"] = mission_update.get("target")
+
+        brain_reward, brain_events = compute_doom_brain_reward(
+            game_state=game_state,
+            action_name=action_name,
+            world_state=world_state,
+            mission_update=mission_update,
+        )
+
+        if self._step_count % 25 == 0:
+            target = mission_update.get("target", {})
+            print(
+                f"[doom_brain] mode={world_state.get('mode')} "
+                f"target={target.get('name')} "
+                f"hint={target.get('hint')} "
+                f"reward={brain_reward:.3f} "
+                f"events={brain_events[:3]}"
+            )
+
+        return brain_reward, {
+            "world_state": world_state,
+            "mission_update": mission_update,
+            "brain_events": brain_events,
+        }
+
+
+    def infer_half_wall_rail_state(
+        self,
+        scene_label,
+        scene_confidence,
+        wall_info=None,
+        distance_moved=None,
+        motion=None,
+        action=None,
+    ):
+        """
+        Detect corridor rails / half-walls.
+
+        A half-wall/rail is not a normal full wall:
+        - the screen may look partly open above it
+        - but movement is blocked or heavily slowed
+        - front wall ratio is often orange/red
+        """
+
+        wall_info = wall_info or {}
+
+        front_ratio = float(wall_info.get("front_ratio", 0.0) or 0.0)
+        left_ratio = float(wall_info.get("left_ratio", 0.0) or 0.0)
+        right_ratio = float(wall_info.get("right_ratio", 0.0) or 0.0)
+
+        side_ratio = max(left_ratio, right_ratio)
+
+        has_motion_data = distance_moved is not None and motion is not None
+
+        movement_action = action in [
+            "move_forward",
+            "move_backward",
+            "strafe_left",
+            "strafe_right",
+        ]
+
+        low_translation = (
+            has_motion_data
+            and movement_action
+            and float(distance_moved or 0.0) <= 1.0
+            and float(motion or 0.0) < 2.0
+        )
+
+        # Rail/half-wall signature:
+        # front pressure is high enough to block movement, but not necessarily
+        # a full-screen wall. This often happens on Doom corridor rails.
+        front_rail_pressure = 0.52 <= front_ratio <= 0.78
+
+        side_rail_pressure = 0.45 <= side_ratio <= 0.75
+
+        fake_open = scene_label in [
+            "open_path",
+            "unclear",
+            "normal_navigation",
+        ]
+
+        likely_front_half_wall = (
+            fake_open
+            and front_rail_pressure
+            and (
+                low_translation
+                or self.stuck_counter >= 2
+                or self.wall_contact_steps >= 1
+                or getattr(self, "repeated_position_steps", 0) >= 2
+            )
+        )
+
+        likely_side_rail = (
+            fake_open
+            and side_rail_pressure
+            and not likely_front_half_wall
+        )
+
+        if likely_front_half_wall:
+            return {
+                "label": "half_wall_rail",
+                "confidence": max(float(scene_confidence or 0.0), 0.88),
+                "position": "front",
+                "front_ratio": front_ratio,
+                "side_ratio": side_ratio,
+            }
+
+        if likely_side_rail:
+            return {
+                "label": "side_rail",
+                "confidence": max(float(scene_confidence or 0.0), 0.72),
+                "position": "side",
+                "front_ratio": front_ratio,
+                "side_ratio": side_ratio,
+            }
+
+        return {
+            "label": scene_label,
+            "confidence": float(scene_confidence or 0.0),
+            "position": None,
+            "front_ratio": front_ratio,
+            "side_ratio": side_ratio,
+        }
+
+
+    def half_wall_rail_reward(self, game_state, action):
+        """
+        Reward shaping for rails / half-walls.
+
+        Front rail:
+        - moving forward into it is very bad
+        - backing up / turning / strafing away is good
+
+        Side rail:
+        - normal movement beside it is okay
+        - scraping into it is bad
+        """
+
+        label = game_state.get("scene_label")
+        rail_position = game_state.get("rail_position")
+
+        if label not in ["half_wall_rail", "side_rail"]:
+            return 0.0
+
+        reward = 0.0
+
+        if label == "half_wall_rail" or rail_position == "front":
+            if action == "move_forward":
+                reward += self.add_penalty("push_into_half_wall_rail", -15.0)
+            elif action in ["move_backward", "turn_left", "turn_right", "strafe_left", "strafe_right"]:
+                reward += self.add_positive("half_wall_rail_escape_action", 15.0)
+                self.reward_manager.add("half_wall_rail_escape_action", 45.0)
+
+        elif label == "side_rail" or rail_position == "side":
+            if action in ["strafe_left", "strafe_right"] and game_state.get("distance_moved", 0.0) <= 1.0:
+                reward += self.add_penalty("scrape_side_rail", -8.0)
+            elif action in ["move_forward", "turn_left", "turn_right"]:
+                reward += self.add_positive("direct_positive_reward", 0.05)
+                self.reward_manager.add("side_rail_safe_action", 0.05)
+
+        return reward
+
+
+
+    def get_current_route_target(self, game_state=None):
+        """
+        Pick the current route target.
+
+        Prefer the new mission tracker target if it exists.
+        Otherwise fall back to the active route bubble or main goal.
+        """
+
+        game_state = game_state or {}
+
+        target = game_state.get("director_target")
+        if isinstance(target, dict) and target.get("x") is not None and target.get("y") is not None:
+            return target
+
+        try:
+            if hasattr(self, "mission_tracker"):
+                world_state = {"mode": game_state.get("world_mode", "navigate")}
+                mission_update = self.mission_tracker.update(game_state, world_state)
+                target = mission_update.get("target")
+                if isinstance(target, dict) and target.get("x") is not None and target.get("y") is not None:
+                    return target
+        except Exception:
+            pass
+
+        try:
+            target = self.get_active_goal_bubble_target(game_state)
+            if isinstance(target, dict) and target.get("x") is not None and target.get("y") is not None:
+                return target
+        except Exception:
+            pass
+
+        guide = getattr(self, "level_guide", {}) or {}
+        return guide.get("main_goal")
+
+
+    def route_gravity_action(self, action, game_state, wall_info=None):
+        """
+        Convert current position + target position into a simple steering action.
+
+        This is not a full pathfinder. It gives the recovery system a bias:
+        if the agent is far east/right of the path, rotate/strafe west/left.
+        """
+
+        wall_info = wall_info or {}
+
+        x = game_state.get("x")
+        y = game_state.get("y")
+        angle = game_state.get("angle")
+
+        target = self.get_current_route_target(game_state)
+
+        if x is None or y is None or not target:
+            return action
+
+        tx = target.get("x")
+        ty = target.get("y")
+
+        if tx is None or ty is None:
+            return action
+
+        x = float(x)
+        y = float(y)
+        tx = float(tx)
+        ty = float(ty)
+
+        dx = tx - x
+        dy = ty - y
+
+        # Strong map-specific correction:
+        # Freedoom E1M1 useful route/exit lane is much farther west than x=700+.
+        # If the agent is far right/east, force west/left correction.
+        if x > 700:
+            front = float(wall_info.get("front_ratio", 0.0) or 0.0)
+
+            if front >= 0.55:
+                return "turn_left"
+
+            # Mix turn-left and strafe-left so it actually translates.
+            phase = self._step_count % 6
+            if phase in [0, 1, 2]:
+                return "turn_left"
+            if phase in [3, 4]:
+                return "strafe_left"
+            return "move_forward"
+
+        # If it is moderately off to the right, bias left but less aggressively.
+        if x > 250:
+            phase = self._step_count % 5
+            if phase in [0, 1]:
+                return "turn_left"
+            if phase == 2:
+                return "strafe_left"
+            return action
+
+        # General target steering using dx only when angle is unreliable.
+        if dx < -128:
+            return "turn_left"
+
+        if dx > 128:
+            return "turn_right"
+
+        return action
+
+
+    def should_start_hard_180_recovery(self, game_state, wall_info=None, sensory_state=None):
+        """
+        Decide when normal recovery is not enough.
+
+        New rule:
+        - not just wall
+        - ANY obstacle/rail/boundary/front blocker can trigger recovery
+        - no useful translation for about 2 seconds can trigger recovery
+        """
+
+        wall_info = wall_info or {}
+        sensory_state = sensory_state or {}
+
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        situation = (
+            sensory_state.get("situation")
+            or game_state.get("sensory_situation")
+            or "normal_navigation"
+        )
+
+        scene_label = (
+            game_state.get("scene_label")
+            or game_state.get("pre_scene_label")
+            or ""
+        )
+
+        front = float(wall_info.get("front_ratio", 0.0) or 0.0)
+        left = float(wall_info.get("left_ratio", 0.0) or 0.0)
+        right = float(wall_info.get("right_ratio", 0.0) or 0.0)
+
+        no_move_steps = int(getattr(self, "no_position_change_steps", 0) or 0)
+        no_goal_steps = int(getattr(self, "no_distance_progress_steps", 0) or 0)
+
+        threshold = int(
+            getattr(self, "no_movement_recovery_threshold_steps", 18)
+        )
+
+        obstacle_labels = {
+            "front_wall",
+            "obstacle",
+            "boundary_or_stuck_wall",
+            "half_wall_rail",
+            "side_rail",
+            "door_or_button",
+        }
+
+        obstacle_situations = {
+            "stuck_or_looping",
+            "front_blocked",
+            "spawn_wall_zone",
+            "secret_side_area",
+            "right_route_area",
+            "half_wall_rail",
+            "side_rail",
+        }
+
+        any_obstacle_label = scene_label in obstacle_labels
+        any_obstacle_situation = situation in obstacle_situations
+
+        # Visual/body obstacle pressure. This catches rails, half-walls,
+        # corners, monster-blocking-looking barriers, and invisible boundaries.
+        obstacle_pressure = (
+            front >= 0.45
+            or left >= 0.55
+            or right >= 0.55
+            or any_obstacle_label
+            or any_obstacle_situation
+        )
+
+        front_or_rail_blocked = (
+            front >= 0.60
+            or scene_label in {"half_wall_rail", "front_wall", "obstacle", "boundary_or_stuck_wall"}
+            or situation == "front_blocked"
+        )
+
+        no_movement_for_2sec = no_move_steps >= threshold
+
+        no_goal_progress_for_2sec = no_goal_steps >= threshold
+
+        far_wrong_side = False
+        if x is not None:
+            try:
+                far_wrong_side = float(x) > 700.0
+            except Exception:
+                far_wrong_side = False
+
+        # Main new rule:
+        # Any obstacle + no movement for about 2 seconds = hard recovery.
+        if obstacle_pressure and no_movement_for_2sec:
+            return True, "any_obstacle_no_movement_2sec"
+
+        # If the agent is not making route progress for about 2 seconds
+        # while obstacle pressure exists, recover.
+        if obstacle_pressure and no_goal_progress_for_2sec:
+            return True, "any_obstacle_no_goal_progress_2sec"
+
+        # Front/rail block should trigger faster because move_forward will
+        # usually keep colliding.
+        if front_or_rail_blocked and no_move_steps >= 6:
+            return True, "front_or_rail_blocked"
+
+        # Far east/right side is still bad on this map.
+        if far_wrong_side and (obstacle_pressure or no_goal_steps >= 10):
+            return True, "far_wrong_side"
+
+        # Classic stuck fallback.
+        if situation == "stuck_or_looping" and no_move_steps >= 8:
+            return True, "stuck_loop_no_movement"
+
+        return False, None
+
+
+    def hard_180_route_recovery_action(self, action, game_state, wall_info=None, sensory_state=None):
+        """
+        Hard 180 + route gravity recovery.
+
+        This prevents the classic RL Doom problem:
+        rotating forever against walls.
+
+        Recovery sequence:
+        - commit to turning around for several frames
+        - move/strafe away
+        - bias back toward the route target
+        """
+
+        wall_info = wall_info or {}
+        sensory_state = sensory_state or {}
+
+        should_start, reason = self.should_start_hard_180_recovery(
+            game_state=game_state,
+            wall_info=wall_info,
+            sensory_state=sensory_state,
+        )
+
+        if should_start and self.hard_180_recovery_steps <= 0:
+            self.hard_180_recovery_steps = 24
+            self.hard_180_reason = reason
+
+            left = float(wall_info.get("left_ratio", 0.0) or 0.0)
+            right = float(wall_info.get("right_ratio", 0.0) or 0.0)
+
+            # If one side is more blocked, turn away from it.
+            # If far east/right of route, prefer left turn to rejoin the path.
+            x = game_state.get("x")
+            try:
+                far_east = x is not None and float(x) > 700.0
+            except Exception:
+                far_east = False
+
+            if far_east:
+                self.hard_180_turn_direction = "left"
+            elif left > right:
+                self.hard_180_turn_direction = "right"
+            else:
+                self.hard_180_turn_direction = "left"
+
+            print(
+                f"[hard_180_start] reason={reason} "
+                f"turn={self.hard_180_turn_direction} "
+                f"x={game_state.get('x')} y={game_state.get('y')}"
+            )
+
+        if self.hard_180_recovery_steps <= 0:
+            return action
+
+        # During committed hard recovery, do not let PPO/sanitize force
+        # move_forward back into an obstacle.
+        obstacle_pressure_now = (
+            float(wall_info.get("front_ratio", 0.0) or 0.0) >= 0.45
+            or sensory_state.get("situation") in {
+                "stuck_or_looping",
+                "front_blocked",
+                "half_wall_rail",
+                "side_rail",
+            }
+            or game_state.get("scene_label") in {
+                "front_wall",
+                "obstacle",
+                "boundary_or_stuck_wall",
+                "half_wall_rail",
+                "side_rail",
+            }
+        )
+
+        step = self.hard_180_recovery_steps
+        self.hard_180_recovery_steps -= 1
+
+        turn_action = "turn_left" if self.hard_180_turn_direction == "left" else "turn_right"
+        strafe_action = "strafe_left" if self.hard_180_turn_direction == "left" else "strafe_right"
+
+        # Phase 1: hard turn / 180 attempt.
+        # Do not alternate directions during this phase.
+        if step > 16:
+            return turn_action
+
+        # Phase 2: create separation behind the agent.
+        if step > 11:
+            return "move_backward"
+
+        # Phase 3: translate sideways away from obstacle pressure.
+        if step > 6:
+            return strafe_action
+
+        # Phase 4: gravitate toward the route target.
+        return self.route_gravity_action(action, game_state, wall_info)
+
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -773,6 +1620,9 @@ class DoomEnv(gym.Env):
         self.route_progress_level = 0
         self.route_zones_reached = set()
         self.best_route_progress_level = 0
+        self.goal_bubble_best_dist = {}
+        self.goal_bubble_last_dist = {}
+        self.goal_bubble_stall_steps = {}
         self.goal_turn_steps = 0
         self.recent_position_tiles = []
         self.repeated_position_steps = 0
@@ -785,6 +1635,17 @@ class DoomEnv(gym.Env):
         self.sensory_model.reset()
         self.route_director.reset()
         self.retrace_navigator.reset()
+        self.retrace_lock_steps = 0
+        self.pending_retrace_action = None
+        self.recent_loop_tile = None
+        self.recent_loop_steps = 0
+        self.last_progress_position = None
+        self.no_position_change_steps = 0
+        self.last_distance_to_goal = None
+        self.no_distance_progress_steps = 0
+        self.last_exit_distance = None
+        self.best_exit_distance = None
+        self.best_main_goal_distance = None
 
         self.wall_escape_mode = False
         self.wall_escape_step = 0
@@ -814,6 +1675,11 @@ class DoomEnv(gym.Env):
         self.last_melee_step = -100
         self.consecutive_swap_steps = 0
         self.last_swap_step = -100
+        self.current_weapon_name = "pistol"
+        self.has_berserk = False
+        self.berserk_steps_remaining = 0
+        self.last_weapon_swap_step = -100
+        self.last_forced_weapon_reason = None
 
         self.movement_count = 0
         self.exploration_count = 0
@@ -839,6 +1705,9 @@ class DoomEnv(gym.Env):
         self.combat_survival_steps = 0
         self.dodge_when_damaged_count = 0
         self.retreat_from_close_enemy_count = 0
+        self.shared_logic.reset_episode()
+        self.previous_shared_game_state = None
+        self.last_shared_debug = {}
 
         self.reward_manager.reset()
         self.checkpoint_tracker.reset()
@@ -849,7 +1718,7 @@ class DoomEnv(gym.Env):
 
         # Do not clear self.secret_use_locations every episode.
         # This memory should persist across episodes.
-        pass
+    
 
         if hasattr(self.observer, "reset_tracking"):
             self.observer.reset_tracking()
@@ -881,6 +1750,20 @@ class DoomEnv(gym.Env):
             time.sleep(1.0)
 
         player_pos = self.observer.get_player_position()
+        expected_start = self.level_guide.get("player_start", {})
+        sx = expected_start.get("x")
+        sy = expected_start.get("y")
+
+        if player_pos is not None and sx is not None and sy is not None:
+            px, py = float(player_pos[0]), float(player_pos[1])
+            start_dist = ((px - float(sx)) ** 2 + (py - float(sy)) ** 2) ** 0.5
+
+            if start_dist > 256:
+                print(
+                    f"[reset_warning] player did not reset near start. "
+                    f"pos=({px:.1f},{py:.1f}) expected=({float(sx):.1f},{float(sy):.1f}) "
+                    f"dist={start_dist:.1f}"
+                )
         goal_pos = self.observer.get_goal_position()
         self.last_player_position = player_pos
 
@@ -900,6 +1783,20 @@ class DoomEnv(gym.Env):
         frame = self.observer.build()
         observation = self.frame_stack.reset(frame)
 
+        # Try to restart the level/game cleanly.
+        for key in ["Escape", "n"]:
+            subprocess.call(["xdotool", "key", key], stderr=subprocess.DEVNULL)
+            time.sleep(0.2)
+
+        # Press Enter a few times to confirm new game/menu state.
+        for _ in range(4):
+            subprocess.call(["xdotool", "key", "Return"], stderr=subprocess.DEVNULL)
+            time.sleep(0.25)
+
+        self.controller.release_all()
+        time.sleep(1.0)
+        frame_cache.invalidate()
+
         return observation, {}
 
     def step(self, action_index):
@@ -909,7 +1806,18 @@ class DoomEnv(gym.Env):
         reward = 0.0
         terminated = False
         truncated = False
-        info = {}
+
+        scene_label = "unclear"
+        scene_confidence = 0.0
+        scene_probs = {}
+
+        object_result = None
+        hud_result = None
+        pre_hud_result = None
+        info = {
+            "shared_logic_debug": self.last_shared_debug,
+            "use_shared_logic_reward": self.use_shared_logic_reward,
+            }
 
         safe_frame = self.observer.build()
         safe_observation = self.frame_stack.add_frame(safe_frame)
@@ -920,6 +1828,21 @@ class DoomEnv(gym.Env):
             return safe_observation, float(reward), terminated, truncated, info
 
         action = self.actions[action_index]
+
+        if self.retrace_lock_steps > 0:
+            self.retrace_lock_steps -= 1
+
+        can_use_exploration_override = (
+            self.retrace_lock_steps <= 0
+            and self.stuck_counter < 4
+            and self.wall_contact_steps < 2
+            and not getattr(self.retrace_navigator, "active", False)
+            and not self.sensory_emergency_active
+        )
+
+        object_result = None
+        hud_result = None
+
         decision_trace = {
             "ppo_action": action,
             "final_action": None,
@@ -962,6 +1885,25 @@ class DoomEnv(gym.Env):
 
         wall_sensor_state = self.wall_sensor.analyze(pre_frame)
 
+        pre_wall_info = self._wall_direction_info(pre_frame)
+
+        pre_wall_info["left_ratio"] = max(
+            pre_wall_info.get("left_ratio", 0.0),
+            wall_sensor_state["left_ratio"],
+        )
+        pre_wall_info["front_ratio"] = max(
+            pre_wall_info.get("front_ratio", 0.0),
+            wall_sensor_state["front_ratio"],
+        )
+        pre_wall_info["right_ratio"] = max(
+            pre_wall_info.get("right_ratio", 0.0),
+            wall_sensor_state["right_ratio"],
+        )
+        pre_wall_info["front_wall"] = (
+            pre_wall_info.get("front_wall", False)
+            or wall_sensor_state["front_blocked"]
+        )
+
         pre_game_state["wall_sensor"] = wall_sensor_state
         pre_game_state["left_wall_ratio"] = wall_sensor_state["left_ratio"]
         pre_game_state["front_wall_ratio"] = wall_sensor_state["front_ratio"]
@@ -991,15 +1933,21 @@ class DoomEnv(gym.Env):
                 print(f"[pre_object_vision] prediction failed: {e}")
                 pre_object_result = None
 
-        pre_scene_result = self.scene_predictor.predict(
-        pre_gameplay_frame,
-        view_mode="gameplay_wide",
-        )
+        pre_scene_result = None
 
-        pre_object_result = self.object_predictor.predict(
-            pre_gameplay_frame,
-            view_mode="gameplay_wide",
-        )
+        if self.scene_predictor is not None:
+            pre_scene_result = self.scene_predictor.predict(
+                pre_gameplay_frame,
+                view_mode="gameplay_wide",
+            )
+
+        pre_object_result = None
+
+        if self.object_predictor is not None:
+            pre_object_result = self.object_predictor.predict(
+                pre_gameplay_frame,
+                view_mode="gameplay_wide",
+            )
 
         # -----------------------------------------------------
         # Pre-action learned scene prediction
@@ -1074,12 +2022,60 @@ class DoomEnv(gym.Env):
         pre_game_state["scene_probs"] = pre_scene_probs
         pre_game_state["action"] = action
 
+
+        # -----------------------------------------------------
+        # Pending retrace action
+        # -----------------------------------------------------
+        # Retrace is computed after the previous action, so we apply it
+        # at the beginning of the next step before exploration can override it.
+        if (
+            self.pending_retrace_action is not None
+            and self.pending_retrace_action in self.get_allowed_actions()
+        ):
+            pending = self.pending_retrace_action
+
+            front_blocked = (
+                pre_wall_info.get("front_wall", False)
+                or pre_wall_info.get("front_ratio", 0.0) >= 0.55
+            )
+
+            if pending == "move_forward" and front_blocked:
+                before_pending = pending
+
+                if pre_wall_info.get("left_ratio", 0.0) < pre_wall_info.get("right_ratio", 0.0):
+                    pending = "turn_left"
+                else:
+                    pending = "turn_right"
+
+                print(
+                    f"[override] pending_retrace_safety: "
+                    f"{before_pending} -> {pending} "
+                    f"front={pre_wall_info.get('front_ratio', 0.0):.2f}"
+                )
+
+            before = action
+            action = pending
+            pre_game_state["action"] = action
+            self.pending_retrace_action = None
+            self.retrace_lock_steps = max(self.retrace_lock_steps, 6)
+            can_use_exploration_override = False
+
+            print(
+                f"[override] pending_retrace: {before} -> {action} "
+                f"lock={self.retrace_lock_steps}"
+            )
+
+        pre_game_state = self.update_powerup_state(
+            game_state=pre_game_state,
+            object_result=pre_object_result,
+        )
+
         # -----------------------------------------------------
         # Pre-action sensory override
         # -----------------------------------------------------
         # The neural classifier can call spawn-boundary/corner views open_path.
         # The sensory layer corrects that using position memory and wall ratios.
-        pre_wall_info = self._wall_direction_info(pre_frame)
+        
         pre_scene_label, pre_scene_confidence = self.sensory_scene_override(
             scene_label=pre_scene_label,
             scene_confidence=pre_scene_confidence,
@@ -1108,6 +2104,14 @@ class DoomEnv(gym.Env):
             or wall_sensor_state["front_blocked"]
         )
 
+        wall_penalty = self.strong_wall_penalty(
+            action=action,
+            wall_info=pre_wall_info,
+            game_state=pre_game_state,
+        )
+
+        reward += wall_penalty
+
         pre_game_state["scene_label"] = pre_scene_label
         pre_game_state["scene_confidence"] = pre_scene_confidence
 
@@ -1127,17 +2131,26 @@ class DoomEnv(gym.Env):
         # 2) Stage 0/1/2 are movement/door learning only.
         # Combat helpers must not hijack these stages.
         if self.curriculum_stage < 3:
-            before = action
-            action = self.exploration_assist_action(
-                action=action,
-                enemy_visible=False,
-                distance_moved=None,
-                motion=None,
-            )
-            if action != before:
-                print(f"[override] exploration: {before} -> {action}")
-
-                decision_trace["changes"].append(("exploration", before, action))
+            if False and can_use_exploration_override:
+                before = action
+                action = self.exploration_assist_action(
+                    action=action,
+                    enemy_visible=False,
+                    distance_moved=None,
+                    motion=None,
+                )
+                if action != before:
+                    print(f"[override] exploration: {before} -> {action}")
+                    decision_trace["changes"].append(("exploration", before, action))
+            else:
+                if self.retrace_lock_steps > 0 or getattr(self.retrace_navigator, "active", False):
+                    print(
+                        f"[override_blocked] exploration blocked "
+                        f"lock={self.retrace_lock_steps} "
+                        f"retrace_active={getattr(self.retrace_navigator, 'active', False)} "
+                        f"stuck={self.stuck_counter} "
+                        f"wall={self.wall_contact_steps}"
+                    )
 
             before = action
             action = self.wall_assist_action(
@@ -1166,8 +2179,15 @@ class DoomEnv(gym.Env):
         else:
             aimed_this_step = False
 
-            # Aim alignment gets priority over shooting/swap logic.
-            if pre_enemy_visible and not pre_enemy_centered:
+            allow_aim_priority = (
+                pre_enemy_visible
+                and not pre_enemy_centered
+                and self.retrace_lock_steps <= 0
+                and not getattr(self.retrace_navigator, "active", False)
+                and self.stuck_counter < 4
+            )
+
+            if allow_aim_priority:
                 if pre_game_state.get("enemy_left", False):
                     before = action
                     action = "turn_left"
@@ -1179,11 +2199,19 @@ class DoomEnv(gym.Env):
                     action = "turn_right"
                     aimed_this_step = True
                     print(f"[override] aim_priority: {before} -> {action}")
+            else:
+                if pre_enemy_visible and not pre_enemy_centered and self._step_count % 25 == 0:
+                    print(
+                        f"[override_blocked] aim_priority blocked "
+                        f"lock={self.retrace_lock_steps} "
+                        f"retrace_active={getattr(self.retrace_navigator, 'active', False)} "
+                        f"stuck={self.stuck_counter}"
+                    )
 
             if not aimed_this_step:
                 before = action
                 pre_game_state["action"] = action
-                tactical_action = None #self.combat_tactics.choose_combat_action(pre_game_state)
+                tactical_action = None   #self.combat_tactics.choose_combat_action(pre_game_state)
 
                 if tactical_action is not None:
                     # If route stages have made no progress, do not replace
@@ -1208,26 +2236,57 @@ class DoomEnv(gym.Env):
                         print(f"[override] combat_tactics: {before} -> {action}")
 
                 else:
-                    before = action
-                    action = self.aim_assist_action(
-                        action=action,
-                        frame=pre_frame,
-                        enemy_visible=pre_enemy_visible,
-                        enemy_centered=pre_enemy_centered,
-                        ammo=pre_game_state.get("ammo", 0),
-                    )
-                    if action != before:
-                        print(f"[override] aim_assist: {before} -> {action}")
+                    ammo = int(pre_game_state.get("ammo", 0) or 0)
 
-            before = action
-            action = self.exploration_assist_action(
-                action=action,
-                enemy_visible=pre_enemy_visible,
-                distance_moved=None,
-                motion=None,
-            )
-            if action != before:
-                print(f"[override] exploration: {before} -> {action}")
+                    allow_aim_assist = (
+                        pre_enemy_visible
+                        and not pre_enemy_centered
+                        and ammo > 0
+                        and self.retrace_lock_steps <= 0
+                        and not getattr(self.retrace_navigator, "active", False)
+                        and self.stuck_counter < 4
+                    )
+
+                    if allow_aim_assist:
+                        before = action
+                        action = self.aim_assist_action(
+                            action=action,
+                            frame=pre_frame,
+                            enemy_visible=pre_enemy_visible,
+                            enemy_centered=pre_enemy_centered,
+                            ammo=ammo,
+                        )
+                        if action != before:
+                            print(f"[override] aim_assist: {before} -> {action}")
+                    else:
+                        if pre_enemy_visible and self._step_count % 25 == 0:
+                            print(
+                                f"[override_blocked] aim_assist blocked "
+                                f"centered={pre_enemy_centered} ammo={ammo} "
+                                f"lock={self.retrace_lock_steps} "
+                                f"retrace_active={getattr(self.retrace_navigator, 'active', False)} "
+                                f"stuck={self.stuck_counter}"
+                            )
+
+            if False and can_use_exploration_override:
+                before = action
+                action = self.exploration_assist_action(
+                    action=action,
+                    enemy_visible=pre_enemy_visible,
+                    distance_moved=None,
+                    motion=None,
+                )
+                if action != before:
+                    print(f"[override] exploration: {before} -> {action}")
+            else:
+                if self.retrace_lock_steps > 0 or getattr(self.retrace_navigator, "active", False):
+                    print(
+                        f"[override_blocked] exploration blocked "
+                        f"lock={self.retrace_lock_steps} "
+                        f"retrace_active={getattr(self.retrace_navigator, 'active', False)} "
+                        f"stuck={self.stuck_counter} "
+                        f"wall={self.wall_contact_steps}"
+                    )
 
             before = action
             action = self.wall_assist_action(
@@ -1344,7 +2403,7 @@ class DoomEnv(gym.Env):
             )
 
         # Corner/stuck escape beats combat. Do not shoot while trapped.
-        if self.corner_trap_steps >= 20:
+        if self.corner_trap_steps >= 120:
             before = action
             cycle = self.corner_trap_steps % 12
 
@@ -1413,6 +2472,8 @@ class DoomEnv(gym.Env):
                     f"scene={pre_scene_label} conf={pre_scene_confidence:.2f}"
                 )
 
+        
+
 
         # -----------------------------------------------------
         # Pre-action wall bubble safety
@@ -1430,12 +2491,19 @@ class DoomEnv(gym.Env):
 
         before_wall_bubble = action
 
-        if not self.sensory_emergency_active:
+        if (
+            not self.sensory_emergency_active
+            and self.retrace_lock_steps <= 0
+            and not getattr(self.retrace_navigator, "active", False)
+        ):
             action = self.wall_bubble_action(action, pre_wall_bubble)
         else:
-            # Sensory emergency is already choosing the escape plan.
-            # Do not let wall bubble fight it.
-            action = action
+            if self.retrace_lock_steps > 0 or getattr(self.retrace_navigator, "active", False):
+                print(
+                    f"[override_blocked] wall_bubble blocked "
+                    f"lock={self.retrace_lock_steps} "
+                    f"retrace_ctive={getattr(self.retrace_navigator, 'active', False)}"
+                )
 
         if action != before_wall_bubble:
             print(
@@ -1504,22 +2572,35 @@ class DoomEnv(gym.Env):
             print(f"[override] final_sanitize: {final_before} -> {action}")
 
         if action not in self.get_allowed_actions():
-            # Safer fallback than always moving forward.
-            if pre_wall_info.get("front_wall", False) or pre_wall_info.get("front_ratio", 0.0) > 0.45:
+            allowed = self.get_allowed_actions()
+
+            if "move_backward" in allowed and (
+                pre_wall_info.get("front_wall", False)
+                or pre_wall_info.get("front_ratio", 0.0) > 0.35
+                or self.stuck_counter >= 2
+                or self.wall_contact_steps >= 2
+            ):
                 fixed_action = "move_backward"
+
+            elif "turn_left" in allowed and "turn_right" in allowed:
+                left_ratio = float(pre_wall_info.get("left_ratio", 0.0) or 0.0)
+                right_ratio = float(pre_wall_info.get("right_ratio", 0.0) or 0.0)
+                fixed_action = "turn_left" if left_ratio <= right_ratio else "turn_right"
+
             else:
-                fixed_action = "move_forward"
+                fixed_action = allowed[0]
 
             print(
                 f"[override] final_safety: {action} -> {fixed_action} "
-                f"because stage={self.curriculum_stage} allowed={self.get_allowed_actions()}"
+                f"because stage={self.curriculum_stage} allowed={allowed}"
             )
+
             action = fixed_action
 
         helper_action = self.helper.get_action(pre_game_state)
 
         if action == helper_action:
-            reward += 0.05
+            reward += self.add_positive("direct_positive_reward", 0.05)
         else:
             reward -= 0.01
 
@@ -1535,6 +2616,37 @@ class DoomEnv(gym.Env):
         # -----------------------------------------------------
         # Execute action
         # -----------------------------------------------------
+
+        before_weapon_guard = action
+        action = self.tactical_weapon_action(
+            action=action,
+            game_state=pre_game_state,
+            object_result=pre_object_result,
+            wall_info=pre_wall_info,
+        )
+        if action == "shoot" and int(pre_game_state.get("ammo", 0) or 0) <= 0:
+            before = action
+            action = "move_backward"
+            print(f"[override] no_ammo_after_tactical: {before} -> {action}")
+
+        if action != before_weapon_guard:
+            print(
+                f"[override] tactical_weapon: {before_weapon_guard} -> {action} "
+                f"reason={self.last_forced_weapon_reason} "
+                f"berserk={self.has_berserk}"
+            )
+
+        action_prior_reward, action_prior_result = self.action_prior_advice_reward(
+            frame=pre_frame,
+            action=action,
+        )
+
+        reward += action_prior_reward
+
+        if action_prior_result is not None:
+            info["action_prior"] = action_prior_result
+            self.last_shared_debug["action_prior"] = action_prior_result
+            self.last_shared_debug["action_prior_reward"] = action_prior_reward
 
         if action == "swap_weapon":
             selected = self.smart_weapon_select(
@@ -1579,7 +2691,36 @@ class DoomEnv(gym.Env):
 
         game_state = self.observer.get_game_state()
 
+        try:
+            shared_game_state = self._build_shared_game_state(
+                base_game_state=game_state,
+                object_result=object_result or pre_object_result,
+                scene_result={
+                    "label": scene_label,
+                    "confidence": scene_confidence,
+                },
+                hud_result=locals().get("hud_result") or locals().get("pre_hud_result"),
+            )
+
+            shared_reward, shared_debug = self.shared_logic.compute_reward(
+                previous_state=self.previous_shared_game_state,
+                current_state=shared_game_state,
+                action_name=str(action),
+                depth_obs=None,
+            )
+
+            self.previous_shared_game_state = shared_game_state
+            self.last_shared_debug = shared_debug
+            self.last_shared_debug["shared_reward_preview"] = shared_reward
+
+        except Exception as e:
+            self.last_shared_debug = {
+                "shared_logic_error": str(e),
+            }
+
+
         reward += self.route_progress_reward(game_state)
+        reward += self.real_map_navigation_reward(game_state)
         reward += self.tile_exploration_reward(game_state)
         reward += self.door_use_reward(
             action=action,
@@ -1626,6 +2767,21 @@ class DoomEnv(gym.Env):
         corner_trapped = self.detect_corner_trap(game_state)
         game_state["corner_trapped"] = corner_trapped
 
+        director_result = self.route_director.evaluate(
+            game_state=game_state,
+            action=action,
+            level_guide=self.level_guide,
+        )
+
+        reward += self.main_goal_progress_reward(director_result)
+
+        reward += self.goal_progress_reward(director_result)
+
+        reward += self.stagnation_penalty(
+            game_state=game_state,
+            director_result=director_result,
+        )
+
         # -----------------------------------------------------
         # Post-action scene state
         # -----------------------------------------------------
@@ -1649,6 +2805,36 @@ class DoomEnv(gym.Env):
         game_state["scene_label"] = scene_label
         game_state["scene_confidence"] = scene_confidence
         game_state["scene_probs"] = scene_probs
+
+        rail_state = self.infer_half_wall_rail_state(
+            scene_label=scene_label,
+            scene_confidence=scene_confidence,
+            wall_info=wall_info if "wall_info" in locals() else None,
+            distance_moved=distance_moved if "distance_moved" in locals() else None,
+            motion=motion if "motion" in locals() else None,
+            action=action,
+        )
+
+        if rail_state.get("label") in ["half_wall_rail", "side_rail"]:
+            scene_label = rail_state["label"]
+            scene_confidence = rail_state["confidence"]
+
+            game_state["scene_label"] = scene_label
+            game_state["scene_confidence"] = scene_confidence
+            game_state["rail_position"] = rail_state.get("position")
+            game_state["rail_front_ratio"] = rail_state.get("front_ratio")
+            game_state["rail_side_ratio"] = rail_state.get("side_ratio")
+
+            if self._step_count % 25 == 0:
+                print(
+                    f"[half_wall_rail] label={scene_label} "
+                    f"pos={rail_state.get('position')} "
+                    f"front={rail_state.get('front_ratio'):.2f} "
+                    f"side={rail_state.get('side_ratio'):.2f} "
+                    f"action={action}"
+                )
+
+        reward += self.half_wall_rail_reward(game_state, action)
 
         # -----------------------------------------------------
         # Death review rolling buffer
@@ -1744,6 +2930,28 @@ class DoomEnv(gym.Env):
         secret_name = None
         secret_reward = 0.0
 
+        if not self.doom_has_focus():
+            print("[doom_env] Doom lost focus. Truncating episode.")
+
+            truncated = True
+            info["doom_focus_lost"] = True
+            self.last_shared_debug["doom_focus_lost"] = True
+
+            self.controller.release_all()
+
+            frame_cache.invalidate()
+            safe_frame = self.observer.build()
+            safe_observation = self.frame_stack.add_frame(safe_frame)
+
+            self.episode_reward_total += float(reward)
+
+            return (
+                safe_observation,
+                float(reward),
+                terminated,
+                truncated,
+                info,
+            )
 
         try:
             checkpoint_result = self.checkpoint_tracker.update(game_state)
@@ -1804,6 +3012,41 @@ class DoomEnv(gym.Env):
 
             print(f"[tracker] checkpoint/secret tracker failed: {e}")
 
+        # -----------------------------------------------------
+        # Route loop escape shaping
+        # -----------------------------------------------------
+        tile_size = 64
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        sensory_situation = game_state.get("sensory_situation")
+        repeat = int(game_state.get("sensory_repeat", 0) or 0)
+
+        if x is not None and y is not None:
+            current_tile = (int(float(x) // tile_size), int(float(y) // tile_size))
+
+            if sensory_situation == "stuck_or_looping":
+                self.recent_loop_tile = current_tile
+                self.recent_loop_steps = 20
+
+                if repeat >= 10:
+                    reward += self.add_penalty("slow_loop_escape", -0.02)
+                    self.reward_manager.add("slow_loop_escape", -0.02)
+
+            elif self.recent_loop_steps > 0:
+                self.recent_loop_steps -= 1
+
+                if self.recent_loop_tile is not None and current_tile != self.recent_loop_tile:
+                    reward += self.add_positive("direct_positive_reward", 0.15)
+                    self.reward_manager.add("escaped_loop_tile", 0.15)
+                    print(
+                        f"[route_escape] escaped loop tile "
+                        f"{self.recent_loop_tile} -> {current_tile}"
+                    )
+
+                    self.recent_loop_tile = None
+                    self.recent_loop_steps = 0
+
 
         # Corner escape action changes already happen before perform_action().
         # Do not mutate action here after Doom has already received input.
@@ -1819,6 +3062,13 @@ class DoomEnv(gym.Env):
         kill_delta = game_state.get("kill_delta", 0)
         health = game_state.get("health", 100)
         health_delta = game_state.get("health_delta", 0)
+
+        world_mode = choose_world_mode(game_state, {
+            "situation": game_state.get("sensory_situation", "normal_navigation")
+        })
+        game_state["world_mode"] = world_mode
+
+        self.save_world_debug_frame(pre_frame, game_state, world_mode)
 
         if self.curriculum_stage >= 3 and health > 0:
             self.combat_survival_steps += 1
@@ -1850,6 +3100,12 @@ class DoomEnv(gym.Env):
         # Strong wall / stuck punishment
 
         wall_info = self._wall_direction_info(raw_frame)
+
+        reward += self.strong_wall_penalty(
+            action=action,
+            wall_info=wall_info,
+            game_state=game_state,
+        )
 
         game_state["left_wall_ratio"] = wall_info["left_ratio"]
         game_state["front_wall_ratio"] = wall_info["front_ratio"]
@@ -1898,14 +3154,21 @@ class DoomEnv(gym.Env):
 
         if retrace_action is not None and retrace_action in self.get_allowed_actions():
             before = action
-            action = retrace_action
-            game_state["action"] = action
+
+            # Do not mutate action here for control purposes.
+            # Doom already received the keypress earlier in this step.
+            # Store it for the next pre-action step instead.
+            self.pending_retrace_action = retrace_action
+            self.retrace_lock_steps = max(self.retrace_lock_steps, 8)
+
+            game_state["retrace_recommended_action"] = retrace_action
 
             print(
-                f"[retrace] {before} -> {action} "
+                f"[retrace] queued {before} -> {retrace_action} "
                 f"phase={self.retrace_navigator.phase} "
                 f"step={self.retrace_navigator.phase_step} "
-                f"side={self.retrace_navigator.preferred_side}"
+                f"side={self.retrace_navigator.preferred_side} "
+                f"lock={self.retrace_lock_steps}"
             )
 
         if self.retrace_navigator.active:
@@ -1916,7 +3179,7 @@ class DoomEnv(gym.Env):
             and distance_moved > 6.0
             and motion > 2.0
         ):
-            reward += 0.8
+            reward += self.add_positive("direct_positive_reward", 0.8)
             self.reward_manager.add("successful_retrace_escape", 0.8)
 
         # -----------------------------------------------------
@@ -1933,30 +3196,32 @@ class DoomEnv(gym.Env):
             level_guide=self.level_guide,
         )
 
-        game_state["director_target"] = director_state["target"]
-        game_state["director_distance"] = director_state["distance"]
-        game_state["director_dx"] = director_state["dx"]
-        game_state["director_dy"] = director_state["dy"]
-        game_state["director_hint_action"] = director_state["hint_action"]
+        game_state["director_target"] = director_state.get("target")
+        game_state["director_distance"] = director_state.get("distance")
+        game_state["director_dx"] = director_state.get("dx", 0.0)
+        game_state["director_dy"] = director_state.get("dy", 0.0)
+        game_state["director_hint_action"] = director_state.get("hint_action")
         game_state["director_objective"] = director_state.get("objective")
         game_state["director_reason"] = director_state.get("reason")
 
-        reward += director_state["reward_delta"]
+        reward += director_state.get("reward_delta", director_state.get("reward", 0.0))
 
-        if director_state["reward_delta"] > 0:
-            self.reward_manager.add("director_progress", director_state["reward_delta"])
-        elif director_state["reward_delta"] < 0:
-            self.reward_manager.add("director_wrong_way", director_state["reward_delta"])
+        director_reward_delta = director_state.get("reward_delta", director_state.get("reward", 0.0))
+
+        if director_reward_delta > 0:
+            self.reward_manager.add("director_progress", director_reward_delta)
+        elif director_reward_delta < 0:
+            self.reward_manager.add("director_wrong_way", director_reward_delta)
 
         if self._step_count % 25 == 0:
             print(
                 "[director] "
-                f"target={director_state['target']} "
+                f"target={director_state.get('target')} "
                 f"reason={director_state.get('reason')} "
-                f"dist={director_state['distance']} "
-                f"delta={director_state['distance_delta']:.2f} "
-                f"hint={director_state['hint_action']} "
-                f"reward={director_state['reward_delta']:.2f}"
+                f"dist={director_state.get('distance')} "
+                f"delta={director_state.get('distance_delta', 0.0):.2f} "
+                f"hint={director_state.get('hint_action')} "
+                f"reward={director_state.get('reward_delta', director_state.get('reward', 0.0)):.2f}"
             )
 
         game_state["sensory_situation"] = sensory_state["situation"]
@@ -2001,7 +3266,7 @@ class DoomEnv(gym.Env):
                 or wall_info["front_wall"]
                 or wall_info["front_ratio"] >= 0.45
                 or (
-                    scene_label in ["front_wall", "obstacle", "boundary_or_stuck_wall"]
+                    scene_label in ["front_wall", "obstacle", "boundary_or_stuck_wall", "half_wall_rail"]
                     and scene_confidence >= 0.70
                 )
             )
@@ -2051,14 +3316,14 @@ class DoomEnv(gym.Env):
 
         # Reward actual escape, but only if movement really improved.
         if self.stuck_counter >= 5 and distance_moved > 5.0 and motion > 2.0:
-            reward += 3.0
-            self.reward_manager.add("strong_escape_from_stuck", 3.0)
+            reward += self.add_positive("strong_escape_from_stuck", 15.0)
+            self.reward_manager.add("strong_escape_from_stuck", 45.0)
 
         # If the agent is near a wall but takes a reasonable escape action,
         # give a small reward so it learns the alternative.
         if trapped_near_boundary and action in ["turn_left", "turn_right", "strafe_left", "strafe_right", "move_backward"]:
-            reward += 0.6
-            self.reward_manager.add("correct_boundary_escape_action", 0.6)
+            reward += self.add_positive("correct_boundary_escape_action", 15.0)
+            self.reward_manager.add("correct_boundary_escape_action", 45.0)
 
 
         # Reward open-space movement and penalize wall-hugging.
@@ -2152,35 +3417,35 @@ class DoomEnv(gym.Env):
             )
 
         if wall_bubble["level"] == "red":
-            reward += self.add_penalty("red_wall_bubble", -1.5)
+            reward += self.add_penalty("red_wall_bubble", -15.0)
 
         elif wall_bubble["level"] == "orange":
-            reward += self.add_penalty("orange_wall_bubble", -0.4)
+            reward += self.add_penalty("orange_wall_bubble", -8.0)
 
         elif wall_bubble["level"] == "green":
             if distance_moved > 2.0 and action in ["move_forward", "strafe_left", "strafe_right"]:
-                reward += 0.15
+                reward += self.add_positive("direct_positive_reward", 0.15)
                 self.reward_manager.add("green_space_movement", 0.15)
 
         if scene_label in ["obstacle", "boundary_or_stuck_wall"] and scene_confidence >= 0.55:
             if action == "move_forward":
-                reward += self.add_penalty("push_into_obstacle", -1.5)
+                reward += self.add_penalty("push_into_obstacle", -15.0)
 
             elif action in ["move_backward", "strafe_left", "strafe_right", "turn_left", "turn_right"]:
-                reward += 0.35
-                self.reward_manager.add("avoid_obstacle", 0.35)
+                reward += self.add_positive("avoid_obstacle", 15.0)
+                self.reward_manager.add("avoid_obstacle", 45.0)
         # -----------------------------------------------------
         # Tactical behavior rewards
         # -----------------------------------------------------
 
         if wall_contact:
-            reward += self.add_penalty("wall_contact", -1.0)
+            reward += self.add_penalty("wall_contact", -15.0)
 
         if wall_info["front_wall"] and action == "move_forward":
-            reward += self.add_penalty("push_into_front_wall", -1.0)
+            reward += self.add_penalty("push_into_front_wall", -15.0)
 
         if wall_contact and action == "move_forward":
-            reward += self.add_penalty("push_wall_forward", -1.5)
+            reward += self.add_penalty("push_wall_forward", -15.0)
 
         if self.stuck_counter >= 8:
             reward += self.add_penalty("stuck_near_wall", -1.0)
@@ -2192,28 +3457,28 @@ class DoomEnv(gym.Env):
             reward += self.add_penalty("stuck_critical", -2.0)
 
         if wall_info["front_wall"] and action == "move_backward":
-            reward += 0.4
-            self.reward_manager.add("back_away_from_wall", 0.4)
+            reward += self.add_positive("back_away_from_wall", 15.0)
+            self.reward_manager.add("back_away_from_wall", 45.0)
 
         if wall_info["left_wall"] and action in ["turn_right", "strafe_right"]:
-            reward += 0.25
-            self.reward_manager.add("escape_left_wall", 0.25)
+            reward += self.add_positive("escape_left_wall", 15.0)
+            self.reward_manager.add("escape_left_wall", 45.0)
 
         if wall_info["right_wall"] and action in ["turn_left", "strafe_left"]:
-            reward += 0.25
-            self.reward_manager.add("escape_right_wall", 0.25)
+            reward += self.add_positive("escape_right_wall", 15.0)
+            self.reward_manager.add("escape_right_wall", 45.0)
 
         if enemy_visible and action == "shoot" and ammo > 0:
-            reward += 0.25
+            reward += self.add_positive("direct_positive_reward", 0.25)
             self.reward_manager.add("shoot_enemy_on_sight", 0.25)
 
         if enemy_visible and health_delta < 0 and action in ["strafe_left", "strafe_right"]:
-            reward += 0.8
+            reward += self.add_positive("direct_positive_reward", 0.8)
             self.dodge_when_damaged_count += 1
             self.reward_manager.add("dodge_when_damaged", 0.8)
 
         if enemy_visible and health < 45 and action == "move_backward":
-            reward += 0.6
+            reward += self.add_positive("direct_positive_reward", 0.6)
             self.retreat_from_close_enemy_count += 1
             self.reward_manager.add("retreat_low_health", 0.6)
 
@@ -2224,7 +3489,7 @@ class DoomEnv(gym.Env):
             reward += self.add_penalty("unneeded_turning", -0.6)
 
         if self.wall_escape_mode and distance_moved > 4.0 and motion > 2.0:
-            reward += 0.5
+            reward += self.add_positive("direct_positive_reward", 0.5)
             self.reward_manager.add("successful_wall_escape", 0.5)
 
         # -----------------------------------------------------
@@ -2233,11 +3498,11 @@ class DoomEnv(gym.Env):
 
         if self.curriculum_stage >= 5:
             if distance_moved > 3.0:
-                reward += 0.15
+                reward += self.add_positive("direct_positive_reward", 0.15)
                 self.reward_manager.add("route_movement_progress", 0.15)
 
             if action in ["move_forward", "move_backward", "strafe_left", "strafe_right"]:
-                reward += 0.03
+                reward += self.add_positive("direct_positive_reward", 0.03)
                 self.reward_manager.add("route_movement_action", 0.03)
 
             if action == "melee_attack" and self.consecutive_melee_steps > 3:
@@ -2249,11 +3514,10 @@ class DoomEnv(gym.Env):
             if self.distance_traveled < 25.0 and self._step_count > 100:
                 reward += self.add_penalty("no_route_progress", -1.5)
 
-        if self.corner_trap_steps >= 20 and not self.sensory_emergency_active:
-            reward -= 5.0
-            terminated = True
-            info["corner_trap_reset"] = True
-            print("[reset] corner trap timeout")
+        if self.corner_trap_steps >= 120 and not self.sensory_emergency_active:
+            reward += self.add_penalty("corner_trap_no_reset_penalty", -15.0)
+            info["corner_trap_penalty"] = True
+            print("[no_reset] corner trap penalty only")
 
         # -----------------------------------------------------
         # Known use-point reward: doors, elevators, switches
@@ -2304,15 +3568,66 @@ class DoomEnv(gym.Env):
 
         game_state["near_use_point"] = near_use_point
         game_state["nearest_use_name"] = nearest_use_name
+        # Route gravity correction:
+        # The useful path/exit lane is west of the far-right drift area.
+        try:
+            gx = float(game_state.get("x", 0.0) or 0.0)
+            if gx > 700.0:
+                if action in ["turn_left", "strafe_left", "move_backward"]:
+                    reward += self.add_positive("far_east_route_recovery_action", 5.0)
+                elif action in ["move_forward", "turn_right", "strafe_right"]:
+                    reward += self.add_penalty("far_east_wrong_direction", -15.0)
+        except Exception:
+            pass
+
+
+        # Any obstacle / 2-second no-movement recovery shaping.
+        try:
+            obstacle_scene = game_state.get("scene_label") in {
+                "front_wall",
+                "obstacle",
+                "boundary_or_stuck_wall",
+                "half_wall_rail",
+                "side_rail",
+            }
+            obstacle_situation = game_state.get("sensory_situation") in {
+                "stuck_or_looping",
+                "front_blocked",
+                "half_wall_rail",
+                "side_rail",
+            }
+            no_move_steps = int(getattr(self, "no_position_change_steps", 0) or 0)
+            threshold = int(getattr(self, "no_movement_recovery_threshold_steps", 18))
+
+            if (obstacle_scene or obstacle_situation) and no_move_steps >= threshold:
+                if action in ["turn_left", "turn_right", "move_backward", "strafe_left", "strafe_right"]:
+                    reward += self.add_positive("any_obstacle_2sec_recovery_action", 5.0)
+                elif action == "move_forward":
+                    reward += self.add_penalty("any_obstacle_2sec_push_forward", -15.0)
+        except Exception:
+            pass
+
+
+        reward += self.exit_distance_progress_reward(game_state)
+
+        brain_reward, brain_info = self.apply_doom_brain(
+            game_state=game_state,
+            action_name=action,
+            sensory_state={
+                    "situation": game_state.get("sensory_situation", "normal_navigation")
+                },
+            )
+        reward += brain_reward
+        info["doom_brain"] = brain_info
 
         if near_use_point:
             if action == "use":
-                reward += 2.0
+                reward += self.add_positive("direct_positive_reward", 2.0)
                 self.reward_manager.add("used_known_use_point", 2.0)
                 print(f"[use_point] used {nearest_use_name}")
 
             elif action == "move_forward" and (
-                scene_label in ["front_wall", "door_or_button", "obstacle"]
+                scene_label in ["front_wall", "door_or_button", "obstacle", "half_wall_rail"]
                 or distance_moved < 1.0
             ):
                 reward += self.add_penalty("ignored_use_point", -0.8)
@@ -2337,18 +3652,18 @@ class DoomEnv(gym.Env):
                 f"front={wall_info['front_ratio']:.2f} "
                 f"right={wall_info['right_ratio']:.2f}"
             )
-
+    
         if self._step_count % 25 == 0:
             print(
                 f"[coords] "
-                f"x={game_state.get('x'):.1f} "
-                f"y={game_state.get('y'):.1f}"
-            )
+                f"x={self._fmt_num(game_state.get('x'))} "
+                f"y={self._fmt_num(game_state.get('y'))} "
+                )
 
         if self._step_count % 100 == 0:
             print(
-                f"[pos] x={game_state.get('x')} "
-                f"y={game_state.get('y')} "
+                f"[pos] x={self._fmt_num(game_state.get('x'))} "
+                f"y={self._fmt_num(game_state.get('y'))} "
                 f"shared={game_state.get('shared_state_available')}"
             )
 
@@ -2360,31 +3675,48 @@ class DoomEnv(gym.Env):
                 f"reward={checkpoint_reward:.2f}"
             )
 
+        if self._step_count % 10 == 0:
+            print(
+                "[director_debug] "
+                f"pos=({game_state.get('x'):.1f},{game_state.get('y'):.1f}) "
+                f"target={director_result.get('target')} "
+                f"target_xy=({director_result.get('target_x'):.1f},{director_result.get('target_y'):.1f}) "
+                f"dx={director_result.get('dx'):.1f} "
+                f"dy={director_result.get('dy'):.1f} "
+                f"dist={director_result.get('distance'):.1f} "
+                f"delta={director_result.get('distance_delta'):.1f} "
+                f"hint={director_result.get('hint')} "
+                f"hint_action={director_result.get('hint_action')}"
+            )
+
+        if self._step_count % 50 == 0:
+            print(f"[world_mode] {world_mode}")
+
         # -----------------------------------------------------
         # Resource / combat event rewards
         # -----------------------------------------------------
 
         if ammo_delta > 0:
-            reward += 0.4
+            reward += self.add_positive("direct_positive_reward", 0.4)
             self.ammo_pickup_count += 1
             self.reward_manager.add("ammo_pickup", 0.4)
 
         if weapon_delta > 0:
-            reward += 3.0
+            reward += self.add_positive("direct_positive_reward", 3.0)
             self.weapon_pickup_count += 1
             self.reward_manager.add("weapon_pickup", 3.0)
 
         if kill_delta > 0:
-            reward += 5.0 * kill_delta
+            reward += self.add_positive("direct_positive_reward", 5.0) * kill_delta
             self.enemy_kill_count += kill_delta
             self.reward_manager.add("enemy_kill", 5.0 * kill_delta)
 
         if enemy_visible and health_delta < 0 and action in ["strafe_left", "strafe_right"]:
-            reward += 0.5
+            reward += self.add_positive("direct_positive_reward", 0.5)
             self.dodge_when_damaged_count += 1
 
         if enemy_visible and enemy_close and action == "move_backward":
-            reward += 0.4
+            reward += self.add_positive("direct_positive_reward", 0.4)
             self.retreat_from_close_enemy_count += 1
 
         # -----------------------------------------------------
@@ -2395,11 +3727,11 @@ class DoomEnv(gym.Env):
             self.stuck_counter += 1
         else:
             if self.stuck_counter > 10:
-                reward += 1.0
+                reward += self.add_positive("direct_positive_reward", 1.0)
             self.stuck_counter = 0
 
         if motion < 1.0 and action == "move_forward":
-            reward += self.add_penalty("low_motion_forward", -0.3)
+            reward += self.add_penalty("low_motion_forward", -15.0)
 
         if self.stuck_counter > 10 and action in [
             "turn_left",
@@ -2408,14 +3740,14 @@ class DoomEnv(gym.Env):
             "strafe_left",
             "strafe_right",
         ]:
-            reward += 0.2
+            reward += self.add_positive("direct_positive_reward", 0.2)
             self.reward_manager.add("escape_stuck_action", 0.2)
 
         if self.stuck_counter > 25:
             reward += self.add_penalty("long_stuck", -1.0)
 
         if distance_moved > 5.0:
-            reward += 0.04
+            reward += self.add_positive("direct_positive_reward", 0.04)
             self.movement_count += 1
 
         # -----------------------------------------------------
@@ -2428,7 +3760,7 @@ class DoomEnv(gym.Env):
         )
 
         if game_state.get("health_delta", 0) > 0 or game_state.get("ammo_delta", 0) > 0:
-            reward += 0.5
+            reward += self.add_positive("direct_positive_reward", 0.5)
             self.pickup_count += 1
             self.key_item_count += 1
 
@@ -2457,37 +3789,37 @@ class DoomEnv(gym.Env):
             ]
 
             if not enemy_visible and action == "move_forward":
-                reward += 0.03
+                reward += self.add_positive("direct_positive_reward", 0.03)
 
             if distance_moved > 5.0:
-                reward += 0.04
+                reward += self.add_positive("direct_positive_reward", 0.04)
 
             if len(self.visited_tiles) > 0 and action in movement_actions:
-                reward += 0.01
+                reward += self.add_positive("direct_positive_reward", 0.01)
 
             if action in ["turn_left", "turn_right"] and not enemy_visible:
                 reward += self.add_penalty("stage3_unneeded_turn", -0.1)
 
             if action in ["turn_left", "turn_right"] and enemy_visible:
-                reward += 0.05
+                reward += self.add_positive("direct_positive_reward", 0.05)
 
             if enemy_visible and not self.prev_enemy_visible:
-                reward += 2.0
+                reward += self.add_positive("direct_positive_reward", 2.0)
                 self.reward_manager.add("enemy_discovered", 2.0)
 
             if enemy_visible:
-                reward += 0.50
+                reward += self.add_positive("direct_positive_reward", 0.50)
 
             if enemy_visible and enemy_centered:
-                reward += 1.00
+                reward += self.add_positive("direct_positive_reward", 1.00)
                 self.track_enemy_count += 1
 
             if action == "shoot" and enemy_visible and ammo > 0:
                 # Smaller reward to avoid ammo-spam learning.
-                reward += 0.30
+                reward += self.add_positive("direct_positive_reward", 0.30)
 
                 if enemy_centered:
-                    reward += 0.50
+                    reward += self.add_positive("direct_positive_reward", 0.50)
                     self.enemy_engagement_count += 1
                     self.valid_shot_count += 1
 
@@ -2507,24 +3839,46 @@ class DoomEnv(gym.Env):
 
                 else:
                     if enemy_visible:
-                        reward += 0.6
+                        reward += self.add_positive("direct_positive_reward", 0.6)
                         self.enemy_engagement_count += 1
 
                     if enemy_visible:
-                        reward += 1.2
+                        reward += self.add_positive("direct_positive_reward", 1.2)
                         self.valid_shot_count += 1
                         self.reward_manager.add("visible_enemy_shot", 1.2)
 
                         if enemy_centered:
-                            reward += 0.8
+                            reward += self.add_positive("direct_positive_reward", 0.8)
                             self.reward_manager.add("centered_enemy_shot", 0.8)
 
                     if enemy_visible and not enemy_centered:
-                        reward += 0.15
+                        reward += self.add_positive("direct_positive_reward", 0.15)
 
                     if ammo <= 5:
                         reward += self.add_penalty("low_ammo_shot_pressure", -0.5)
 
+
+        # -----------------------------------------------------
+        # Ammo discipline reward shaping
+        # -----------------------------------------------------
+        ammo_discipline_reward = 0.0
+
+        if action == "shoot":
+            ammo = int(game_state.get("ammo", 0) or 0)
+
+            if not enemy_visible:
+                ammo_discipline_reward -= 0.015
+                self.reward_manager.add("shoot_no_enemy", -0.03)
+
+            elif enemy_visible and not enemy_centered:
+                ammo_discipline_reward -= 0.01
+                self.reward_manager.add("shoot_not_centered", -0.02)
+
+            elif enemy_visible and enemy_centered:
+                ammo_discipline_reward += 0.02
+                self.reward_manager.add("shoot_centered_enemy", 0.02)
+
+        reward += ammo_discipline_reward
         # -----------------------------------------------------
         # Melee/use/swap rewards
         # -----------------------------------------------------
@@ -2539,11 +3893,11 @@ class DoomEnv(gym.Env):
                 reward += self.add_penalty("melee_without_enemy", -0.4)
 
             elif enemy_visible and enemy_centered:
-                reward += 0.8
+                reward += self.add_positive("direct_positive_reward", 0.8)
                 self.reward_manager.add("melee_enemy_centered", 0.8)
 
                 if enemy_close:
-                    reward += 1.5
+                    reward += self.add_positive("direct_positive_reward", 1.5)
                     self.melee_close_bonus_count += 1
                     self.reward_manager.add("melee_close_range", 1.5)
 
@@ -2590,7 +3944,7 @@ class DoomEnv(gym.Env):
 
             if meaningful_use:
                 self.door_interaction_count += 1
-                reward += 1.0
+                reward += self.add_positive("direct_positive_reward", 1.0)
                 self.reward_manager.add("meaningful_door_use", 1.0)
 
                 x = game_state.get("x")
@@ -2605,10 +3959,10 @@ class DoomEnv(gym.Env):
                     if use_tile not in self.secret_use_locations:
                         self.secret_use_locations.add(use_tile)
 
-                        reward += 3.0
+                        reward += self.add_positive("direct_positive_reward", 3.0)
                         self.reward_manager.add("new_use_location_discovered", 3.0)
                     else:
-                        reward += 0.8
+                        reward += self.add_positive("direct_positive_reward", 0.8)
                         self.reward_manager.add("known_use_location_reused", 0.8)
 
                         print(f"[memory] useful use location discovered: {use_tile}")
@@ -2640,7 +3994,7 @@ class DoomEnv(gym.Env):
                     reward += self.add_penalty("bad_melee_weapon_distance", -1.0)
 
                 if weapon == "melee" and close_enemy:
-                    reward += 0.4
+                    reward += self.add_positive("direct_positive_reward", 0.4)
                     self.reward_manager.add("melee_only_close_range", 0.4)
 
                 # RPG/rocket is powerful, but dangerous near barrels or close enemies.
@@ -2648,12 +4002,12 @@ class DoomEnv(gym.Env):
                     reward += self.add_penalty("dangerous_rpg_context", -1.5)
 
                 if weapon == "rpg" and enemy_visible and not barrel_visible and not close_enemy and health >= 60:
-                    reward += 0.8
+                    reward += self.add_positive("direct_positive_reward", 0.8)
                     self.reward_manager.add("good_rpg_context", 0.8)
 
                 # Shotgun/chaingun are generally good combat defaults.
                 if enemy_visible and weapon in ["shotgun", "chaingun"]:
-                    reward += 0.3
+                    reward += self.add_positive("direct_positive_reward", 0.3)
                     self.reward_manager.add("good_general_weapon", 0.3)
 
                 # Weapon swap should not be spammed.
@@ -2672,7 +4026,7 @@ class DoomEnv(gym.Env):
                         reward += self.add_penalty("crashed_into_known_door", -2.0)
 
                     if near_known_use and action == "use":
-                        reward += 1.0
+                        reward += self.add_positive("direct_positive_reward", 1.0)
                         self.reward_manager.add("used_known_door_location", 1.0)
 
         # -----------------------------------------------------
@@ -2701,7 +4055,7 @@ class DoomEnv(gym.Env):
                 reward += self.add_penalty("weak_weapon_pressure", -0.02)
 
             if self.weapon_pickup_count > 0:
-                reward += 0.05
+                reward += self.add_positive("direct_positive_reward", 0.05)
 
         # -----------------------------------------------------
         # Route progress milestones
@@ -2709,39 +4063,39 @@ class DoomEnv(gym.Env):
 
         if self.curriculum_stage >= 7:
             if game_state.get("checkpoint_reached", False):
-                reward += 2.0
+                reward += self.add_positive("direct_positive_reward", 2.0)
                 self.reward_manager.add("stage7_checkpoint_bonus", 2.0)
 
             if game_state.get("secret_reached", False):
-                reward += 5.0
+                reward += self.add_positive("direct_positive_reward", 5.0)
                 self.reward_manager.add("stage7_secret_bonus", 5.0)
 
             if game_state.get("all_checkpoints_reached", False):
-                reward += 20.0
+                reward += self.add_positive("direct_positive_reward", 20.0)
                 self.reward_manager.add("all_checkpoints_reached", 20.0)
 
             if len(self.visited_tiles) >= 10 and self.route_progress_level < 1:
-                reward += 5.0
+                reward += self.add_positive("direct_positive_reward", 5.0)
                 self.route_progress_level = 1
                 self.reward_manager.add("route_tiles_10", 5.0)
 
             if self.pickup_count >= 2 and self.route_progress_level < 2:
-                reward += 5.0
+                reward += self.add_positive("direct_positive_reward", 5.0)
                 self.route_progress_level = 2
                 self.reward_manager.add("route_pickups_2", 5.0)
 
             if self.door_interaction_count >= 1 and self.route_progress_level < 3:
-                reward += 8.0
+                reward += self.add_positive("direct_positive_reward", 8.0)
                 self.route_progress_level = 3
                 self.reward_manager.add("route_door_1", 8.0)
 
             if self.enemy_kill_count >= 1 and self.route_progress_level < 4:
-                reward += 5.0
+                reward += self.add_positive("direct_positive_reward", 5.0)
                 self.route_progress_level = 4
                 self.reward_manager.add("route_kill_1", 5.0)
 
             if len(self.visited_tiles) >= 25 and self.route_progress_level < 5:
-                reward += 8.0
+                reward += self.add_positive("direct_positive_reward", 8.0)
                 self.route_progress_level = 5
                 self.reward_manager.add("route_tiles_25", 8.0)
 
@@ -2776,7 +4130,7 @@ class DoomEnv(gym.Env):
 
             if "enemy_visible" in present_objects:
                 game_state["aux_enemy_visible"] = True
-                reward += 0.02
+                reward += self.add_positive("direct_positive_reward", 0.02)
                 self.reward_manager.add("aux_enemy_awareness", 0.02)
             else:
                 game_state["aux_enemy_visible"] = False
@@ -2785,7 +4139,7 @@ class DoomEnv(gym.Env):
                 game_state["aux_health_pickup_visible"] = True
 
                 if health < 80 and action in ["move_forward", "strafe_left", "strafe_right"]:
-                    reward += 0.08
+                    reward += self.add_positive("direct_positive_reward", 0.08)
                     self.reward_manager.add("aux_move_toward_health", 0.08)
             else:
                 game_state["aux_health_pickup_visible"] = False
@@ -2794,7 +4148,7 @@ class DoomEnv(gym.Env):
                 game_state["aux_ammo_pickup_visible"] = True
 
                 if ammo < 20 and action in ["move_forward", "strafe_left", "strafe_right"]:
-                    reward += 0.08
+                    reward += self.add_positive("direct_positive_reward", 0.08)
                     self.reward_manager.add("aux_move_toward_ammo", 0.08)
             else:
                 game_state["aux_ammo_pickup_visible"] = False
@@ -2803,7 +4157,7 @@ class DoomEnv(gym.Env):
                 game_state["aux_barrel_visible"] = True
 
                 if action == "shoot" and enemy_visible:
-                    reward += 0.05
+                    reward += self.add_positive("direct_positive_reward", 0.05)
                     self.reward_manager.add("aux_barrel_combat_awareness", 0.05)
             else:
                 game_state["aux_barrel_visible"] = False
@@ -2813,14 +4167,21 @@ class DoomEnv(gym.Env):
         # Termination
         # -----------------------------------------------------
 
-        health = game_state.get("health", 100)
+        if kill_delta > 0:
+            print(
+                f"[combat_success] kill gained "
+                f"kill_delta={kill_delta} "
+                f"total_kills={self.enemy_kill_count} "
+                f"ammo={ammo} "
+                f"health={health}"
+            )
 
         # Emergency combat override:
         # Freedoom has enemies very early. If the agent is still in Stage 2 but
         # taking damage, allow simple defensive shooting instead of dying helplessly.
         if self.curriculum_stage == 2 and health_delta < 0 and ammo > 0:
             if enemy_visible and enemy_centered:
-                reward += 0.5
+                reward += self.add_positive("direct_positive_reward", 0.5)
                 self.reward_manager.add("emergency_enemy_defense", 0.5)
 
         death_like_screen = (
@@ -2833,7 +4194,7 @@ class DoomEnv(gym.Env):
         )
 
         if game_state.get("level_complete", False):
-            reward += 100.0
+            reward += self.add_positive("direct_positive_reward", 100.0)
             self.level_completion_count += 1
             terminated = True
 
@@ -2846,14 +4207,17 @@ class DoomEnv(gym.Env):
             self.save_death_review_frames(reason="death")
 
         if self.stuck_counter >= 35:
-            reward -= 2.0
-            terminated = True
-            info["stuck_reset"] = True
-            self.episode_had_stuck_reset = True
-            self.save_death_review_frames(reason="stuck_reset")
+            reward += self.add_penalty("stuck_counter_no_reset_penalty", -15.0)
+            info["stuck_penalty"] = True
+            self.episode_had_stuck_reset = False
+            if not self.training_mode:
+                self.save_death_review_frames(reason="stuck_penalty")
 
         self._step_count += 1
         truncated = self._step_count >= self._max_episode_steps
+        reward += self.route_progress_reward(game_state)
+        reward += self.goal_attraction_bubble_reward(game_state)
+        #self.update_curriculum_from_progress(game_state)
 
         if terminated or truncated:
             self.controller.release_all()
@@ -2881,6 +4245,9 @@ class DoomEnv(gym.Env):
                 f"death={info.get('death', False)} "
                 f"stuck_reset={info.get('stuck_reset', False)}"
             )
+        
+        if self.use_shared_logic_reward:
+            reward = float(self.last_shared_debug.get("shared_reward_preview", reward))
 
         self.episode_reward_total += float(reward)
 
@@ -2893,13 +4260,90 @@ class DoomEnv(gym.Env):
                         f"{self.best_episode_reward:.2f}"
                     )
 
+        front_ratio = float(pre_wall_info.get("front_ratio", 0.0) or 0.0)
+        left_ratio = float(pre_wall_info.get("left_ratio", 0.0) or 0.0)
+        right_ratio = float(pre_wall_info.get("right_ratio", 0.0) or 0.0)
+
+        front_safe = front_ratio < 0.28
+        sides_safe = left_ratio < 0.38 and right_ratio < 0.38
+
+        can_use_exploration_override = (
+            self.retrace_lock_steps <= 0
+            and not getattr(self.retrace_navigator, "active", False)
+            and self.stuck_counter == 0
+            and self.wall_contact_steps == 0
+            and front_safe
+            and sides_safe
+        )
+
+        if self.wall_contact_steps > 0 and action in ["move_backward", "turn_left", "turn_right", "strafe_left", "strafe_right"]:
+            reward += self.add_positive("direct_positive_reward", 0.10)
+        self.reward_manager.add("wall_escape_attempt", 0.10)
+
+        if front_ratio < 0.25 and left_ratio < 0.35 and right_ratio < 0.35:
+            if self.wall_contact_steps > 0 or self.stuck_counter > 0:
+                reward += self.add_positive("direct_positive_reward", 0.25)
+        self.reward_manager.add("cleared_wall_pressure", 0.25)
+
         info["route_progress_level"] = self.route_progress_level
         info["best_route_progress_level"] = self.best_route_progress_level
         info["unique_tiles"] = len(self.visited_tiles)
         info["doors_used"] = self.door_interaction_count
         info["stuck_counter"] = self.stuck_counter
         info["sensory_emergency_active"] = self.sensory_emergency_active
-        
+
+        shared_move_explore = self._shared_movement_reward_only()
+        reward += shared_move_explore
+
+        self.last_shared_debug["reward_after_shared_movement_exploration"] = float(reward)
+
+        shared_wall = self._shared_wall_reward_only()
+        reward += shared_wall
+
+        self.last_shared_debug["reward_after_shared_wall"] = float(reward)
+
+        shared_object_scene = self._shared_object_scene_reward_only()
+        reward += shared_object_scene
+
+        self.last_shared_debug["reward_after_shared_object_scene"] = float(reward)
+
+        shared_route_curriculum = self._shared_route_curriculum_reward_only()
+        reward += shared_route_curriculum
+
+        self.last_shared_debug["reward_after_shared_route_curriculum"] = float(reward)
+
+        # Small preview blend remains useful while full replacement is off.
+        reward = self._blend_shared_reward(reward)
+
+        self.last_shared_debug["reward_after_shared_blend_before_full_mode"] = float(reward)
+
+        # Full shared reward mode is available but OFF by default.
+        reward = self._full_shared_reward_replacement(reward)
+
+        if death_like_screen:
+            reward -= 25.0
+            self.reward_manager.add("death_penalty", -25.0)
+            terminated = True
+            info["death"] = True
+            self.episode_had_death = True
+
+        if not self.training_mode:
+            self.save_death_review_frames(reason="death")
+
+        if self.stuck_counter >= 35:
+            reward += self.add_penalty("stuck_counter_no_reset_penalty", -15.0)
+            info["stuck_penalty"] = True
+            self.episode_had_stuck_reset = False
+            if not self.training_mode:
+                self.save_death_review_frames(reason="stuck_penalty")
+
+        if not self.training_mode:
+            self.save_death_review_frames(reason="stuck_reset")
+
+        self.last_shared_debug["final_reward_output"] = float(reward)
+        self.last_shared_debug["old_route_reward_scale"] = self.old_route_reward_scale
+        self.last_shared_debug["old_curriculum_reward_scale"] = self.old_curriculum_reward_scale
+        self.last_shared_debug["use_full_shared_reward_mode"] = self.use_full_shared_reward_mode
 
         return observation, float(reward), terminated, truncated, info
 
@@ -3067,7 +4511,81 @@ class DoomEnv(gym.Env):
     # Tracking / recording helpers
     # ---------------------------------------------------------
 
-    
+    def _build_shared_game_state(
+            self,
+            base_game_state,
+            object_result=None,
+            scene_result=None,
+            hud_result=None,
+        ):
+            """
+            Convert Doom Retro state + learned predictions into the same format
+            used by ViZDoom and SharedDoomLogic.
+
+            This does not control the game by itself.
+            It only prepares normalized debug/reward data.
+            """
+
+            if base_game_state is None:
+                base_game_state = {}
+
+            shared_game_state = build_doomretro_game_state(
+                base_game_state=base_game_state,
+                object_prediction=object_result,
+                scene_prediction=scene_result,
+                hud_prediction=hud_result,
+            )
+
+            return shared_game_state
+        
+    def exit_distance_progress_reward(self, game_state):
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        if x is None or y is None:
+            return 0.0
+
+        main_goal = self.level_guide.get("main_goal")
+        if not main_goal:
+            return 0.0
+
+        x = float(x)
+        y = float(y)
+        gx = float(main_goal["x"])
+        gy = float(main_goal["y"])
+
+        dist = ((x - gx) ** 2 + (y - gy) ** 2) ** 0.5
+
+        if not hasattr(self, "last_exit_distance"):
+            self.last_exit_distance = None
+
+        if not hasattr(self, "best_exit_distance"):
+            self.best_exit_distance = None
+
+        reward = 0.0
+
+        if self.last_exit_distance is not None:
+            improvement = self.last_exit_distance - dist
+
+            if improvement > 1.0:
+                reward += min(0.08, improvement / 128.0)
+                self.reward_manager.add("exit_distance_closer", reward)
+
+            elif improvement < -4.0:
+                penalty = min(0.10, abs(improvement) / 128.0)
+                reward -= penalty
+                self.reward_manager.add("exit_distance_farther", -penalty)
+
+        if self.best_exit_distance is None or dist < self.best_exit_distance - 8.0:
+            self.best_exit_distance = dist
+            reward += self.add_positive("direct_positive_reward", 0.10)
+            self.reward_manager.add("new_best_exit_distance", 0.10)
+
+        self.last_exit_distance = dist
+
+        return reward
+
+   
     def normalize_weapon_name(self, weapon_name):
         weapon = str(weapon_name or "").lower()
 
@@ -3093,6 +4611,428 @@ class DoomEnv(gym.Env):
             return "bfg"
 
         return weapon or "unknown"
+    
+    def _fmt_num(self, value, digits=1):
+        try:
+            if value is None:
+                return "None"
+            return f"{float(value):.{digits}f}"
+        except Exception:
+            return "None"
+        
+    def fast_enemy_reaction_action(self, action, game_state):
+        """
+        Fast emergency combat reaction.
+
+        Purpose:
+        - shoot immediately when enemy is centered and ammo exists
+        - turn toward enemy quickly when off-center
+        - dodge/retreat instead of fighting with 0 ammo
+        """
+
+        enemy_visible = bool(game_state.get("enemy_visible", False))
+        enemy_centered = bool(game_state.get("enemy_centered", False))
+        enemy_left = bool(game_state.get("enemy_left", False))
+        enemy_right = bool(game_state.get("enemy_right", False))
+        ammo = int(game_state.get("ammo", 0) or 0)
+        health = int(game_state.get("health", 100) or 100)
+
+        if not enemy_visible:
+            return action
+
+        # Do not let combat interrupt retrace/wall recovery.
+        if (
+            self.retrace_lock_steps > 0
+            or getattr(self.retrace_navigator, "active", False)
+            or self.stuck_counter >= 4
+        ):
+            return action
+
+        # No ammo = do not fight. Move.
+        if ammo <= 0:
+            if health <= 35:
+                return "move_backward"
+
+            if self._step_count % 2 == 0:
+                return "strafe_left"
+            return "strafe_right"
+
+        # Enemy centered + ammo = shoot immediately.
+        if enemy_centered:
+            return "shoot"
+
+        # Enemy not centered = snap aim faster.
+        if enemy_left:
+            return "turn_left"
+
+        if enemy_right:
+            return "turn_right"
+
+        return action
+        
+    def _shared_object_scene_reward_only(self):
+        """
+        Extract only object/scene shaping from SharedDoomLogic debug.
+
+        This uses Doom Retro ObjectPredictor / ScenePredictor indirectly
+        through perception.prediction_adapter.build_doomretro_game_state().
+        """
+
+        if not self.use_shared_object_scene_reward:
+            return 0.0
+
+        debug = self.last_shared_debug or {}
+
+        object_scene = debug.get("object_scene_reward", 0.0)
+        combat = debug.get("combat_reward", 0.0)
+        use_reward = debug.get("use_reward", 0.0)
+
+        try:
+            object_scene = float(object_scene)
+        except Exception:
+            object_scene = 0.0
+
+        try:
+            combat = float(combat)
+        except Exception:
+            combat = 0.0
+
+        try:
+            use_reward = float(use_reward)
+        except Exception:
+            use_reward = 0.0
+
+        total = (object_scene + combat + use_reward) * self.shared_object_scene_reward_scale
+
+        debug["shared_object_scene_component"] = object_scene
+        debug["shared_combat_component"] = combat
+        debug["shared_use_component"] = use_reward
+        debug["shared_object_scene_total"] = total
+
+        self.last_shared_debug = debug
+
+        return float(total)
+    
+    def goal_heading_reward(self, game_state):
+        x = game_state.get("x")
+        y = game_state.get("y")
+        angle = game_state.get("angle")
+
+        if x is None or y is None or angle is None:
+            return 0.0
+
+        target = self.get_active_goal_bubble_target(game_state)
+
+        if target is None:
+            return 0.0
+
+        x = float(x)
+        y = float(y)
+        angle = float(angle)
+
+        tx = float(target["x"])
+        ty = float(target["y"])
+
+        target_angle = math.degrees(math.atan2(ty - y, tx - x))
+        diff = abs((target_angle - angle + 180.0) % 345.0 - 180.0)
+
+        reward = 0.0
+
+        if diff <= 15:
+            reward += self.add_positive("direct_positive_reward", 0.05)
+            self.reward_manager.add("facing_goal", 0.05)
+        elif diff >= 90:
+            reward -= 0.05
+            self.reward_manager.add("facing_away_from_goal", -0.05)
+
+        return reward
+    
+    def main_goal_progress_reward(self, director_result):
+        """
+        Reward getting closer to the real level exit.
+
+        This should be stronger and more consistent than checkpoint rewards.
+        """
+
+        if director_result is None:
+            return 0.0
+
+        distance = director_result.get("distance")
+        distance_delta = float(director_result.get("distance_delta", 0.0) or 0.0)
+        hint = director_result.get("hint")
+
+        if distance is None:
+            return 0.0
+
+        reward = 0.0
+
+        # Moving closer to the real exit.
+        if distance_delta > 1.0:
+            progress_reward = min(0.12, distance_delta / 96.0)
+            reward += progress_reward
+            self.reward_manager.add("main_goal_closer", progress_reward)
+
+        # New best distance to exit.
+        if not hasattr(self, "best_main_goal_distance"):
+            self.best_main_goal_distance = None
+
+        if self.best_main_goal_distance is None:
+            self.best_main_goal_distance = float(distance)
+
+        if float(distance) < self.best_main_goal_distance - 8.0:
+            self.best_main_goal_distance = float(distance)
+            reward += self.add_positive("direct_positive_reward", 0.10)
+            self.reward_manager.add("main_goal_new_best", 0.10)
+
+        # Moving away from the exit.
+        if distance_delta < -6.0:
+            penalty = min(0.12, abs(distance_delta) / 96.0)
+            reward -= penalty
+            self.reward_manager.add("main_goal_moving_away", -penalty)
+
+        # Stuck while not progressing.
+        if hint == "recover_unstuck":
+            reward -= 0.08
+            self.reward_manager.add("main_goal_stuck", -0.08)
+
+        # Reached the actual exit area.
+        if hint == "goal_reached":
+            reward += self.add_positive("direct_positive_reward", 10.0)
+            self.reward_manager.add("main_goal_reached", 10.0)
+
+        return reward
+        
+    def _shared_wall_reward_only(self):
+        """
+        Extract only wall/stuck/depth-style reward from SharedDoomLogic debug.
+
+        For Doom Retro, depth_obs is usually None, but SharedDoomLogic can still
+        use scene/object/wall-style signals from the normalized game_state.
+        """
+
+        if not self.use_shared_wall_reward:
+            return 0.0
+
+        debug = self.last_shared_debug or {}
+
+        wall = debug.get("wall_reward", 0.0)
+
+        try:
+            wall = float(wall)
+        except Exception:
+            wall = 0.0
+
+        total = wall * self.shared_wall_reward_scale
+
+        debug["shared_wall_component"] = wall
+        debug["shared_wall_total"] = total
+
+        self.last_shared_debug = debug
+
+        return float(total)
+    
+    def combat_movement_reward(self, game_state, action, distance_moved):
+        enemy_visible = bool(game_state.get("enemy_visible", False))
+        enemy_centered = bool(game_state.get("enemy_centered", False))
+        ammo = int(game_state.get("ammo", 0) or 0)
+        health = int(game_state.get("health", 100) or 100)
+
+        reward = 0.0
+        moved = float(distance_moved or 0.0)
+
+        if not enemy_visible:
+            return 0.0
+
+        # Standing still in combat is bad.
+        if moved < 2.0 and action in ["turn_left", "turn_right", "shoot", "melee_attack"]:
+            reward -= 0.12
+            self.reward_manager.add("combat_standing_still", -0.12)
+
+        # Strafing/backing up while enemy is visible is useful.
+        if action in ["strafe_left", "strafe_right"] and moved >= 2.0:
+            reward += self.add_positive("direct_positive_reward", 0.08)
+            self.reward_manager.add("combat_strafe_movement", 0.08)
+
+        if action == "move_backward" and enemy_visible:
+            reward += self.add_positive("direct_positive_reward", 0.05)
+            self.reward_manager.add("combat_retreat_spacing", 0.05)
+
+        # Shooting rules.
+        if action == "shoot" and ammo <= 0:
+            reward -= 0.60
+            self.reward_manager.add("shoot_no_ammo", -0.60)
+
+        elif action == "shoot" and enemy_centered and ammo > 0:
+            reward += self.add_positive("direct_positive_reward", 0.30)
+            self.reward_manager.add("shoot_centered_with_ammo", 0.30)
+
+        elif action == "shoot" and enemy_visible and not enemy_centered and ammo > 0:
+            reward -= 0.15
+            self.reward_manager.add("shoot_not_centered", -0.15)
+
+        # Low health means movement is more important.
+        if health <= 35 and action in ["strafe_left", "strafe_right", "move_backward"]:
+            reward += self.add_positive("direct_positive_reward", 0.10)
+            self.reward_manager.add("low_health_dodge", 0.10)
+
+        return reward
+    
+    def weapon_ammo_policy_reward(self, game_state, action):
+        weapon = str(
+            game_state.get("weapon")
+            or game_state.get("selected_weapon")
+            or self.current_weapon_name
+            or "pistol"
+        ).lower()
+
+        ammo = int(game_state.get("ammo", 0) or 0)
+        enemy_visible = bool(game_state.get("enemy_visible", False))
+        enemy_centered = bool(game_state.get("enemy_centered", False))
+
+        reward = 0.0
+
+        rare_ammo_weapons = [
+            "rocket",
+            "rocket_launcher",
+            "plasma",
+            "plasma_rifle",
+            "bfg",
+        ]
+
+        common_ammo_weapons = [
+            "pistol",
+            "chaingun",
+            "shotgun",
+            "super_shotgun",
+        ]
+
+        using_rare_ammo = any(name in weapon for name in rare_ammo_weapons)
+        using_common_ammo = any(name in weapon for name in common_ammo_weapons)
+
+        if action == "shoot" and ammo <= 0:
+            reward -= 0.75
+            self.reward_manager.add("weapon_no_ammo_shot", -0.75)
+            return reward
+
+        if action == "shoot" and using_rare_ammo:
+            if enemy_visible and enemy_centered:
+                reward += self.add_positive("direct_positive_reward", 0.10)
+                self.reward_manager.add("rare_ammo_good_shot", 0.10)
+            else:
+                reward -= 0.35
+                self.reward_manager.add("rare_ammo_wasted", -0.35)
+
+        elif action == "shoot" and using_common_ammo:
+            if enemy_visible and enemy_centered:
+                reward += self.add_positive("direct_positive_reward", 0.15)
+                self.reward_manager.add("common_ammo_good_shot", 0.15)
+            elif not enemy_visible:
+                reward -= 0.12
+                self.reward_manager.add("common_ammo_wasted", -0.12)
+
+        return reward
+        
+    def _shared_movement_reward_only(self):
+        """
+        Extract only movement/exploration reward from SharedDoomLogic debug.
+
+        This lets Doom Retro gradually migrate reward components without
+        replacing the entire reward function at once.
+        """
+
+        if not self.use_shared_movement_reward:
+            return 0.0
+
+        debug = self.last_shared_debug or {}
+
+        movement = debug.get("movement_reward", 0.0)
+        exploration = debug.get("exploration_reward", 0.0)
+
+        try:
+            movement = float(movement)
+        except Exception:
+            movement = 0.0
+
+        try:
+            exploration = float(exploration)
+        except Exception:
+            exploration = 0.0
+
+        total = (movement + exploration) * self.shared_movement_reward_scale
+
+        debug["shared_movement_component"] = movement
+        debug["shared_exploration_component"] = exploration
+        debug["shared_movement_exploration_total"] = total
+
+        self.last_shared_debug = debug
+
+        return float(total)
+    
+    def _shared_route_curriculum_reward_only(self):
+        """
+        Extract route/curriculum shaping from SharedDoomLogic debug.
+
+        route_reward comes from SharedDoomLogic route zones.
+        curriculum_stage is debug/status, not usually a direct reward by itself.
+        """
+
+        if not self.use_shared_route_curriculum_reward:
+            return 0.0
+
+        debug = self.last_shared_debug or {}
+
+        route = debug.get("route_reward", 0.0)
+
+        try:
+            route = float(route)
+        except Exception:
+            route = 0.0
+
+        total = route * self.shared_route_curriculum_reward_scale
+
+        debug["shared_route_component"] = route
+        debug["shared_route_curriculum_total"] = total
+        debug["shared_curriculum_stage"] = debug.get("curriculum_stage")
+        debug["shared_curriculum_weights"] = debug.get("curriculum_weights")
+
+        self.last_shared_debug = debug
+
+        return float(total)
+    
+    def _full_shared_reward_replacement(self, base_reward):
+        """
+        Optional full replacement mode.
+
+        This replaces Doom Retro's reward with SharedDoomLogic's reward preview.
+        It is OFF by default because it is the riskiest migration step.
+        """
+
+        if not self.use_full_shared_reward_mode:
+            return float(base_reward)
+
+        debug = self.last_shared_debug or {}
+        shared_reward = debug.get("shared_reward_preview")
+
+        try:
+            shared_reward = float(shared_reward)
+        except Exception:
+            return float(base_reward)
+
+        scaled = shared_reward * self.full_shared_reward_scale
+
+        clipped = max(
+            -self.full_shared_reward_clip,
+            min(self.full_shared_reward_clip, scaled),
+        )
+
+        debug["full_shared_reward_raw"] = shared_reward
+        debug["full_shared_reward_scaled"] = scaled
+        debug["full_shared_reward_clipped"] = clipped
+        debug["base_reward_replaced_by_full_shared"] = float(base_reward)
+
+        self.last_shared_debug = debug
+
+        return float(clipped)
 
     def choose_weapon_key(self, game_state, object_result=None, enemy_visible=False, enemy_centered=False):
         """
@@ -3161,7 +5101,7 @@ class DoomEnv(gym.Env):
             if current_weapon == "rpg" and (barrel_visible or enemy_close or health < 45):
                 return "3", "avoid_rpg_self_damage"
             return "3", "safe_shotgun"
-        
+   
         # Only keep RPG for safer long-range situations.
         if current_weapon == "rpg":
             if enemy_seen and not enemy_close and not barrel_visible and health >= 60:
@@ -3187,9 +5127,54 @@ class DoomEnv(gym.Env):
             return "2", "low_ammo_pistol"
 
         return None, "keep_current"
+    
+    def action_prior_advice_reward(self, frame, action):
+        """
+        Advice-only reward from the ViZDoom teacher-trained action prior.
+
+        This does NOT override PPO. It only gives a tiny reward when PPO's
+        action agrees with the teacher-student action prior.
+        """
+
+        if not self.use_action_prior_advice:
+            return 0.0, None
+
+        if self.action_prior_advisor is None:
+            return 0.0, None
+
+        result = self.action_prior_advisor.predict(frame)
+
+        if not result.get("enabled", False):
+            return 0.0, result
+
+        advised_action = result.get("action_name")
+        confidence = float(result.get("confidence", 0.0))
+
+        reward = 0.0
+
+        if confidence >= self.action_prior_min_confidence:
+            if advised_action == action:
+                reward += self.action_prior_reward_scale
+            else:
+                reward -= self.action_prior_reward_scale * 0.25
+
+        step = getattr(self, "step_count", getattr(self, "current_step", 0))
+        if step % 100 == 0:
+            print(
+                f"[action_prior_reward] step={step} "
+                f"advised={advised_action} action={action} "
+                f"conf={confidence:.2f} reward={reward:.4f}"
+            )
+
+        return float(reward), result
 
     def route_progress_reward(self, game_state):
-        reward = 0.0
+        """
+        Sequential real-map route progress.
+
+        Only the next expected route zone can trigger. This prevents broad
+        overlapping bubbles from awarding later milestones too early.
+        """
 
         x = game_state.get("x")
         y = game_state.get("y")
@@ -3200,30 +5185,60 @@ class DoomEnv(gym.Env):
         x = float(x)
         y = float(y)
 
-        # Example placeholders — tune these from your real logs.
-        route_zones = [
-            ("spawn_exit", 600, 360, 120, 0.5),
-            ("right_route", 625, 360, 120, 0.8),
-            ("door_area", 700, 420, 140, 1.0),
-            ("combat_corridor", 850, 400, 160, 1.5),
-            ("exit_route", 1000, 500, 180, 2.0),
-        ]
+        route_zones = self.level_guide.get("route_zones", [])
 
-        for idx, (name, tx, ty, radius, zone_reward) in enumerate(route_zones, start=1):
-            dist = ((x - tx) ** 2 + (y - ty) ** 2) ** 0.5
+        if not route_zones:
+            return 0.0
 
-            if dist <= radius and self.route_progress_level < idx:
-                self.route_progress_level = idx
-                reward += zone_reward
-                self.reward_manager.add(f"route_progress_{name}", zone_reward)
+        next_idx = int(getattr(self, "route_progress_level", 0))
 
-                print(
-                    f"[route_progress] reached={name} "
-                    f"level={self.route_progress_level} "
-                    f"x={x:.1f} y={y:.1f} reward={zone_reward:.2f}"
-                )
+        if next_idx >= len(route_zones):
+            return 0.0
 
-        return reward
+        zone = route_zones[next_idx]
+
+        name = zone.get("name", f"route_zone_{next_idx}")
+        zx = float(zone.get("x", 0.0))
+        zy = float(zone.get("y", 0.0))
+        radius = float(zone.get("radius", 128.0))
+        zone_reward = float(zone.get("reward", 0.05))
+
+        dx = x - zx
+        dy = y - zy
+        dist = (dx * dx + dy * dy) ** 0.5
+
+        if dist <= radius:
+            self.route_zones_reached.add(name)
+            self.route_progress_level = next_idx + 1
+
+            print(
+                f"[route_progress] reached={name} "
+                f"level={self.route_progress_level} "
+                f"x={x:.1f} y={y:.1f} reward={zone_reward:.2f}"
+            )
+
+            return zone_reward
+
+        return 0.0
+
+
+    def doom_has_focus(self):
+        try:
+            expected = str(getattr(self.controller, "window_id", "")).strip()
+
+            if not expected:
+                return False
+
+            active = subprocess.check_output(
+                ["xdotool", "getactivewindow"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+
+            return active == expected
+
+        except Exception:
+            return True
 
     def smart_weapon_select(self, game_state, object_result=None, enemy_visible=False, enemy_centered=False):
         """
@@ -3264,6 +5279,246 @@ class DoomEnv(gym.Env):
         quantized = small // 32
 
         return hash(quantized.tobytes())
+    
+    def _blend_shared_reward(self, base_reward):
+        """
+        Blend a small amount of SharedDoomLogic reward into the existing
+        Doom Retro reward.
+
+        This is safer than fully replacing the reward.
+        """
+
+        if not self.use_shared_logic_reward_blend:
+            return float(base_reward)
+
+        shared_reward = self.last_shared_debug.get("shared_reward_preview")
+
+        try:
+            shared_reward = float(shared_reward)
+        except Exception:
+            return float(base_reward)
+
+        scaled = shared_reward * self.shared_logic_reward_scale
+
+        clipped = max(
+            -self.shared_logic_reward_clip,
+            min(self.shared_logic_reward_clip, scaled),
+        )
+
+        self.last_shared_debug["shared_reward_scaled"] = scaled
+        self.last_shared_debug["shared_reward_clipped"] = clipped
+        self.last_shared_debug["base_reward_before_shared_blend"] = float(base_reward)
+        self.last_shared_debug["final_reward_after_shared_blend"] = float(base_reward + clipped)
+
+        return float(base_reward + clipped)
+    
+    def strong_wall_penalty(self, action, wall_info, game_state):
+        """
+        Strong temporary wall penalty.
+
+        Purpose:
+        - punish moving into walls
+        - punish staying glued to walls
+        - punish repeated wall contact
+        - still allow turning/backing up as recovery
+        """
+
+        if not wall_info:
+            return 0.0
+
+        reward = 0.0
+
+        left_ratio = float(wall_info.get("left_ratio", 0.0) or 0.0)
+        front_ratio = float(wall_info.get("front_ratio", 0.0) or 0.0)
+        right_ratio = float(wall_info.get("right_ratio", 0.0) or 0.0)
+
+        front_wall = bool(wall_info.get("front_wall", False)) or front_ratio >= 0.35
+        side_wall = left_ratio >= 0.35 or right_ratio >= 0.35
+        heavy_wall_pressure = front_ratio >= 0.45 or left_ratio >= 0.50 or right_ratio >= 0.50
+
+        sensory_situation = game_state.get("sensory_situation")
+        stuck_or_looping = sensory_situation == "stuck_or_looping"
+
+        # 1. Biggest mistake: moving forward into a front wall.
+        if action == "move_forward" and front_wall:
+            reward -= 1.00
+            self.reward_manager.add("strong_forward_into_wall", -1.00)
+
+        # 2. Strong wall pressure near any side.
+        if heavy_wall_pressure:
+            reward -= 0.50
+            self.reward_manager.add("strong_wall_pressure", -0.50)
+
+        # 3. Side scraping is bad, but less bad than front collision.
+        elif side_wall:
+            reward -= 0.25
+            self.reward_manager.add("side_wall_scrape", -0.25)
+
+        # 4. Repeated wall contact gets worse over time.
+        if self.wall_contact_steps >= 2:
+            penalty = min(1.50, 0.20 * self.wall_contact_steps)
+            reward -= penalty
+            self.reward_manager.add("repeated_wall_contact", -penalty)
+
+        # 5. Wall + stuck loop is the worst case.
+        if stuck_or_looping and (front_wall or side_wall):
+            reward -= 1.00
+            self.reward_manager.add("stuck_against_wall", -1.00)
+
+        # 6. Do not punish recovery actions as hard.
+        if action in ["move_backward", "turn_left", "turn_right", "strafe_left", "strafe_right"]:
+            reward += self.add_positive("direct_positive_reward", 0.10)
+            self.reward_manager.add("wall_recovery_action", 0.10)
+
+        return reward
+    
+    def goal_attraction_bubble_reward(self, game_state):
+        """
+        Reverse wall-bubble reward.
+
+        The agent gets:
+        - small reward for being in the outer target bubble
+        - bigger reward for entering closer rings
+        - progress reward for reducing distance
+        - penalty for moving away after entering the bubble
+        - penalty for spinning/stalling inside the bubble
+        """
+
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        if x is None or y is None:
+            return 0.0
+
+        x = float(x)
+        y = float(y)
+
+        target = self.get_active_goal_bubble_target(game_state)
+
+        if target is None:
+            return 0.0
+
+        tx = float(target["x"])
+        ty = float(target["y"])
+        target_name = target.get("name", "unknown_goal")
+
+        dx = x - tx
+        dy = y - ty
+        dist = (dx * dx + dy * dy) ** 0.5
+
+        reward = 0.0
+
+        # Track best distance to this target.
+        if not hasattr(self, "goal_bubble_best_dist"):
+            self.goal_bubble_best_dist = {}
+
+        if not hasattr(self, "goal_bubble_last_dist"):
+            self.goal_bubble_last_dist = {}
+
+        if not hasattr(self, "goal_bubble_stall_steps"):
+            self.goal_bubble_stall_steps = {}
+
+        best_dist = self.goal_bubble_best_dist.get(target_name)
+        last_dist = self.goal_bubble_last_dist.get(target_name)
+
+        if best_dist is None:
+            best_dist = dist
+            self.goal_bubble_best_dist[target_name] = dist
+
+        if last_dist is None:
+            last_dist = dist
+
+        improvement = last_dist - dist
+
+        # -----------------------------
+        # Ring reward: closer = bigger
+        # -----------------------------
+        if dist <= 1024:
+            reward += self.add_positive("direct_positive_reward", 0.01)
+            self.reward_manager.add("goal_outer_bubble", 0.01)
+
+        if dist <= 768:
+            reward += self.add_positive("direct_positive_reward", 0.02)
+            self.reward_manager.add("goal_mid_outer_bubble", 0.02)
+
+        if dist <= 512:
+            reward += self.add_positive("direct_positive_reward", 0.04)
+            self.reward_manager.add("goal_mid_bubble", 0.04)
+
+        if dist <= 256:
+            reward += self.add_positive("direct_positive_reward", 0.08)
+            self.reward_manager.add("goal_inner_bubble", 0.08)
+
+        if dist <= 128:
+            reward += self.add_positive("direct_positive_reward", 0.15)
+            self.reward_manager.add("goal_core_bubble", 0.15)
+
+        # -----------------------------
+        # Delta reward: moving closer
+        # -----------------------------
+        if improvement > 2.0:
+            progress_reward = min(0.12, improvement / 128.0)
+            reward += progress_reward
+            self.reward_manager.add("goal_bubble_closer", progress_reward)
+
+            self.goal_bubble_stall_steps[target_name] = 0
+
+        elif improvement < -4.0:
+            penalty = min(0.20, abs(improvement) / 96.0)
+            reward -= penalty
+            self.reward_manager.add("goal_bubble_leaving", -penalty)
+
+        else:
+            self.goal_bubble_stall_steps[target_name] = (
+                self.goal_bubble_stall_steps.get(target_name, 0) + 1
+            )
+
+        # -----------------------------
+        # Best-distance reward
+        # -----------------------------
+        if dist < best_dist - 8.0:
+            self.goal_bubble_best_dist[target_name] = dist
+            reward += self.add_positive("direct_positive_reward", 0.10)
+            self.reward_manager.add("goal_bubble_new_best", 0.10)
+
+        # -----------------------------
+        # Anti-spin inside bubble
+        # -----------------------------
+        stall_steps = self.goal_bubble_stall_steps.get(target_name, 0)
+
+        if dist <= 512 and stall_steps >= 8:
+            penalty = min(0.30, 0.03 * stall_steps)
+            reward -= penalty
+            self.reward_manager.add("goal_bubble_spin_stall", -penalty)
+
+        self.goal_bubble_last_dist[target_name] = dist
+
+        return reward
+    
+    def get_active_goal_bubble_target(self, game_state):
+        """
+        Pick the next unreached route target.
+
+        This prevents the agent from camping the corridor.
+        Once a zone is reached, the active bubble moves forward.
+        """
+
+        route_zones = self.level_guide.get("route_zones", [])
+
+        reached = getattr(self, "route_zones_reached", set())
+
+        for zone in route_zones:
+            name = zone.get("name")
+
+            if name not in reached:
+                return zone
+
+        main_goal = self.level_guide.get("main_goal")
+
+        if main_goal is not None:
+            return main_goal
+
+        return None
 
     def _update_position_tracking(self, game_state, frame=None, motion=0.0, action=None):
         distance_moved = 0.0
@@ -3347,6 +5602,73 @@ class DoomEnv(gym.Env):
             score = self.preference_model(frame_tensor)
 
         return float(score.item())
+    
+    def stagnation_penalty(self, game_state, director_result=None):
+        x = game_state.get("x")
+        y = game_state.get("y")
+
+        if x is None or y is None:
+            return 0.0
+
+        x = float(x)
+        y = float(y)
+
+        reward = 0.0
+
+        if self.last_progress_position is not None:
+            old_x, old_y = self.last_progress_position
+            moved = ((x - old_x) ** 2 + (y - old_y) ** 2) ** 0.5
+
+            if moved < 2.0:
+                self.no_position_change_steps += 1
+            else:
+                self.no_position_change_steps = 0
+
+            if self.no_position_change_steps >= 4:
+                penalty = min(1.0, 0.10 * self.no_position_change_steps)
+                reward -= penalty
+                self.reward_manager.add("no_position_change", -penalty)
+
+                if self.no_position_change_steps % 5 == 0:
+                    print(
+                        f"[stagnation] no_position_change "
+                        f"steps={self.no_position_change_steps} "
+                        f"moved={moved:.2f} "
+                        f"penalty={penalty:.2f}"
+                    )
+
+        self.last_progress_position = (x, y)
+
+        if director_result is not None:
+            distance = director_result.get("distance")
+
+            if distance is not None:
+                distance = float(distance)
+
+                if self.last_distance_to_goal is not None:
+                    improvement = self.last_distance_to_goal - distance
+
+                    if improvement < 1.0:
+                        self.no_distance_progress_steps += 1
+                    else:
+                        self.no_distance_progress_steps = 0
+
+                    if self.no_distance_progress_steps >= 8:
+                        penalty = min(0.75, 0.05 * self.no_distance_progress_steps)
+                        reward -= penalty
+                        self.reward_manager.add("no_goal_distance_progress", -penalty)
+
+                        if self.no_distance_progress_steps % 5 == 0:
+                            print(
+                                f"[stagnation] no_goal_distance_progress "
+                                f"steps={self.no_distance_progress_steps} "
+                                f"improvement={improvement:.2f} "
+                                f"penalty={penalty:.2f}"
+                            )
+
+                self.last_distance_to_goal = distance
+
+        return reward
 
     def _record_step(self, frame, action, reward, game_state):
         if self.reward_overlay is not None:
@@ -3457,6 +5779,30 @@ class DoomEnv(gym.Env):
     # ---------------------------------------------------------
     # Combat / action helpers
     # ---------------------------------------------------------
+    def combat_readiness_reward(self, game_state, action):
+        enemy_visible = bool(game_state.get("enemy_visible", False))
+        enemy_centered = bool(game_state.get("enemy_centered", False))
+        ammo = int(game_state.get("ammo", 0) or 0)
+
+        reward = 0.0
+
+        if enemy_visible and ammo > 0:
+            reward += self.add_positive("direct_positive_reward", 0.03)
+            self.reward_manager.add("enemy_seen_with_ammo", 0.03)
+
+        if enemy_visible and enemy_centered and ammo > 0:
+            reward += self.add_positive("direct_positive_reward", 0.08)
+            self.reward_manager.add("enemy_centered_with_ammo", 0.08)
+
+        if action == "shoot" and enemy_visible and enemy_centered and ammo > 0:
+            reward += self.add_positive("direct_positive_reward", 0.20)
+            self.reward_manager.add("valid_shoot_attempt", 0.20)
+
+        if action == "shoot" and not enemy_visible:
+            reward -= 0.10
+            self.reward_manager.add("bad_shoot_no_enemy", -0.10)
+
+        return reward
 
     def weapon_context_reward(
         self,
@@ -3510,20 +5856,20 @@ class DoomEnv(gym.Env):
         # -----------------------------------------------------
 
         if trusted_enemy_visible and weapon in ["pistol", "shotgun", "chaingun", "plasma"]:
-            reward += 0.20
+            reward += self.add_positive("direct_positive_reward", 0.20)
             self.reward_manager.add("good_combat_weapon_context", 0.20)
 
         if enemy_close and weapon == "melee":
-            reward += 0.30
+            reward += self.add_positive("direct_positive_reward", 0.30)
             self.reward_manager.add("melee_close_context", 0.30)
 
         if enemy_mid_or_far and weapon in ["shotgun", "chaingun", "plasma"]:
-            reward += 0.25
+            reward += self.add_positive("direct_positive_reward", 0.25)
             self.reward_manager.add("midrange_weapon_context", 0.25)
 
         if weapon == "rpg":
             if trusted_enemy_visible and not enemy_close and not barrel_visible and health >= 60:
-                reward += 0.30
+                reward += self.add_positive("direct_positive_reward", 0.30)
                 self.reward_manager.add("safe_rpg_context", 0.30)
             else:
                 reward += self.add_penalty("unsafe_rpg_context", -0.80)
@@ -3642,43 +5988,94 @@ class DoomEnv(gym.Env):
 
         # Already roughly aimed; leave shoot decision to vision_combat_action().
         return action
+    
+    def goal_progress_reward(self, director_result):
+        """
+        Small dense reward for moving closer to the current director target.
+
+        This helps the agent understand:
+        - closer to goal = good
+        - small progress matters
+        - route movement should continue
+        """
+
+        if director_result is None:
+            return 0.0
+
+        distance_delta = float(director_result.get("distance_delta", 0.0) or 0.0)
+
+        reward = 0.0
+
+        if distance_delta > 1.0:
+            reward += self.add_positive("direct_positive_reward", 0.03)
+            self.reward_manager.add("small_goal_progress", 0.03)
+
+        if distance_delta > 8.0:
+            reward += self.add_positive("direct_positive_reward", 0.07)
+            self.reward_manager.add("medium_goal_progress", 0.07)
+
+        if distance_delta > 20.0:
+            reward += self.add_positive("direct_positive_reward", 0.10)
+            self.reward_manager.add("large_goal_progress", 0.10)
+
+        if distance_delta < -12.0:
+            reward -= 0.08
+            self.reward_manager.add("moving_away_from_goal", -0.08)
+
+        return reward
 
     def exploration_assist_action(self, action, enemy_visible, distance_moved=None, motion=None):
-        if enemy_visible:
-            return action
+        """
+        Advisory-only exploration.
 
-        if action in ["shoot", "melee_attack"]:
-            return "move_forward"
-
-        if self.wall_contact_steps >= 2 or self.stuck_counter > 12:
-            cycle = self._step_count % 6
-
-            if cycle == 0:
-                return "move_backward"
-            if cycle == 1:
-                return "turn_right"
-            if cycle == 2:
-                return "turn_right"
-            if cycle == 3:
-                return "strafe_left"
-            if cycle == 4:
-                return "move_forward"
-
-            return "turn_left"
-
-        if action in ["turn_left", "turn_right"]:
-            if self._step_count - self.last_aim_assist_step > 10:
-                return "move_forward"
-
-        if (
-            distance_moved is not None
-            and motion is not None
-            and distance_moved <= 0.0
-            and motion < 1.0
-        ):
-            return "move_forward"
-
+        Keep this helper available for logging/future reward shaping,
+        but never replace PPO movement choices during route learning.
+        """
         return action
+    
+    def save_world_debug_frame(self, frame, game_state, world_mode):
+        """
+        Saves labeled frames for later vision/sensory training.
+
+        These are not expert action labels.
+        These are world-understanding labels.
+        """
+
+        if not getattr(self, "collect_world_images", False):
+            return
+
+        if frame is None:
+            return
+
+        if self._step_count % 10 != 0:
+            return
+
+        x = game_state.get("x", 0)
+        y = game_state.get("y", 0)
+        health = game_state.get("health", 0)
+        ammo = game_state.get("ammo", 0)
+
+        label = str(world_mode or "unknown")
+
+        label_dir = os.path.join(self.world_image_dir, label)
+        os.makedirs(label_dir, exist_ok=True)
+
+        filename = (
+            f"step_{self._step_count:06d}"
+            f"_x_{float(x):.1f}"
+            f"_y_{float(y):.1f}"
+            f"_hp_{int(health)}"
+            f"_ammo_{int(ammo)}.png"
+        )
+
+        path = os.path.join(label_dir, filename)
+
+        try:
+            cv2.imwrite(path, frame)
+            self.vision_frame_count += 1
+        except Exception as e:
+            print(f"[world_image_save] failed: {e}")
+
 
     def penalty_scale(self):
         if not self.strong_penalty_mode:
@@ -3686,6 +6083,35 @@ class DoomEnv(gym.Env):
 
         progress = min(1.0, self._step_count / float(self.penalty_decay_steps))
         return 4.0 - (3.0 * progress)
+
+
+    def add_positive(self, name, base_reward):
+        """
+        TEST MODE:
+        Triple positive rewards.
+
+        This keeps your hard negative reward experiment intact while making
+        successful behavior easier for PPO to notice.
+
+        Example:
+        +0.35 -> +1.05
+        +3.00 -> +9.00
+        +15.00 -> +45.00
+        """
+
+        try:
+            value = float(base_reward)
+        except Exception:
+            return base_reward
+
+        if value > 0:
+            boosted = value * 3.0
+            self.reward_manager.add(name, boosted)
+            return boosted
+
+        self.reward_manager.add(name, value)
+        return value
+
 
     def add_penalty(self, name, base_penalty):
         scaled_penalty = base_penalty * self.penalty_scale()
@@ -3859,16 +6285,32 @@ class DoomEnv(gym.Env):
                 near_spawn_boundary = False
 
         # Correct fake-open predictions.
-        if label == "open_path":
-            if stuck_by_body or no_translation or near_spawn_boundary:
+        if label in ["open_path", "unclear", "normal_navigation"]:
+            # Half-walls / rails can look visually open above the rail,
+            # but body feedback says the path is blocked.
+            if front_ratio >= 0.52 and (stuck_by_body or no_translation):
+                label = "half_wall_rail"
+                confidence = max(confidence, 0.88)
+
+            elif stuck_by_body or no_translation or near_spawn_boundary:
                 label = "boundary_or_stuck_wall"
                 confidence = max(confidence, 0.90)
-            elif front_ratio >= 0.55:
+
+            elif front_ratio >= 0.65:
                 label = "front_wall"
+                confidence = max(confidence, 0.80)
+
+            elif front_ratio >= 0.52:
+                label = "half_wall_rail"
                 confidence = max(confidence, 0.75)
+
             elif side_ratio >= 0.85:
                 label = "obstacle"
                 confidence = max(confidence, 0.70)
+
+            elif side_ratio >= 0.50:
+                label = "side_rail"
+                confidence = max(confidence, 0.65)
 
         # Very low-confidence enemy in navigation stages should not hijack movement.
         # Your current dataset is enemy-heavy, so be conservative outside combat.
@@ -3916,7 +6358,7 @@ class DoomEnv(gym.Env):
             wall_info.get("front_wall", False)
             or front_ratio >= 0.62
             or (
-                scene_label in ["front_wall", "obstacle", "boundary_or_stuck_wall"]
+                scene_label in ["front_wall", "obstacle", "boundary_or_stuck_wall", "half_wall_rail"]
                 and scene_confidence >= 0.85
                 and front_ratio >= 0.45
             )
@@ -4024,7 +6466,7 @@ class DoomEnv(gym.Env):
             self.corner_trap_position = current_tile
             self.corner_trap_steps = 0
 
-        return self.corner_trap_steps >= 20
+        return self.corner_trap_steps >= 120
 
     def wall_assist_action(self, action, frame, enemy_visible, distance_moved=None, motion=None):
         if action == "move_backward" and self.stuck_counter < 8 and self.corner_trap_steps < 12:
@@ -4241,6 +6683,9 @@ class DoomEnv(gym.Env):
         level = bubble["level"]
         direction = bubble["direction"]
 
+        if getattr(self, "hard_180_recovery_steps", 0) > 0:
+            return action
+
         if level == "green":
             return action
 
@@ -4299,14 +6744,14 @@ class DoomEnv(gym.Env):
 
         # Very close enemies should trigger retreat or strafe.
         if enemy_close and action in ["move_backward", "strafe_left", "strafe_right"]:
-            reward += 0.35
+            reward += self.add_positive("direct_positive_reward", 0.35)
 
         if enemy_very_close and action == "move_forward":
             reward -= 1.25
 
         # If taking damage, reward evasive movement.
         if health_delta < 0 and action in ["move_backward", "strafe_left", "strafe_right"]:
-            reward += 0.75
+            reward += self.add_positive("direct_positive_reward", 0.75)
 
         # Standing close and using/shooting without repositioning can be risky.
         if enemy_very_close and action == "use":
@@ -4397,11 +6842,11 @@ class DoomEnv(gym.Env):
         target_angle = np.degrees(np.arctan2(dy, dx))
 
         # Normalize both angles to 0-360.
-        current_angle = float(angle) % 360.0
-        target_angle = float(target_angle) % 360.0
+        current_angle = float(angle) % 345.0
+        target_angle = float(target_angle) % 345.0
 
         # Shortest signed angular difference: -180 to +180.
-        diff = (target_angle - current_angle + 180.0) % 360.0 - 180.0
+        diff = (target_angle - current_angle + 180.0) % 345.0 - 180.0
 
         return diff
 
@@ -4600,29 +7045,102 @@ class DoomEnv(gym.Env):
         ]
 
         if action == "move_forward" and front_blocked and distance_moved < 1.0:
-            reward += self.add_penalty("wall_sensor_forward_blocked", -1.5)
+            reward += self.add_penalty("wall_sensor_forward_blocked", -15.0)
 
         if movement_action and near_wall and distance_moved < 0.5 and motion < 1.0:
-            reward += self.add_penalty("wall_sensor_no_progress_near_wall", -1.0)
+            reward += self.add_penalty("wall_sensor_no_progress_near_wall", -15.0)
 
         if near_wall and action in ["move_backward", "turn_left", "turn_right", "strafe_left", "strafe_right"]:
-            reward += 0.15
-            self.reward_manager.add("wall_sensor_escape_action", 0.15)
+            reward += self.add_positive("wall_sensor_escape_action", 15.0)
+            self.reward_manager.add("wall_sensor_escape_action", 45.0)
 
         if safest == "right" and action in ["turn_right", "strafe_right"]:
-            reward += 0.08
+            reward += self.add_positive("direct_positive_reward", 0.08)
             self.reward_manager.add("wall_sensor_escape_right", 0.08)
 
         if safest == "left" and action in ["turn_left", "strafe_left"]:
-            reward += 0.08
+            reward += self.add_positive("direct_positive_reward", 0.08)
             self.reward_manager.add("wall_sensor_escape_left", 0.08)
 
         if obstacle_pressure < 0.25 and action == "move_forward" and distance_moved > 3.0:
-            reward += 0.05
+            reward += self.add_positive("direct_positive_reward", 0.05)
             self.reward_manager.add("wall_sensor_open_forward", 0.05)
 
         return reward
+    
 
+    def tactical_weapon_action(
+        self,
+        action,
+        game_state,
+        object_result=None,
+        wall_info=None,
+    ):
+        """
+        Situational weapon swapping.
+
+        This prevents blind swap_weapon spam while still allowing:
+        - berserk/fist for very close enemies
+        - guns for medium/far enemies
+        - rockets only for groups at safe distance
+        """
+
+        if self.curriculum_stage < 3:
+            if action == "swap_weapon":
+                self.last_forced_weapon_reason = "swap_blocked_before_combat_stage"
+                return "move_forward"
+            return action
+
+        if action != "swap_weapon":
+            return action
+
+        if self._step_count - self.last_weapon_swap_step < self.weapon_swap_cooldown:
+            self.last_forced_weapon_reason = "swap_cooldown"
+            return "move_backward"
+
+        enemy_visible = bool(game_state.get("enemy_visible", False))
+        enemy_centered = bool(game_state.get("enemy_centered", False))
+        enemy_distance_tiles = self.infer_enemy_distance_tiles(game_state, object_result)
+        enemy_count = self.infer_enemy_count(game_state, object_result)
+
+        current_weapon = str(
+            game_state.get("weapon", self.current_weapon_name)
+        ).lower()
+
+        front_ratio = 0.0
+        if wall_info:
+            front_ratio = float(wall_info.get("front_ratio", 0.0))
+
+        rocket_unsafe = (
+            front_ratio >= 0.45
+            or (
+                enemy_distance_tiles is not None
+                and enemy_distance_tiles < 4.0
+            )
+        )
+
+        if not enemy_visible:
+            self.last_forced_weapon_reason = "swap_blocked_no_enemy"
+            return "move_forward"
+
+        if self.has_berserk and enemy_distance_tiles is not None:
+            if enemy_distance_tiles <= 1.5 and enemy_centered:
+                self.last_weapon_swap_step = self._step_count
+                self.last_forced_weapon_reason = "berserk_close_enemy"
+                return "swap_weapon"
+
+            if current_weapon in ["fist", "chainsaw", "riptor"] and enemy_distance_tiles > 2.0:
+                self.last_weapon_swap_step = self._step_count
+                self.last_forced_weapon_reason = "leave_melee_range"
+                return "swap_weapon"
+
+        if enemy_count >= 2 and not rocket_unsafe:
+            self.last_weapon_swap_step = self._step_count
+            self.last_forced_weapon_reason = "group_enemy_safe_rocket"
+            return "swap_weapon"
+
+        self.last_forced_weapon_reason = "swap_not_contextual"
+        return "shoot" if enemy_centered else "move_backward"
 
     def sanitize_action(self, action, game_state, enemy_visible):
         """
@@ -4635,6 +7153,19 @@ class DoomEnv(gym.Env):
         config = self.get_stage_config()
 
         ammo = int(game_state.get("ammo", 0) or 0)
+
+        if ammo <= 0 and action == "shoot":
+            before = action
+
+            if self.stuck_counter >= 3:
+                action = "move_backward"
+            elif self._step_count % 2 == 0:
+                action = "strafe_left"
+            else:
+                action = "strafe_right"
+
+            print(f"[override] no_ammo: {before} -> {action}")
+
         current_weapon = str(game_state.get("weapon", "")).lower()
 
         is_melee_weapon = (

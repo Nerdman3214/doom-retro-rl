@@ -171,21 +171,45 @@ def setup_game(visible=False):
 
     if os.path.exists(IWAD):
         game.set_doom_game_path(IWAD)
+    else:
+        raise FileNotFoundError(f"IWAD not found: {IWAD}")
+
+    # Important: force a playable map.
+    game.set_doom_map("E1M1")
 
     game.set_window_visible(visible)
     game.set_mode(vzd.Mode.PLAYER)
+
+    if hasattr(game, "set_sound_enabled"):
+        game.set_sound_enabled(False)
+
+    if hasattr(game, "set_console_enabled"):
+        game.set_console_enabled(False)
+
+    if hasattr(game, "set_episode_start_time"):
+        game.set_episode_start_time(10)
+
+    if hasattr(game, "set_episode_timeout"):
+        game.set_episode_timeout(2100)
+
     game.set_screen_resolution(vzd.ScreenResolution.RES_320X240)
     game.set_screen_format(vzd.ScreenFormat.RGB24)
 
     game.set_depth_buffer_enabled(True)
     game.set_labels_buffer_enabled(True)
-    game.set_automap_buffer_enabled(True)
     game.set_objects_info_enabled(True)
     game.set_sectors_info_enabled(True)
 
-    game.set_automap_mode(vzd.AutomapMode.OBJECTS)
-    game.set_automap_rotate(False)
-    game.set_automap_render_textures(False)
+    # Automap can fail on some setups, so keep it optional.
+    try:
+        game.set_automap_buffer_enabled(True)
+        game.set_automap_mode(vzd.AutomapMode.OBJECTS)
+        game.set_automap_rotate(False)
+        game.set_automap_render_textures(False)
+        print("[vizdoom_geometry] automap enabled")
+    except Exception as e:
+        print(f"[vizdoom_geometry] automap disabled: {e}")
+        game.set_automap_buffer_enabled(False)
 
     game.set_available_buttons(
         [
@@ -204,7 +228,7 @@ def setup_game(visible=False):
         [
             vzd.GameVariable.HEALTH,
             vzd.GameVariable.ARMOR,
-            vzd.GameVariable.AMMO2,
+            vzd.GameVariable.AMMO1,
             vzd.GameVariable.SELECTED_WEAPON,
             vzd.GameVariable.KILLCOUNT,
             vzd.GameVariable.ITEMCOUNT,
@@ -215,9 +239,10 @@ def setup_game(visible=False):
         ]
     )
 
+    print(f"[vizdoom_geometry] init iwad={IWAD} map=E1M1 visible={visible}")
+
     game.init()
     return game
-
 
 def random_action():
     # button order:

@@ -3,16 +3,12 @@ from collections import deque
 
 class RetraceNavigator:
     """
-    Short-term recovery planner.
+    Short-term wall/stuck recovery planner.
 
-    Purpose:
-    - prevent repeated wall/object collisions
-    - back out of local traps
-    - search left/right for openings
-    - exit recovery once movement improves
-
-    This does not know the level layout.
-    It only uses recent position, movement, wall ratios, and stuck state.
+    Goal:
+    - back away from wall/corner
+    - rotate toward the more open side
+    - only test forward when the front view is open enough
     """
 
     def __init__(self, history_size=30):
@@ -21,7 +17,7 @@ class RetraceNavigator:
         self.phase = "idle"
         self.phase_step = 0
         self.total_steps = 0
-        self.max_total_steps = 24
+        self.max_total_steps = 32
         self.preferred_side = "right"
         self.last_escape_action = None
 
@@ -43,13 +39,27 @@ class RetraceNavigator:
 
         self.position_history.append((float(x), float(y)))
 
-    def should_start(self, sensory_state, wall_info, distance_moved, motion, stuck_counter, wall_contact_steps):
+    def should_start(
+        self,
+        sensory_state,
+        wall_info,
+        distance_moved,
+        motion,
+        stuck_counter,
+        wall_contact_steps,
+    ):
         situation = sensory_state.get("situation")
+
+        front_ratio = float(wall_info.get("front_ratio", 0.0) or 0.0)
+        left_ratio = float(wall_info.get("left_ratio", 0.0) or 0.0)
+        right_ratio = float(wall_info.get("right_ratio", 0.0) or 0.0)
 
         front_blocked = (
             wall_info.get("front_wall", False)
-            or wall_info.get("front_ratio", 0.0) >= 0.52
+            or front_ratio >= 0.35
         )
+
+        side_wall_pressure = max(left_ratio, right_ratio) >= 0.30
 
         low_movement = (
             distance_moved is not None
@@ -60,11 +70,11 @@ class RetraceNavigator:
 
         repeated_stuck = (
             situation in ["stuck_or_looping", "front_blocked"]
-            or stuck_counter >= 8
-            or wall_contact_steps >= 3
+            or stuck_counter >= 4
+            or wall_contact_steps >= 2
         )
 
-        return repeated_stuck and (front_blocked or low_movement)
+        return repeated_stuck and (front_blocked or side_wall_pressure or low_movement)
 
     def start(self, wall_info):
         self.active = True
@@ -72,14 +82,11 @@ class RetraceNavigator:
         self.phase_step = 0
         self.total_steps = 0
 
-        left = wall_info.get("left_ratio", 0.0)
-        right = wall_info.get("right_ratio", 0.0)
+        left = float(wall_info.get("left_ratio", 0.0) or 0.0)
+        right = float(wall_info.get("right_ratio", 0.0) or 0.0)
 
-        # Turn toward the more open side.
-        if left < right:
-            self.preferred_side = "left"
-        else:
-            self.preferred_side = "right"
+        # Lower wall ratio = more open.
+        self.preferred_side = "left" if left <= right else "right"
 
     def stop(self):
         self.active = False
@@ -88,27 +95,36 @@ class RetraceNavigator:
         self.total_steps = 0
         self.last_escape_action = None
 
-    def get_action(self, sensory_state, wall_info, distance_moved, motion, stuck_counter, wall_contact_steps):
-        """
-        Returns:
-            action string or None
-        """
+    def front_is_safe(self, wall_info):
+        front_ratio = float(wall_info.get("front_ratio", 0.0) or 0.0)
+        return front_ratio < 0.30
 
-        self.total_steps += 1
-        self.phase_step += 1
+    def turn_action(self):
+        return "turn_left" if self.preferred_side == "left" else "turn_right"
 
-        # Exit retrace mode once movement improves.
+    def opposite_turn_action(self):
+        return "turn_right" if self.preferred_side == "left" else "turn_left"
+
+    def strafe_action(self):
+        return "strafe_left" if self.preferred_side == "left" else "strafe_right"
+
+    def get_action(
+        self,
+        sensory_state,
+        wall_info,
+        distance_moved,
+        motion,
+        stuck_counter,
+        wall_contact_steps,
+    ):
         if self.active:
-            if distance_moved is not None and motion is not None:
-                if distance_moved > 6.0 and motion > 2.0 and self.total_steps >= 4:
-                    self.stop()
-                    return None
+            self.total_steps += 1
+            self.phase_step += 1
 
             if self.total_steps > self.max_total_steps:
                 self.stop()
                 return None
-
-        if not self.active:
+        else:
             if self.should_start(
                 sensory_state=sensory_state,
                 wall_info=wall_info,
@@ -121,12 +137,8 @@ class RetraceNavigator:
             else:
                 return None
 
-        # -----------------------------------------------------
-        # Recovery plan
-        # -----------------------------------------------------
-
         if self.phase == "back_up":
-            if self.phase_step <= 3:
+            if self.phase_step <= 4:
                 self.last_escape_action = "move_backward"
                 return "move_backward"
 
@@ -134,8 +146,9 @@ class RetraceNavigator:
             self.phase_step = 0
 
         if self.phase == "turn_to_opening":
-            if self.phase_step <= 4:
-                action = "turn_left" if self.preferred_side == "left" else "turn_right"
+            # Stronger rotation, closer to a 90-degree turn.
+            if self.phase_step <= 8:
+                action = self.turn_action()
                 self.last_escape_action = action
                 return action
 
@@ -143,6 +156,13 @@ class RetraceNavigator:
             self.phase_step = 0
 
         if self.phase == "test_forward":
+            if not self.front_is_safe(wall_info):
+                self.phase = "turn_to_opening"
+                self.phase_step = 0
+                action = self.turn_action()
+                self.last_escape_action = action
+                return action
+
             if self.phase_step <= 4:
                 self.last_escape_action = "move_forward"
                 return "move_forward"
@@ -152,7 +172,7 @@ class RetraceNavigator:
 
         if self.phase == "strafe_search":
             if self.phase_step <= 4:
-                action = "strafe_left" if self.preferred_side == "left" else "strafe_right"
+                action = self.strafe_action()
                 self.last_escape_action = action
                 return action
 
@@ -160,8 +180,8 @@ class RetraceNavigator:
             self.phase_step = 0
 
         if self.phase == "opposite_turn":
-            if self.phase_step <= 4:
-                action = "turn_right" if self.preferred_side == "left" else "turn_left"
+            if self.phase_step <= 6:
+                action = self.opposite_turn_action()
                 self.last_escape_action = action
                 return action
 
@@ -169,11 +189,13 @@ class RetraceNavigator:
             self.phase_step = 0
 
         if self.phase == "test_forward_again":
+            if not self.front_is_safe(wall_info):
+                self.stop()
+                return None
+
             if self.phase_step <= 4:
                 self.last_escape_action = "move_forward"
                 return "move_forward"
 
-            self.stop()
-            return None
-
+        self.stop()
         return None
