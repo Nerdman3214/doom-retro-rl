@@ -1,0 +1,75 @@
+# Git / editor junk
+.git/
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+*.swo
+*~
+
+# Virtual envs
+.venv/
+venv/
+.env
+
+# RL generated data
+frames/
+frame*/
+screenshots/
+videos/
+recordings/
+runs/
+logs/
+traces/
+replays/
+datasets/
+data/
+outputs/
+results/
+tmp/
+backups/
+old_backups/
+reset_backups/
+cleanup_backups_*/
+
+# Generated data files
+*.json
+*.jsonl
+*.csv
+*.log
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.mp4
+*.avi
+*.mkv
+*.gif
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tar
+*.tar.gz
+*.zip
+*.7z
+
+# Doom/game assets
+*.wad
+*.pk3
+*.deh
+
+# Build/binary files
+*.o
+*.so
+*.dll
+*.dylib
+*.exe
+*.bin
+*.out
+
+# Large vendored app/framework folders
+xcode/
+*.framework/
