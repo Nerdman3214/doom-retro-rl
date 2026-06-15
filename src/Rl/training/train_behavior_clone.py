@@ -16,12 +16,18 @@ ACTION_TO_IDX = {a: i for i, a in enumerate(ActionSpace.ACTIONS)}
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 EVENT_WEIGHTS = {
-    "enemy_seen":        3.0,
+    "enemy_seen":        5.0,  # Boosted for stronger shoot confidence
     "took_damage":       3.0,
     "low_health_escape": 4.0,
     "door_open":         2.0,
     "pickup_collected":  2.0,
     "none":              1.0,
+}
+
+# Action-specific multipliers to boost confidence for critical actions
+ACTION_WEIGHTS = {
+    "shoot": 2.0,       # Boost shoot action
+    "use": 2.5,         # Boost use action more aggressively
 }
 
 OUT_W, OUT_H = 84, 84
@@ -73,6 +79,9 @@ class EventDemoDataset(Dataset):
             if action_name is None:
                 continue
             weight = EVENT_WEIGHTS.get(event, 1.0)
+            # Apply action-specific boosting for critical actions
+            if action_name in ACTION_WEIGHTS:
+                weight *= ACTION_WEIGHTS[action_name]
             self.samples.append((frame, action_name, weight))
 
         print(f"Loaded {len(self.samples)} samples from {pkl_path}.")
@@ -90,7 +99,7 @@ class EventDemoDataset(Dataset):
             return "turn_right_shoot" if shoot else "turn_right"
         if shoot:
             return "shoot"
-        if "Key.space" in keys:
+        if "Key.space" in keys or "Key.e" in keys or "'e'" in keys:
             return "use"
         return None
 
@@ -111,7 +120,7 @@ class EventDemoDataset(Dataset):
 def train():
     ACTION_SPACE = len(ActionSpace.ACTIONS)
     BATCH_SIZE = 32
-    EPOCHS = 10
+    EPOCHS = 15  # Increased epochs for better convergence with boosted weights
 
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     # Prefer event-tagged demo; fall back to plain human recording.
