@@ -1,0 +1,316 @@
+import numpy as np
+import cv2
+
+
+class FrameProcessor:
+    def __init__(self, width=84, height=84):
+        self.width = width
+        self.height = height
+        self.prev_gray = None
+
+    # ---------------------------------------------------------
+    # Core preprocessing
+    # ---------------------------------------------------------
+
+    def preprocess(self, frame):
+        """
+        Converts raw BGR/RGB frame into 84x84 grayscale uint8.
+        Most screenshot/cv2 paths are BGR, so this uses BGR2GRAY.
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        resized = cv2.resize(gray, (self.width, self.height))
+        return resized.astype(np.uint8)
+
+    def extract(self, frame):
+        obs = self.preprocess(frame)
+        motion = self.motion(frame)
+        cx, cy = self.center_of_mass(frame)
+        return obs, motion, cx, cy
+
+    # ---------------------------------------------------------
+    # Motion / attention
+    # ---------------------------------------------------------
+
+    def motion(self, frame):
+        gray = self.preprocess(frame)
+
+        if self.prev_gray is None:
+            self.prev_gray = gray
+            return 0.0
+
+        diff = np.abs(gray.astype(np.int16) - self.prev_gray.astype(np.int16))
+        self.prev_gray = gray
+        return float(np.mean(diff))
+
+    def center_of_mass(self, frame):
+        gray = self.preprocess(frame)
+        h, w = gray.shape
+
+        y, x = np.indices((h, w))
+        total = float(gray.sum()) + 1e-8
+
+        cx = float((x * gray).sum()) / total
+        cy = float((y * gray).sum()) / total
+
+        norm_x = (cx / w) * 2.0 - 1.0
+        norm_y = (cy / h) * 2.0 - 1.0
+
+        return norm_x, norm_y
+
+    def attention_crop(self, frame, cx, cy, size=42):
+        h, w = frame.shape[:2]
+
+        x = int((cx + 1.0) * w / 2.0)
+        y = int((cy + 1.0) * h / 2.0)
+
+        x1 = max(0, x - size)
+        x2 = min(w, x + size)
+        y1 = max(0, y - size)
+        y2 = min(h, y + size)
+
+        return frame[y1:y2, x1:x2]
+
+    # ---------------------------------------------------------
+    # Enemy/color feature helpers
+    # BGR convention:
+    #   channel 0 = blue
+    #   channel 1 = green
+    #   channel 2 = red
+    # ---------------------------------------------------------
+
+    def channel_diff_mean(self, frame, c1=2, c2=1):
+        if frame is None or frame.size == 0:
+            return 0.0
+
+        diff = frame[:, :, c1].astype(np.int16) - frame[:, :, c2].astype(np.int16)
+        return float(np.mean(diff))
+
+    def centre_channel_diff_mean(self, frame, c1=2, c2=1, radius=32):
+        region = self._center_crop(frame, radius)
+        return self.channel_diff_mean(region, c1=c1, c2=c2)
+
+    def centre_channel_count(self, frame, c1=2, c2=1, threshold=20, radius=40):
+        region = self._center_crop(frame, radius)
+
+        if region is None or region.size == 0:
+            return 0
+
+        diff = region[:, :, c1].astype(np.int16) - region[:, :, c2].astype(np.int16)
+        return int(np.sum(diff > threshold))
+
+    def centre_channel_x_mean(self, frame, c1=2, c2=1, threshold=20, radius=40):
+        region = self._center_crop(frame, radius)
+
+        if region is None or region.size == 0:
+            return None
+
+        diff = region[:, :, c1].astype(np.int16) - region[:, :, c2].astype(np.int16)
+        mask = diff > threshold
+
+        if not np.any(mask):
+            return None
+
+        xs = np.where(mask)[1]
+        return float(np.mean(xs))
+
+    def floor_green_ratio(self, frame, threshold=120):
+        if frame is None or frame.size == 0:
+            return 0.0
+
+        green = frame[:, :, 1]
+        return float(np.mean(green > threshold))
+
+    def red_flash_ratio(self, frame, threshold=150):
+        if frame is None or frame.size == 0:
+            return 0.0
+
+        red = frame[:, :, 2]
+        return float(np.mean(red > threshold))
+
+    def enemy_heatmap(self, frame):
+        """
+        Enemy-like color heatmap.
+
+        This is intentionally stricter than red-green difference alone,
+        because Doom/Freedoom has lots of brown/red walls and HUD elements.
+        """
+        if frame is None or frame.size == 0:
+            return np.zeros((self.height, self.width), dtype=np.float32)
+
+        # Make sure frame is HWC, not CHW.
+        # HWC = height, width, channels
+        # CHW = channels, height, width
+        if len(frame.shape) == 3 and frame.shape[0] in [3, 9] and frame.shape[-1] not in [3, 4]:
+            frame = np.transpose(frame[:3], (1, 2, 0))
+
+        resized = cv2.resize(frame, (self.width, self.height))
+
+        # Important: h must be an int, not resized.shape[:2].
+        h = resized.shape[0]
+
+        # Ignore HUD / weapon area near bottom.
+        gameplay = resized[: int(h * 0.75), :]
+
+        blue = gameplay[:, :, 0].astype(np.int16)
+        green = gameplay[:, :, 1].astype(np.int16)
+        red = gameplay[:, :, 2].astype(np.int16)
+
+        heatmap = (
+            (red > 90)
+            & (red > green + 25)
+            & (red > blue + 20)
+            & (green < 120)
+        )
+
+        full = np.zeros((self.height, self.width), dtype=np.float32)
+        full[: gameplay.shape[0], :] = heatmap.astype(np.float32)
+
+        return full
+
+    def _center_crop(self, frame, radius):
+        if frame is None or frame.size == 0:
+            return frame
+
+        h, w = frame.shape[:2]
+        cx, cy = w // 2, h // 2
+
+        x1 = max(0, cx - radius)
+        x2 = min(w, cx + radius)
+        y1 = max(0, cy - radius)
+        y2 = min(h, cy + radius)
+
+        return frame[y1:y2, x1:x2]
+    
+    def make_wide_model_frame(self, frame, size=(160, 100)):
+        """
+        Full-screen / wide-FOV frame for navigation, doors, route context, and object detection.
+        Keeps more horizontal information than a tight center crop.
+        """
+        if frame is None:
+            return None
+
+        import cv2
+
+        # Convert BGRA/RGBA if needed
+        if len(frame.shape) == 3 and frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+        resized = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
+        return resized
+
+
+    def make_center_combat_frame(self, frame, size=(84, 84)):
+        """
+        Center-focused view for aiming/combat classification.
+        Keeps the crosshair/front view strong.
+        """
+        if frame is None:
+            return None
+
+        import cv2
+
+        h, w = frame.shape[:2]
+
+        crop_w = int(w * 0.60)
+        crop_h = int(h * 0.75)
+
+        x1 = max(0, (w - crop_w) // 2)
+        y1 = max(0, (h - crop_h) // 2)
+        x2 = min(w, x1 + crop_w)
+        y2 = min(h, y1 + crop_h)
+
+        crop = frame[y1:y2, x1:x2]
+
+        if len(crop.shape) == 3 and crop.shape[2] == 4:
+            crop = cv2.cvtColor(crop, cv2.COLOR_BGRA2BGR)
+
+        resized = cv2.resize(crop, size, interpolation=cv2.INTER_AREA)
+        return resized
+    
+    def _ensure_bgr(self, frame):
+        if frame is None or frame.size == 0:
+            return frame
+
+        if len(frame.shape) == 3 and frame.shape[2] == 4:
+            return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+        return frame
+
+    def gameplay_crop(self, frame, bottom_cut=0.80):
+        """
+        Visible gameplay area without the HUD/status bar.
+        Use this for navigation, enemies, doors, pickups, wall detection.
+        """
+        frame = self._ensure_bgr(frame)
+
+        if frame is None or frame.size == 0:
+            return frame
+
+        h, w = frame.shape[:2]
+        y2 = int(h * bottom_cut)
+        return frame[:y2, :]
+
+    def hud_crop(self, frame, top_start=0.78):
+        """
+        Bottom HUD/status area.
+        Use this for health, ammo, armor, keys, weapon/status.
+        """
+        frame = self._ensure_bgr(frame)
+
+        if frame is None or frame.size == 0:
+            return frame
+
+        h, w = frame.shape[:2]
+        y1 = int(h * top_start)
+        return frame[y1:, :]
+
+    def center_gameplay_crop(self, frame, width_ratio=0.60, height_ratio=0.75):
+        """
+        Center gameplay view for aiming/combat.
+        Excludes most HUD and keeps forward-facing detail.
+        """
+        frame = self._ensure_bgr(frame)
+
+        if frame is None or frame.size == 0:
+            return frame
+
+        gameplay = self.gameplay_crop(frame)
+        h, w = gameplay.shape[:2]
+
+        crop_w = int(w * width_ratio)
+        crop_h = int(h * height_ratio)
+
+        x1 = max(0, (w - crop_w) // 2)
+        y1 = max(0, (h - crop_h) // 2)
+        x2 = min(w, x1 + crop_w)
+        y2 = min(h, y1 + crop_h)
+
+        return gameplay[y1:y2, x1:x2]
+
+    def make_model_frame(self, frame, view_mode="gameplay_wide", size=(160, 100)):
+        """
+        Model-ready RGB/BGR frame crop.
+
+        view_mode options:
+        - gameplay_wide
+        - gameplay_center
+        - hud
+        - full_debug
+        """
+        frame = self._ensure_bgr(frame)
+
+        if frame is None or frame.size == 0:
+            return frame
+
+        if view_mode in ["wide", "gameplay_wide"]:
+            crop = self.gameplay_crop(frame)
+        elif view_mode in ["center", "gameplay_center"]:
+            crop = self.center_gameplay_crop(frame)
+        elif view_mode == "hud":
+            crop = self.hud_crop(frame)
+        elif view_mode in ["full", "full_debug"]:
+            crop = frame
+        else:
+            crop = self.gameplay_crop(frame)
+
+        return cv2.resize(crop, size, interpolation=cv2.INTER_AREA)
